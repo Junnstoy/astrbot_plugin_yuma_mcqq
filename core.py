@@ -9,6 +9,34 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from string import Formatter
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+TEMPLATE_FIELDS = frozenset({
+    "user_id", "player", "points", "total", "currency_name", "day", "mc_state",
+    "minutes", "product_name", "product_id", "price", "order_id", "reward", "old",
+    "delta", "target_id", "items", "stock", "rank",
+})
+DEFAULT_TEMPLATES = {
+    "checkin_success": "签到成功！获得 {points} {currency_name}，余额：{total} {currency_name}。",
+    "checkin_pending": "签到正在等待 MC 确认，预计奖励 {points} {currency_name}，暂未入账。",
+    "checkin_duplicate": "今天已经提交过签到，不会重复执行。余额：{total} {currency_name}，MC 状态：{mc_state}。",
+    "checkin_disabled": "本会话尚未开启签到。",
+    "checkin_outside_window": "当前不在本会话允许的签到时间内。",
+    "checkin_unbound": "请先绑定 Minecraft 游戏名，再进行签到。",
+    "checkin_mc_failed": "MC 签到失败，本次未获得 {currency_name}，请联系管理员查看记录。",
+    "checkin_mc_unknown": "MC 签到结果未确认，本次暂未获得 {currency_name}，请联系管理员核实。",
+    "balance": "你的余额：{total} {currency_name}。",
+    "shop_list": "本会话商店：\n{items}",
+    "shop_item": "{product_id}. {product_name} — {price} {currency_name}（库存：{stock}）",
+    "purchase_pending": "是否消耗 {price}{currency_name}，来购买 {product_id} {product_name}？请在 {minutes} 分钟内回复“兑换”。",
+    "purchase_delivered": "订单 {order_id} 已完成，奖励已私聊发送。余额：{total} {currency_name}。",
+    "purchase_private": "你购买的 {product_name}，订单 {order_id}：\n{reward}",
+    "purchase_failed": "订单 {order_id} 的私聊发送失败，已扣款且奖励已保留。请在原会话回复“兑换”，或使用唤醒头和插件前缀发送“补领”，不会重复扣款。",
+    "ranking": "本会话排行榜：\n{items}",
+    "ranking_item": "{rank}. {player}（{user_id}）：{total} {currency_name}",
+    "admin_adjust": "已调整 {target_id}：{old} → {total} {currency_name}（变化 {delta}）。",
+    "admin_query": "{target_id} 的余额：{total} {currency_name}。",
+    "no_permission": "你没有本会话的积分管理权限。",
+    "usage": "请按本会话的唤醒头和插件前缀使用：签到、积分、查询 [玩家]、修改 玩家 数量、增加 玩家 数量、减少 玩家 数量、排行榜、商店列表、商店 购买 编号、兑换、补领。",
+}
 
 DEFAULT_SETTINGS = {
     "enabled": False,
@@ -21,6 +49,14 @@ DEFAULT_SETTINGS = {
     "server_name": "",
     "commands": [],
     "require_binding": True,
+    "currency_name": "积分",
+    "command_prefix": "",
+    "admin_ids": [],
+    "confirmation_minutes": 3,
+    "mc_success_keywords": ["签到成功", "成功给玩家", "今日签到已完成", "sign in success", "signin success", "successfully signed in"],
+    "mc_failure_keywords": ["失败", "不存在", "离线", "已经签到", "已签到", "请不要重复签到", "already", "has signed in today", "have signed in today", "don't sign in again", "already signed", "not exist", "not online", "not found", "error", "failed"],
+    "templates": DEFAULT_TEMPLATES,
+    "products": [],
 }
 
 
@@ -113,7 +149,90 @@ def validate_settings(settings: dict) -> dict:
     result["commands"] = commands
     if result["mc_enabled"] and (not result["server_name"] or not commands):
         raise ValueError("开启 MC 联动前，请选择服务器并填写签到指令")
+    result["currency_name"] = _clean_string(result["currency_name"], "积分名称", 30)
+    if not result["currency_name"]:
+        raise ValueError("积分名称不能为空")
+    result["command_prefix"] = _clean_string(result["command_prefix"], "指令前缀", 30)
+    if any(char.isspace() for char in result["command_prefix"]):
+        raise ValueError("指令前缀不能包含空白")
+    if not isinstance(result["admin_ids"], list) or len(result["admin_ids"]) > 1000:
+        raise ValueError("管理员 ID 必须为列表")
+    result["admin_ids"] = list(dict.fromkeys(_clean_string(value, "管理员 ID", 256) for value in result["admin_ids"]))
+    if any(not value or any(char.isspace() for char in value) for value in result["admin_ids"]):
+        raise ValueError("管理员 ID 不能为空或含空白")
+    if type(result["confirmation_minutes"]) is not int or not 1 <= result["confirmation_minutes"] <= 1440:
+        raise ValueError("购买确认时间必须为 1 至 1440 分钟")
+    for key in ("mc_success_keywords", "mc_failure_keywords"):
+        if not isinstance(result[key], list) or len(result[key]) > 100:
+            raise ValueError("MC 判定关键词必须为列表，最多 100 条")
+        result[key] = list(dict.fromkeys(_clean_string(value, "MC 判定关键词", 200) for value in result[key]))
+        if any(not value for value in result[key]):
+            raise ValueError("MC 判定关键词不能为空")
+    templates = result["templates"]
+    if not isinstance(templates, dict) or set(templates) - set(DEFAULT_TEMPLATES):
+        raise ValueError("回复模板包含不支持的模板名称")
+    result["templates"] = {**DEFAULT_TEMPLATES, **templates}
+    for key, template in result["templates"].items():
+        if not isinstance(template, str) or len(template) > 10000:
+            raise ValueError(f"模板 {key} 必须为不超过 10000 字符的文本")
+        try:
+            used_fields = set()
+            for _, field, spec, conversion in Formatter().parse(template):
+                if field is not None and (field not in TEMPLATE_FIELDS or spec or conversion):
+                    raise ValueError(f"不支持的占位符：{field}")
+                if field is not None:
+                    used_fields.add(field)
+            if key == "purchase_private" and "reward" not in used_fields:
+                raise ValueError("私聊奖励模板必须包含 {reward}，确保实际发出奖励内容")
+        except ValueError as exc:
+            raise ValueError(f"模板 {key} 格式错误：{exc}") from exc
+    if not isinstance(result["products"], list) or len(result["products"]) > 1000:
+        raise ValueError("商品必须为列表，最多 1000 件")
+    products, identifiers = [], set()
+    for raw in result["products"]:
+        if not isinstance(raw, dict):
+            raise ValueError("商品设置必须为对象")
+        identifier = _clean_string(raw.get("id", ""), "商品编号", 64)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier) or identifier in identifiers:
+            raise ValueError("商品编号必须唯一，且只能使用字母、数字、下划线或连字符")
+        identifiers.add(identifier)
+        name = _clean_string(raw.get("name", ""), "商品名称", 100)
+        if not name:
+            raise ValueError("商品名称不能为空")
+        price = raw.get("price")
+        if type(price) is not int or not 0 <= price <= 2**53 - 1:
+            raise ValueError("商品价格必须为 0 至 9007199254740991 的整数，避免网页数字精度丢失")
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("商品启用状态必须为布尔值")
+        reward_type = raw.get("reward_type", "text")
+        if reward_type not in {"text", "codes"}:
+            raise ValueError("奖励类型只能为 text 或 codes")
+        reward_text = raw.get("reward_text", "")
+        if not isinstance(reward_text, str) or len(reward_text) > 10000:
+            raise ValueError("奖励文本必须为不超过 10000 字符的文本")
+        if reward_type == "text" and not reward_text.strip():
+            raise ValueError("文本商品的奖励内容不能为空")
+        codes = raw.get("codes", [])
+        if not isinstance(codes, list) or len(codes) > 10000:
+            raise ValueError("兑换码库存必须为列表，最多 10000 条")
+        codes = [_clean_string(code, "兑换码", 2000) for code in codes]
+        if any(not code for code in codes) or len(set(codes)) != len(codes):
+            raise ValueError("兑换码不能重复或为空")
+        products.append(dict(id=identifier, name=name, price=price, enabled=enabled,
+                             reward_type=reward_type, reward_text=reward_text, codes=codes))
+    result["products"] = products
     return result
+
+
+def classify_mc_output(output, settings: dict) -> tuple[str, str]:
+    clean = re.sub(r"§(?:#[0-9a-f]{6}|[0-9a-fk-orx])", "", str(output or ""), flags=re.I).strip()
+    lowered = clean.casefold()
+    if any(keyword.casefold() in lowered for keyword in settings.get("mc_failure_keywords", DEFAULT_SETTINGS["mc_failure_keywords"]) if keyword):
+        return "failed", clean
+    if any(keyword.casefold() in lowered for keyword in settings.get("mc_success_keywords", DEFAULT_SETTINGS["mc_success_keywords"]) if keyword):
+        return "sent", clean
+    return "unknown", clean
 
 
 def local_now(settings: dict, now: datetime | None = None) -> datetime:

@@ -3,13 +3,18 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
-  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [] };
+  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [], currency_name: '积分', command_prefix: '', admin_ids: [], confirmation_minutes: 3, mc_success_keywords: [], mc_failure_keywords: [], products: [], templates: {} };
+  const templateNames = { checkin_success: '签到成功', checkin_pending: '签到处理中', checkin_duplicate: '重复签到', checkin_disabled: '签到未启用', checkin_outside_window: '不在签到时间', checkin_unbound: '尚未绑定', checkin_mc_failed: '游戏签到失败', checkin_mc_unknown: '游戏结果未知', balance: '查询余额', shop_list: '商店列表', shop_item: '单件商品介绍', purchase_pending: '等待兑换确认', purchase_delivered: '奖励已发放', purchase_private: '私聊奖励内容', purchase_failed: '兑换发放失败', ranking: '排行榜', ranking_item: '单条排名', admin_adjust: '管理员调整余额', admin_query: '管理员查询余额', no_permission: '权限不足', usage: '指令使用说明' };
+  const templateFields = ['user_id', 'player', 'points', 'total', 'currency_name', 'day', 'mc_state', 'minutes', 'product_name', 'product_id', 'price', 'order_id', 'reward', 'old', 'delta', 'target_id', 'items', 'stock', 'rank'];
   let state = { sessions: [], servers: [], session: '', binding_count: 0 };
   let settings = structuredClone(defaults);
   let dirty = false;
   let busy = false;
   let ready = false;
   let sequence = 0;
+  let page = 'overview';
+  let finishConfirmation = null;
+  const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
 
   function el(tag, text, className) {
     const node = document.createElement(tag);
@@ -31,6 +36,26 @@
     $('new-session').disabled = value || !ready;
     $('add-session').disabled = value || !ready;
     $('discard').disabled = value || !dirty;
+    $('back-overview').disabled = value || !ready;
+    $('sessions-list').querySelectorAll('button,input').forEach(control => { control.disabled = value || !ready; });
+  }
+  function showPage(name) {
+    page = name;
+    $('overview-page').hidden = name !== 'overview';
+    $('editor-page').hidden = name !== 'editor';
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
+  function confirmAction(title, description, accept = '确认') {
+    $('confirm-title').textContent = title;
+    $('confirm-description').textContent = description;
+    $('confirm-accept').textContent = accept;
+    $('confirm-overlay').hidden = false;
+    const previousFocus = document.activeElement;
+    $('confirm-cancel').focus();
+    return new Promise(resolve => { finishConfirmation = value => { $('confirm-overlay').hidden = true; finishConfirmation = null; previousFocus?.focus(); resolve(value); }; });
+  }
+  async function mayLeave() {
+    return !dirty || await confirmAction('有尚未保存的修改', '离开后将放弃当前会话未保存的修改。是否继续？', '放弃修改并继续');
   }
   function markDirty() {
     dirty = true;
@@ -81,6 +106,41 @@
     remove.addEventListener('click', () => { row.remove(); $('dates-empty').hidden = $('dates-list').children.length > 0; markDirty(); });
     row.append(remove); $('dates-list').append(row); $('dates-empty').hidden = true;
   }
+  function addProduct(value = {}) {
+    const used = new Set([...$('products-list').querySelectorAll('[data-field="id"]')].map(input => input.value));
+    let number = 1; while (used.has(String(number))) number++;
+    const product = { id: String(number), name: '', price: 100, enabled: true, reward_type: 'text', reward_text: '', codes: [], ...value };
+    const row = el('section', undefined, 'product-card');
+    const heading = el('div', undefined, 'card-heading');
+    heading.append(el('h3', '商品设置'));
+    const controls = el('div', undefined, 'product-controls');
+    const enabledLabel = el('label', undefined, 'check-label'); const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = product.enabled; enabled.dataset.field = 'enabled'; enabledLabel.append(enabled, el('span', '上架'));
+    const remove = el('button', '删除商品', 'button danger small'); remove.type = 'button'; remove.addEventListener('click', () => { row.remove(); $('products-empty').hidden = !!$('products-list').children.length; markDirty(); });
+    controls.append(enabledLabel, remove); heading.append(controls); row.append(heading);
+    const fields = el('div', undefined, 'product-fields');
+    for (const [key, label, type] of [['id', '商品序号', 'text'], ['name', '商品名称', 'text'], ['price', '兑换价格', 'number']]) {
+      const field = rowInput(label, type, product[key], type === 'number' ? { min: '0', max: String(Number.MAX_SAFE_INTEGER), step: '1' } : {});
+      field.querySelector('input').dataset.field = key; fields.append(field);
+    }
+    row.append(fields);
+    const typeLabel = el('label', '奖励类型', 'field'); const select = el('select'); select.dataset.field = 'reward_type';
+    for (const [type, text] of [['text', '固定文本奖励'], ['codes', '独立兑换码']]) { const option = el('option', text); option.value = type; select.append(option); }
+    select.value = product.reward_type; typeLabel.append(select); row.append(typeLabel);
+    const textLabel = el('label', '奖励文本（仅后台可见）', 'field'); const text = el('textarea'); text.dataset.field = 'reward_text'; text.value = product.reward_text; text.rows = 3; textLabel.append(text);
+    const codesLabel = el('label', '兑换码池（每行一个，仅后台可见）', 'field'); const codes = el('textarea'); codes.dataset.field = 'codes'; codes.value = product.codes.join('\n'); codes.rows = 4; codes.spellcheck = false; codesLabel.append(codes);
+    row.append(textLabel, codesLabel, el('p', '已使用的兑换码由后台自动排除，不会因重新保存而再次发放。商品列表只公开序号、名称和价格。', 'hint'));
+    const updateType = () => { textLabel.hidden = select.value !== 'text'; codesLabel.hidden = select.value !== 'codes'; };
+    select.addEventListener('change', updateType); updateType(); $('products-list').append(row); $('products-empty').hidden = true;
+  }
+  function renderTemplates(values) {
+    $('templates-list').replaceChildren();
+    const fields = Array.isArray(state.template_fields) ? state.template_fields : templateFields;
+    $('template-fields').textContent = `可用占位符：${fields.map(field => String(field).startsWith('{') ? field : `{${field}}`).join(' ')}。不同场景仅填写该场景可用的字段。`;
+    for (const [key, value] of Object.entries(values || {})) {
+      const label = el('label', undefined, 'template-field'); label.append(el('span', templateNames[key] || key), el('small', key));
+      const input = el('textarea'); input.rows = 3; input.value = value; input.dataset.key = key; input.spellcheck = false; label.append(input); $('templates-list').append(label);
+    }
+  }
   function collect() {
     return { ...settings,
       enabled: $('enabled').checked, timezone: $('timezone').value.trim(),
@@ -89,7 +149,12 @@
       date_rules: [...$('dates-list').children].map(row => { const inputs = row.querySelectorAll('input'); return { date: inputs[0].value.trim(), multiplier: Number(inputs[1].value) }; }),
       mc_enabled: $('mc-enabled').checked, server_name: $('server-name').value,
       require_binding: $('require-binding').checked,
-      commands: $('commands').value.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+      commands: lines($('commands').value),
+      currency_name: $('currency-name').value.trim(), command_prefix: $('command-prefix').value.trim(),
+      admin_ids: lines($('admin-ids').value), confirmation_minutes: Number($('confirmation-minutes').value),
+      mc_success_keywords: lines($('mc-success-keywords').value), mc_failure_keywords: lines($('mc-failure-keywords').value),
+      products: [...$('products-list').children].map(row => ({ id: row.querySelector('[data-field="id"]').value.trim(), name: row.querySelector('[data-field="name"]').value.trim(), price: Number(row.querySelector('[data-field="price"]').value), enabled: row.querySelector('[data-field="enabled"]').checked, reward_type: row.querySelector('[data-field="reward_type"]').value, reward_text: row.querySelector('[data-field="reward_text"]').value, codes: lines(row.querySelector('[data-field="codes"]').value) })),
+      templates: Object.fromEntries([...$('templates-list').querySelectorAll('textarea')].map(input => [input.dataset.key, input.value]))
     };
   }
   function validate(data) {
@@ -105,16 +170,23 @@
       seen.add(rule.date);
     }
     if (data.mc_enabled && (!data.server_name || !data.commands.length)) throw new Error('开启 MC 同步时，请选择目标服务器并填写签到指令。');
+    const products = new Set();
+    for (const product of data.products) {
+      if (!Number.isSafeInteger(product.price) || product.price < 0) throw new Error('商品价格必须为 0 至 9007199254740991 的整数。');
+      if (products.has(product.id)) throw new Error(`商品序号重复：${product.id}。`);
+      products.add(product.id);
+    }
   }
   function preview() {
     const data = collect();
     $('stat-points').textContent = `${data.min_points}–${data.max_points}`;
+    $('stat-currency').textContent = `${data.currency_name || '积分'} / 次`;
     $('stat-dates').textContent = data.date_rules.length;
     $('stat-status').textContent = data.enabled ? '签到已启用' : '签到已关闭';
     $('stat-status').className = `badge ${data.enabled ? 'good' : 'neutral'}`;
-    $('preview-summary').textContent = data.enabled ? `每天签到一次，随机获得 ${data.min_points}–${data.max_points} 积分。特别日期使用对应倍率。` : '此会话已关闭签到；启用并保存后，群成员即可参加。';
+    $('preview-summary').textContent = data.enabled ? `每天签到一次，基础奖励 ${data.min_points}–${data.max_points} ${data.currency_name || '积分'}。特别日期使用对应倍率。` : '此会话已关闭签到；启用并保存后，群成员即可参加。';
     $('preview-time').textContent = `${data.timezone || '未设置时区'} · ${data.windows.map(w => `${w.start || '…'}—${w.end || '…'}`).join(' / ')}`;
-    $('preview-mc').textContent = data.mc_enabled ? `同步至 ${data.server_name || '尚未选择的服务器'}，发送 ${data.commands.length} 条指令。${data.require_binding ? '签到前需要绑定游戏账号。' : '未绑定玩家仍可领取群积分。'}` : 'MC 同步已关闭，仅记录群内签到与积分。';
+    $('preview-mc').textContent = data.mc_enabled ? `同步至 ${data.server_name || '尚未选择的服务器'}，发送 ${data.commands.length} 条指令。仅命中成功关键词才入账，失败优先；未知结果不加分。` : 'MC 同步已关闭，直接记录群内签到与积分。';
   }
   function renderForm(data) {
     settings = { ...structuredClone(defaults), ...(data || {}) };
@@ -125,6 +197,16 @@
     $('mc-enabled').checked = settings.mc_enabled;
     $('require-binding').checked = settings.require_binding;
     $('commands').value = settings.commands.join('\n');
+    $('currency-name').value = settings.currency_name;
+    $('command-prefix').value = settings.command_prefix;
+    $('admin-ids').value = settings.admin_ids.join('\n');
+    $('confirmation-minutes').value = settings.confirmation_minutes;
+    $('mc-success-keywords').value = settings.mc_success_keywords.join('\n');
+    $('mc-failure-keywords').value = settings.mc_failure_keywords.join('\n');
+    $('products-list').replaceChildren();
+    settings.products.forEach(addProduct);
+    $('products-empty').hidden = settings.products.length > 0;
+    renderTemplates(settings.templates);
     $('windows-list').replaceChildren();
     for (const window of settings.windows) addWindow(window);
     $('dates-list').replaceChildren();
@@ -148,6 +230,46 @@
     if (!sessions.size) { const option = el('option', '暂无会话，请点击「新增会话」'); option.value = ''; $('session-select').append(option); }
     for (const item of sessions.values()) { const option = el('option', item.session); option.value = item.session; $('session-select').append(option); }
     $('session-select').value = state.session || '';
+    renderOverview();
+  }
+  function renderOverview() {
+    $('sessions-list').replaceChildren();
+    $('sessions-empty').hidden = !!state.sessions.length;
+    for (const item of state.sessions) {
+      const config = { ...defaults, ...item.settings };
+      const card = el('section', undefined, 'card session-overview'); card.dataset.session = item.session;
+      const heading = el('div', undefined, 'card-heading');
+      const title = el('div'); title.append(el('p', 'GROUP SESSION', 'eyebrow'), el('h2', item.session));
+      const label = el('label', undefined, 'switch-label');
+      const toggle = el('input'); toggle.type = 'checkbox'; toggle.checked = config.enabled; toggle.setAttribute('aria-label', `${item.session} 启用签到`);
+      label.append(toggle, el('span', undefined, 'switch-track'));
+      heading.append(title, label); card.append(heading);
+      card.append(el('p', `${config.currency_name} · ${config.min_points}–${config.max_points} / 次`, 'session-summary'));
+      const status = el('p', undefined, 'session-meta'); status.append(el('span', config.enabled ? '签到已开启' : '签到已关闭', `badge ${config.enabled ? 'good' : 'neutral'}`), el('span', config.mc_enabled ? 'MC 联动' : '群签到')); card.append(status);
+      const actions = el('div', undefined, 'session-actions');
+      const edit = el('button', '进入配置', 'button primary'); edit.type = 'button'; edit.dataset.action = 'edit';
+      edit.addEventListener('click', async () => { notify(''); if (await load(item.session)) showPage('editor'); });
+      const remove = el('button', '删除会话', 'button danger'); remove.type = 'button'; remove.dataset.action = 'delete';
+      remove.addEventListener('click', () => deleteSession(item.session));
+      toggle.addEventListener('change', async () => {
+        const enabled = toggle.checked; lock(true);
+        try { const response = result(await bridge.apiPost('sessions/toggle', { session: item.session, enabled })); item.settings = { ...config, ...(response.settings || {}), enabled }; renderOverview(); notify(enabled ? '此会话已开启签到。' : '此会话已关闭签到。', 'success'); }
+        catch (error) { toggle.checked = config.enabled; notify(`切换失败：${error.message || error}`, 'error'); }
+        finally { lock(false); }
+      });
+      actions.append(edit, remove); card.append(actions); $('sessions-list').append(card);
+    }
+  }
+  async function deleteSession(session) {
+    if (!await confirmAction('删除此会话的配置？', `${session}\n只删除会话配置，保留积分、签到和兑换历史，并停用待执行任务。重新添加相同会话可继续查看历史。`, '确认删除配置')) return;
+    lock(true);
+    try {
+      result(await bridge.apiPost('sessions/delete', { session }));
+      state.sessions = state.sessions.filter(item => item.session !== session);
+      if (state.session === session) state.session = '';
+      renderSessions(); notify('会话配置已删除，积分与历史记录已保留。', 'success');
+    } catch (error) { notify(`删除失败，会话仍保留：${error.message || error}`, 'error'); }
+    finally { lock(false); }
   }
   function renderBindings() {
     $('stat-bindings').textContent = state.binding_count ?? 0;
@@ -164,8 +286,20 @@
       if (record.player) user.append(el('div', record.user_id, 'user-secondary'));
       const status = labels[record.mc_state] || [record.mc_state || '无同步记录', 'neutral'];
       const statusCell = el('td'); statusCell.append(el('span', status[0], `badge ${status[1]}`));
-      row.append(user, el('td', record.day || '—'), el('td', `+${record.points ?? 0}`, 'points-cell'), el('td', String(record.total ?? '—')), statusCell, el('td', record.mc_detail || '—', 'detail-cell'));
+      const points = el('td'); points.append(el('div', record.credited ? `+${record.points ?? 0}` : `预计 ${record.points ?? 0}`, record.credited ? 'points-cell' : 'pending-points'), el('div', record.credited ? '已入账' : '未入账', 'user-secondary'));
+      row.append(user, el('td', record.day || '—'), points, el('td', String(record.total ?? '—')), statusCell, el('td', record.mc_detail || '—', 'detail-cell'));
       $('history-body').append(row);
+    }
+  }
+  function renderActivity() {
+    $('leaderboard-body').replaceChildren(); $('orders-body').replaceChildren();
+    const leaderboard = state.leaderboard || []; const orders = state.orders || [];
+    $('leaderboard-empty').hidden = !!leaderboard.length; $('orders-empty').hidden = !!orders.length;
+    leaderboard.forEach((item, index) => { const row = el('tr'); row.append(el('td', String(index + 1)), el('td', item.user_id), el('td', `${item.total} ${settings.currency_name}`)); $('leaderboard-body').append(row); });
+    const orderLabels = { pending: '待确认', confirmed: '已确认', delivered: '已发放', expired: '已过期', cancelled: '已取消', failed: '失败' };
+    for (const order of orders) {
+      const row = el('tr'); const account = el('td'); account.append(el('div', String(order.id), 'user-primary'), el('div', order.user_id, 'user-secondary'));
+      row.append(account, el('td', order.product_name), el('td', `${order.price} ${order.currency_name || settings.currency_name}`), el('td', orderLabels[order.status] || order.status), el('td', order.detail || '—', 'detail-cell')); $('orders-body').append(row);
     }
   }
   async function load(session = '') {
@@ -175,32 +309,43 @@
       const data = result(await bridge.apiGet('state', session ? { session } : {}));
       if (request !== sequence) return;
       state = { ...data, session: data.session || session || '' };
-      renderSessions(); renderBindings(); renderForm(data.settings); renderHistory(data.history);
+      renderSessions(); renderBindings(); renderForm(data.settings); renderHistory(data.history); renderActivity();
       markSaved(state.session ? '设置已加载' : '添加一个会话，开始配置');
-    } catch (error) { $('session-select').value = state.session; notify(`加载失败：${error.message || error}`, 'error'); }
+      return true;
+    } catch (error) { $('session-select').value = state.session; notify(`加载失败：${error.message || error}`, 'error'); return false; }
     finally { if (request === sequence) lock(false); }
   }
   $('settings-form').addEventListener('input', markDirty);
   $('settings-form').addEventListener('change', markDirty);
   $('add-window').addEventListener('click', () => { addWindow(); markDirty(); });
   $('add-date').addEventListener('click', () => { addDate(); markDirty(); });
+  $('add-product').addEventListener('click', () => { addProduct(); markDirty(); });
   $('new-session').addEventListener('click', () => { $('new-session-panel').hidden = false; $('session-input').focus(); });
   $('cancel-session').addEventListener('click', () => { $('new-session-panel').hidden = true; });
   $('session-select').addEventListener('change', async () => {
-    if (dirty) { $('session-select').value = state.session; notify('请先保存当前修改，或点击「放弃修改」，再切换会话。'); return; }
-    notify(''); await load($('session-select').value);
+    const selected = $('session-select').value; $('session-select').value = state.session;
+    if (!await mayLeave()) return;
+    notify(''); await load(selected);
   });
-  $('add-session').addEventListener('click', () => {
-    if (dirty) { notify('请先保存当前修改，或点击「放弃修改」，再新增会话。'); return; }
+  $('add-session').addEventListener('click', async () => {
     const session = $('session-input').value.trim();
     if (!/^[^:\s]+:GroupMessage:[^:\s]+$/.test(session)) { notify('请输入有效的群会话标识：平台ID:GroupMessage:群号。', 'error'); return; }
     $('new-session-panel').hidden = true;
-    if (state.sessions.some(item => item.session === session)) { load(session); return; }
-    state.session = session; renderSessions(); renderForm(defaults); renderHistory(); markDirty(); lock(false);
-    $('save-caption').textContent = session; notify('新会话尚未保存。完成设置后点击「保存当前会话」。');
+    const existing = state.sessions.some(item => item.session === session);
+    if (!await load(session)) return;
+    showPage('editor');
+    if (!existing) { markDirty(); notify('新会话尚未保存。完成设置后点击「保存当前会话」。'); }
   });
-  $('refresh').addEventListener('click', async () => { if (dirty) { notify('当前有未保存的修改，请先保存或放弃修改再刷新。'); return; } notify(''); await load(state.session); });
-  $('discard').addEventListener('click', async () => { notify(''); await load(state.session); });
+  $('back-overview').addEventListener('click', async () => { if (!await mayLeave()) return; notify(''); if (await load()) showPage('overview'); });
+  $('refresh').addEventListener('click', async () => { if (page === 'editor' && !await mayLeave()) return; notify(''); await load(page === 'editor' ? state.session : ''); });
+  $('discard').addEventListener('click', async () => { if (!await mayLeave()) return; notify(''); await load(state.session); });
+  $('confirm-cancel').addEventListener('click', () => finishConfirmation?.(false));
+  $('confirm-accept').addEventListener('click', () => finishConfirmation?.(true));
+  document.addEventListener('keydown', event => {
+    if (!finishConfirmation) return;
+    if (event.key === 'Escape') { event.preventDefault(); finishConfirmation(false); }
+    if (event.key === 'Tab') { event.preventDefault(); (document.activeElement === $('confirm-cancel') ? $('confirm-accept') : $('confirm-cancel')).focus(); }
+  });
   document.querySelectorAll('[data-token]').forEach(button => button.addEventListener('click', () => {
     const field = $('commands'); const start = field.selectionStart; const end = field.selectionEnd;
     field.setRangeText(button.dataset.token, start, end, 'end'); field.focus(); markDirty();

@@ -1,7 +1,7 @@
 name: astrbot_plugin_checkin_points
 display_name: 群签到积分
-desc: 按会话配置随机签到积分、日期倍率和签到时段，通过鹊桥同步 MC 签到，提供 SQLite 记录和管理界面。
-version: v0.1.0
+desc: 按会话管理签到货币、管理员、排行榜与商品兑换，鹊桥确认 MC 签到成功后入账，支持私聊奖励与双页管理界面。
+version: v0.2.0
 author: Junnstoy
 repo: https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq
 astrbot_version: ">=4.29.0"

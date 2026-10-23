@@ -1,0 +1,8 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用签到积分",
+    "hint": "每个会话的积分、倍率、时段和 MC 指令请在插件的签到积分管理页面配置。",
+    "default": true
+  }
+}

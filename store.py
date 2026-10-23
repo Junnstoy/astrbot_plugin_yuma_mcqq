@@ -13,6 +13,7 @@ from .core import DEFAULT_TEMPLATES, award_points, date_multiplier, in_window, l
 
 MAX_BALANCE = 2**63 - 1
 LEGACY_USAGE = "请按本会话的唤醒头和插件前缀使用：签到、积分、查询 [玩家]、修改 玩家 数量、增加 玩家 数量、减少 玩家 数量、排行榜、商店列表、商店 购买 编号、兑换、补领。"
+V3_USAGE = "签到、点数及签到排行榜仅需 AstrBot 唤醒头；其余命令需唤醒头和本会话插件前缀。可用命令：{command_list}"
 LEGACY_TEMPLATES = {
     "no_permission": "你没有本会话的积分管理权限。",
     "usage": LEGACY_USAGE,
@@ -99,6 +100,16 @@ class Store:
                 db.execute("PRAGMA user_version=3")
             if version < 4:
                 db.execute("PRAGMA user_version=4")
+            if version < 5:
+                for row in db.execute("SELECT session,settings FROM session_settings").fetchall():
+                    settings = json.loads(row["settings"])
+                    settings.setdefault("checkin_prefix", "")
+                    templates = settings.get("templates", {})
+                    if templates.get("usage") == V3_USAGE:
+                        templates["usage"] = DEFAULT_TEMPLATES["usage"]
+                    db.execute("UPDATE session_settings SET settings=? WHERE session=?",
+                               (json.dumps(settings, ensure_ascii=False), row["session"]))
+                db.execute("PRAGMA user_version=5")
             db.commit()
 
     @contextmanager

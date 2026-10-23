@@ -8,6 +8,8 @@ from __future__ import annotations
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
+from .core import CHECKIN_COMMANDS
+
 
 class SessionCommandFilter(CommandFilter):
     def get_complete_command_names(self) -> list[str]:
@@ -53,19 +55,17 @@ class SessionCommandFilter(CommandFilter):
         if not woken and not bare_confirmation:
             return False
 
-        prefix = str(settings.get("command_prefix", "")).strip()
+        prefix_key = "checkin_prefix" if self._canonical in CHECKIN_COMMANDS else "command_prefix"
+        prefix = str(settings.get(prefix_key, "")).strip()
         candidate = text
-        prefix_exempt = self._canonical in {"签到", "点数", "签到排行榜"}
-        # An effective command can itself begin with the configured prefix.
-        # Prefer its complete unprefixed spelling for exempt commands and bare
-        # order confirmations; stripping here would otherwise corrupt names
-        # such as "签到 排行榜" when the session prefix is "签到".
-        preserve_native_name = bare_confirmation or (prefix_exempt and self._exact_name(text))
-        if preserve_native_name:
+        # A pending order's exact confirmation name remains the only prefix
+        # bypass. Every other command uses its own group's configured prefix,
+        # even when its effective name starts with that same word.
+        if bare_confirmation:
             pass
         elif prefix and text.startswith(prefix + " "):
             candidate = text[len(prefix):].strip()
-        elif prefix and not prefix_exempt:
+        elif prefix:
             return False
         candidate = self._native_spelling(candidate)
 

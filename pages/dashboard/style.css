@@ -10,3 +10,5 @@
 .product-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.stock-count{display:block;margin-top:5px;font-size:11px;color:#7f9585;font-weight:400}.stock-status{padding:10px 12px;background:#f1f7f3;border-radius:8px;margin:0 0 16px}.stock-status.stock-changed{background:#fff5e3;color:#9b732d}@media(max-width:680px){.product-fields>label:nth-child(2){grid-column:auto;grid-row:auto}.product-fields>label{min-width:0}}
 
 .archive-label{display:inline-block;margin-top:6px;padding:2px 6px;border-radius:5px;font-size:10px;color:#8c7650;background:#f6f0e5}.archived-record .detail-cell{color:#9b9b8a}
+
+.prefix-preview{padding:10px 12px;background:#eff6f1;border:1px solid #dce9df;border-radius:8px;color:#557461;overflow-wrap:anywhere}.prefix-fields input{font-size:12px}

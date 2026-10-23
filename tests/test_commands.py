@@ -20,7 +20,7 @@ PACKAGE = "checkin_points_command_tests"
 package = types.ModuleType(PACKAGE)
 package.__path__ = [str(ROOT)]
 sys.modules[PACKAGE] = package
-from checkin_points_command_tests.core import TEMPLATE_FIELDS, classify_mc_output, validate_settings
+from checkin_points_command_tests.core import CHECKIN_COMMANDS, TEMPLATE_FIELDS, classify_mc_output, validate_settings
 from checkin_points_command_tests.routing import render_reply
 from checkin_points_command_tests.store import Store
 
@@ -66,7 +66,8 @@ registry.get_handlers_by_module_name = lambda module: [
 filter_tree = ast.parse((ROOT / "command_filters.py").read_text(encoding="utf-8"))
 filter_module = ast.Module(body=[node for node in filter_tree.body
                                 if isinstance(node, (ast.ClassDef, ast.FunctionDef))], type_ignores=[])
-filter_namespace = dict(CommandFilter=NativeCommandFilter, star_handlers_registry=registry)
+filter_namespace = dict(CommandFilter=NativeCommandFilter, star_handlers_registry=registry,
+                        CHECKIN_COMMANDS=CHECKIN_COMMANDS)
 exec(compile(ast.fix_missing_locations(filter_module), "actual-command-filters-under-test", "exec"), filter_namespace)
 install_command_filters = filter_namespace["install_command_filters"]
 
@@ -93,6 +94,7 @@ module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(n
 namespace = dict(asyncio=asyncio, contextlib=contextlib, json=json, re=re, Path=Path,
                  logger=logging.getLogger("command-test"), NAME="checkin-test", MC_NAME="mc-test",
                  __name__=PACKAGE + ".entry", TEMPLATE_FIELDS=TEMPLATE_FIELDS, Store=Store,
+                 CHECKIN_COMMANDS=CHECKIN_COMMANDS,
                  render_reply=render_reply, install_command_filters=install_command_filters,
                  classify_mc_output=classify_mc_output, validate_settings=validate_settings)
 exec(compile(ast.fix_missing_locations(module), "actual-entry-under-test", "exec"), namespace)
@@ -244,7 +246,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.balance(self.session, "200"), 100)
 
     async def test_prefix_wake_and_ai_messages_not_swallowed(self):
-        for text, woken in (("cp 签到", False), ("签到", False), ("cp签到", True),
+        for text, woken in (("cp 签到", False), ("cp 签到", True), ("签到", False), ("cp签到", True),
                              ("wrong 签到", True), ("chat 你好", True), ("cp chat 你好", True),
                              ("#cp 签到", True), ("你好", False)):
             with self.subTest(text=text, woken=woken):
@@ -258,29 +260,29 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         _, replies = await self.run_message("点数")
         self.assertIn("11 星币", replies[0])
         _, replies = await self.run_message("cp 点数")
-        self.assertIn("11 星币", replies[0])
+        self.assertEqual(replies, [])
 
     async def test_uppercase_english_alias_survives_entry_filter(self):
-        _, replies = await self.run_message("cp CHECKIN")
+        _, replies = await self.run_message("CHECKIN")
         self.assertEqual(len(replies), 1)
         self.assertEqual(self.store.balance(self.session, "100"), 11)
 
     async def test_mc_failure_keeps_balance_and_returns_actual_response(self):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
         self.mc_results = [("§c玩家 Steve 今天已经签到了，请不要重复签到。", "queqiao")]
-        _, replies = await self.run_message("cp 签到")
+        _, replies = await self.run_message("签到")
         self.assertNotIn("签到成功", replies[0])
         self.assertIn("今天已经签到了", replies[0])
         self.assertNotIn("§c", replies[0])
         self.assertEqual(self.store.balance(self.session, "100"), 0)
         self.assertEqual(self.mc_calls, ["litesignin click Steve"])
-        await self.run_message("cp 签到")
+        await self.run_message("签到")
         self.assertEqual(len(self.mc_calls), 1)
 
     async def test_mc_empty_response_is_unknown_not_credit(self):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
         self.mc_results = [("", "direct")]
-        _, replies = await self.run_message("cp 签到")
+        _, replies = await self.run_message("签到")
         self.assertIn("未确认", replies[0])
         self.assertEqual(self.store.balance(self.session, "100"), 0)
 
@@ -358,7 +360,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.run_message("兑换", woken=False)
         self.assertEqual(self.store.balance(self.session, "100"), 70)
         self.store.delete_session(self.session)
-        event, replies = await self.run_message("cp 签到")
+        event, replies = await self.run_message("签到")
         self.assertEqual(replies, [])
         self.assertFalse(event.stopped)
         event, replies = await self.run_message("兑换", woken=False)
@@ -381,8 +383,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_successful_mc_credits_only_once_and_includes_response(self):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
-        _, first = await self.run_message("cp 签到")
-        _, duplicate = await self.run_message("cp 签到")
+        _, first = await self.run_message("签到")
+        _, duplicate = await self.run_message("签到")
         self.assertIn("签到成功", first[0])
         self.assertIn("成功给玩家 Steve", first[0])
         self.assertIn("不会重复", duplicate[0])
@@ -401,27 +403,101 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SECRET-ONE", self.private_calls[0]["message"][0]["data"]["text"])
 
     async def test_session_prefixes_are_independent(self):
-        self.store.save_settings(self.other, {**self.settings, "command_prefix": "gp"})
-        for message, session in (("gp 商店", self.session), ("cp 商店", self.other)):
+        self.configure(checkin_prefix="qd")
+        self.store.save_settings(self.other, {**self.settings, "command_prefix": "gp", "checkin_prefix": "mc"})
+        for message, session in (("gp 商店", self.session), ("cp 商店", self.other),
+                                 ("qd 签到", self.other), ("mc 签到", self.session)):
             event, replies = await self.run_message(message, session=session)
             self.assertEqual(replies, [])
             self.assertFalse(event.stopped)
         _, replies = await self.run_message("gp 商店 列表", session=self.other)
         self.assertIn("兑换卡", replies[0])
-        _, replies = await self.run_message("签到", session=self.other)
+        _, replies = await self.run_message("mc 签到", session=self.other)
         self.assertIn("签到成功", replies[0])
         self.assertEqual(self.store.balance(self.session, "100"), 0)
 
-    async def test_exempt_command_name_can_start_with_the_session_prefix(self):
-        self.configure(command_prefix="签到", mc_enabled=True, server_name="Server",
+    async def test_every_native_command_uses_only_its_group_prefix(self):
+        self.configure(checkin_prefix="qd")
+        await self.plugin.refresh_command_settings()
+        expected_checkin = {"签到", "点数", "签到排行榜", "重置签到", "补签"}
+        self.assertEqual(CHECKIN_COMMANDS, expected_checkin)
+        for canonical, entry in self.plugin._command_filters.items():
+            expected = "qd" if canonical in expected_checkin else "cp"
+            other = "cp" if expected == "qd" else "qd"
+            for text, accepted in ((expected + " " + entry.command_name, True),
+                                   (other + " " + entry.command_name, False),
+                                   (entry.command_name, False),
+                                   (expected + entry.command_name, False)):
+                with self.subTest(canonical=canonical, text=text):
+                    self.assertEqual(entry.filter(Event(text, self.bot), {}), accepted)
+            self.assertFalse(entry.filter(Event(expected + " " + entry.command_name, self.bot, woken=False), {}))
+        self.assertEqual(self.mc_calls, [])
+        self.assertEqual(self.private_calls, [])
+
+    async def test_empty_prefixes_require_only_host_wake_for_both_groups(self):
+        self.configure(command_prefix="", checkin_prefix="")
+        self.fund()
+        self.store.create_purchase(self.session, "100", "card")
+        await self.plugin.refresh_command_settings()
+        for canonical, entry in self.plugin._command_filters.items():
+            with self.subTest(canonical=canonical):
+                self.assertTrue(entry.filter(Event(entry.command_name, self.bot), {}))
+                self.assertEqual(entry.filter(Event(entry.command_name, self.bot, woken=False), {}), canonical == "兑换")
+                self.assertFalse(entry.filter(Event("cp " + entry.command_name, self.bot), {}))
+
+    async def test_group_prefixes_survive_native_rename_alias_disable_and_help(self):
+        self.configure(checkin_prefix="qd")
+        self.rename("签到", "每日 签到", {"daily"})
+        self.rename("点数", "余额", {"balance"})
+        self.rename("购买", "购买商品", {"buy"})
+        for text in ("签到", "qd 签到", "daily", "cp DAILY", "balance", "cp balance"):
+            _, replies = await self.run_message(text)
+            self.assertEqual(replies, [])
+        _, first = await self.run_message("qd DAILY")
+        self.assertIn("签到成功", first[0])
+        _, points = await self.run_message("qd BALANCE")
+        self.assertIn("11 星币", points[0])
+        _, help_reply = await self.run_message("cp 帮助")
+        self.assertIn("签到指令：", help_reply[0])
+        self.assertIn("qd 每日 签到", help_reply[0])
+        self.assertIn("qd 重置签到", help_reply[0])
+        self.assertIn("qd 补签", help_reply[0])
+        self.assertIn("点数管理与商店：", help_reply[0])
+        self.assertIn("cp 购买商品", help_reply[0])
+        self.assertNotIn("cp 每日 签到", help_reply[0])
+        self.disable("签到")
+        _, disabled = await self.run_message("qd DAILY")
+        self.assertEqual(disabled, [])
+        _, help_reply = await self.run_message("cp 帮助")
+        self.assertNotIn("qd 每日 签到", help_reply[0])
+
+    async def test_admin_checkin_commands_use_checkin_prefix_and_keep_permissions(self):
+        self.configure(checkin_prefix="qd")
+        await self.run_message("qd 签到")
+        for text in ("cp 重置签到 Steve", "重置签到 Steve", "cp 补签 Alex 2000-01-02", "补签 Alex 2000-01-02"):
+            _, replies = await self.run_message(text, user="901")
+            self.assertEqual(replies, [])
+        _, denied = await self.run_message("qd 重置签到 Steve")
+        self.assertIn("权限", denied[0])
+        _, reset = await self.run_message("qd 重置签到 Steve", user="901")
+        self.assertIn("已重置 100", reset[0])
+        self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
+        self.mc_results = [("成功给玩家 Alex 签到", "queqiao")]
+        _, makeup = await self.run_message("qd 补签 Alex 2000-01-02", user="900", admin=True)
+        self.assertIn("已为 200 补签", makeup[0])
+        self.assertEqual(self.store.balance(self.session, "200"), 11)
+
+    async def test_command_name_equal_to_prefix_still_requires_prefix(self):
+        self.configure(checkin_prefix="签到", mc_enabled=True, server_name="Server",
                        commands=["litesignin click {player}"])
-        self.mc_results = [("1. Steve 10 次", "queqiao"), ("1. Steve 10 次", "queqiao")]
-        for message in ("签到 排行榜", "签到 签到 排行榜"):
-            event, replies = await self.run_message(message)
-            self.assertTrue(event.stopped)
-            self.assertEqual(replies, ["1. Steve 10 次"])
-        self.assertEqual(self.mc_calls, ["signin leaderboard", "signin leaderboard"])
-        _, replies = await self.run_message("签到")
+        self.mc_results = [("1. Steve 10 次", "queqiao")]
+        for message in ("签到 排行榜", "签到", "cp 签到 排行榜"):
+            _, replies = await self.run_message(message)
+            self.assertEqual(replies, [])
+        _, ranking = await self.run_message("签到 签到 排行榜")
+        self.assertEqual(ranking, ["1. Steve 10 次"])
+        self.assertEqual(self.mc_calls, ["signin leaderboard"])
+        _, replies = await self.run_message("签到 签到")
         self.assertIn("签到成功", replies[0])
         self.assertEqual(self.store.balance(self.session, "100"), 11)
 
@@ -438,12 +514,13 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.private_calls), 2)
         self.assertNotEqual(self.private_calls[0], self.private_calls[1])
 
-    async def test_renamed_exempt_name_can_start_with_prefix(self):
+    async def test_renamed_checkin_name_can_start_with_required_prefix(self):
+        self.configure(checkin_prefix="cp")
         self.rename("签到", "cp 日常")
         _, first = await self.run_message("cp 日常")
-        self.assertIn("签到成功", first[0])
+        self.assertEqual(first, [])
         _, second = await self.run_message("cp cp 日常")
-        self.assertIn("不会重复", second[0])
+        self.assertIn("签到成功", second[0])
         self.assertEqual(self.store.balance(self.session, "100"), 11)
 
     async def test_renames_and_disabled_handlers_have_no_legacy_route(self):
@@ -531,26 +608,26 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_reset_requires_admin_and_preserves_balance_and_history(self):
         await self.run_message("签到")
         original_id = self.store.history(self.session)[0]["id"]
-        _, denied = await self.run_message("cp 重置签到 Steve")
+        _, denied = await self.run_message("重置签到 Steve")
         self.assertIn("权限", denied[0])
         self.assertIsNotNone(self.store.get_checkin(original_id))
-        _, reset = await self.run_message("cp 重置签到 Steve", user="901")
+        _, reset = await self.run_message("重置签到 Steve", user="901")
         self.assertIn("已重置 100", reset[0])
         self.assertEqual(self.store.balance(self.session, "100"), 11)
         self.assertIsNone(self.store.get_checkin(original_id))
         self.assertIn("reset_at", self.store.history(self.session)[0])
         self.assertEqual(self.mc_calls, [])
         await self.run_message("签到")
-        _, reset_again = await self.run_message("cp 重置签到 @100", user="900", admin=True)
+        _, reset_again = await self.run_message("重置签到 @100", user="900", admin=True)
         self.assertIn("已重置 100", reset_again[0])
         self.assertEqual(self.store.balance(self.session, "100"), 22)
 
     async def test_makeup_requires_admin_and_valid_past_date(self):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
-        _, denied = await self.run_message("cp 补签 Alex 2000-01-02")
+        _, denied = await self.run_message("补签 Alex 2000-01-02")
         self.assertIn("权限", denied[0])
         for day in ("2000-02-30", "9999-12-31", "not-a-date"):
-            _, invalid = await self.run_message("cp 补签 Alex " + day, user="901")
+            _, invalid = await self.run_message("补签 Alex " + day, user="901")
             self.assertTrue(invalid)
             self.assertNotIn("已为 200 补签", invalid[0])
         self.assertEqual(self.mc_calls, [])
@@ -560,13 +637,13 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_makeup_mc_failure_returns_actual_response_and_never_credits(self):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
         self.mc_results = [("§c玩家 Alex 已经签到，请不要重复签到。", "queqiao")]
-        _, failed = await self.run_message("cp 补签 Alex 2000-01-02", user="901")
+        _, failed = await self.run_message("补签 Alex 2000-01-02", user="901")
         self.assertIn("请不要重复签到", failed[0])
         self.assertNotIn("§c", failed[0])
         self.assertNotIn("已为 200 补签", failed[0])
         self.assertEqual(self.store.balance(self.session, "200"), 0)
         self.assertEqual(self.mc_calls, ["signin click 2000-01-02 Alex"])
-        await self.run_message("cp 补签 Alex 2000-01-02", user="901")
+        await self.run_message("补签 Alex 2000-01-02", user="901")
         self.assertEqual(len(self.mc_calls), 1)
         self.assertEqual(self.store.balance(self.session, "200"), 0)
 
@@ -574,10 +651,10 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"],
                        date_rules=[dict(date="2000-01-03", multiplier=2)])
         self.mc_results = [("成功给玩家 Alex 签到", "queqiao")]
-        _, success = await self.run_message("cp 补签 Alex 2000-01-03", user="900", admin=True)
+        _, success = await self.run_message("补签 Alex 2000-01-03", user="900", admin=True)
         self.assertIn("已为 200 补签 2000-01-03", success[0])
         self.assertIn("22 星币", success[0])
-        _, duplicate = await self.run_message("cp 补签 Alex 2000-01-03", user="901")
+        _, duplicate = await self.run_message("补签 Alex 2000-01-03", user="901")
         self.assertIn("不会重复", duplicate[0])
         self.assertEqual(self.mc_calls, ["signin click 2000-01-03 Alex"])
         self.assertEqual(self.store.balance(self.session, "200"), 22)

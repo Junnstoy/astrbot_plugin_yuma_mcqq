@@ -27,6 +27,19 @@ class SettingsTests(unittest.TestCase):
         first["windows"].clear()
         self.assertEqual(second["windows"], [{"start": "00:00", "end": "23:59"}])
         self.assertFalse(second["enabled"])
+        self.assertEqual(second["checkin_prefix"], "")
+
+    def test_both_command_prefixes_are_independent_and_validated(self):
+        configured = validate_settings({"checkin_prefix": "  mc  ", "command_prefix": "萌妹点"})
+        self.assertEqual(configured["checkin_prefix"], "mc")
+        self.assertEqual(configured["command_prefix"], "萌妹点")
+        self.assertEqual(validate_settings({"command_prefix": "shop"})["checkin_prefix"], "")
+        self.assertEqual(validate_settings({"checkin_prefix": "mc"})["command_prefix"], "")
+        for key in ("checkin_prefix", "command_prefix"):
+            for value in (None, True, 123, [], {}, "a" * 31, "two words", "a\tb", "a\nb", "a\x00b"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    validate_settings({key: value})
+            self.assertEqual(validate_settings({key: ""})[key], "")
 
     def test_invalid_values(self):
         cases = [
@@ -134,6 +147,18 @@ class StoreTests(unittest.TestCase):
 
     def checkin(self, user="10001", player="", now=None):
         return self.store.checkin(self.session, user, player, self.today if now is None else now)
+
+    def test_group_prefixes_roundtrip_per_session_and_invalid_save_keeps_configuration(self):
+        self.configure(checkin_prefix="mc", command_prefix="shop")
+        self.store.save_settings("other:GroupMessage:1", {**self.settings, "checkin_prefix": "qd", "command_prefix": "points"})
+        restarted = Store(self.path)
+        for session, expected in ((self.session, ("mc", "shop")), ("other:GroupMessage:1", ("qd", "points"))):
+            settings = restarted.get_settings(session)
+            self.assertEqual((settings["checkin_prefix"], settings["command_prefix"]), expected)
+        before = restarted.get_settings(self.session)
+        with self.assertRaises(ValueError):
+            restarted.save_settings(self.session, {**before, "checkin_prefix": "two words"})
+        self.assertEqual(restarted.get_settings(self.session), before)
 
     def test_disabled_and_unconfigured_sessions(self):
         self.assertEqual(self.store.checkin("another", "1", now=self.today)["status"], "disabled")

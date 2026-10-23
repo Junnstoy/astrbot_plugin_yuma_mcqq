@@ -3,7 +3,7 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
-  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [], makeup_commands: ['signin click {date} {player}'], leaderboard_command: 'signin leaderboard', currency_name: '点数', command_prefix: '', admin_ids: [], confirmation_minutes: 3, mc_success_keywords: [], mc_failure_keywords: [], products: [], templates: {} };
+  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [], makeup_commands: ['signin click {date} {player}'], leaderboard_command: 'signin leaderboard', currency_name: '点数', checkin_prefix: '', command_prefix: '', admin_ids: [], confirmation_minutes: 3, mc_success_keywords: [], mc_failure_keywords: [], products: [], templates: {} };
   const templateNames = { checkin_success: '签到成功', checkin_pending: '签到处理中', checkin_duplicate: '重复签到', checkin_disabled: '签到未启用', checkin_outside_window: '不在签到时间', checkin_unbound: '尚未绑定', checkin_mc_failed: '游戏签到失败', checkin_mc_unknown: '游戏结果未知', balance: '查询余额', shop_list: '商店列表', shop_item: '单件商品介绍', purchase_pending: '等待兑换确认', purchase_delivered: '奖励已发放', purchase_private: '私聊奖励内容', purchase_failed: '兑换发放失败', ranking: '排行榜', ranking_item: '单条排名', admin_reset: '管理员重置签到', makeup_success: '补签成功', makeup_duplicate: '补签日期已有签到', admin_adjust: '管理员调整余额', admin_query: '管理员查询余额', no_permission: '权限不足', usage: '指令使用说明' };
   const templateFields = ['user_id', 'player', 'points', 'total', 'currency_name', 'day', 'mc_state', 'minutes', 'product_name', 'product_id', 'price', 'order_id', 'reward', 'old', 'delta', 'target_id', 'items', 'stock', 'rank', 'command_list', 'confirmation_command'];
   let state = { sessions: [], servers: [], session: '', binding_count: 0 };
@@ -155,7 +155,7 @@
       mc_enabled: $('mc-enabled').checked, server_name: $('server-name').value,
       require_binding: $('require-binding').checked,
       commands: lines($('commands').value), makeup_commands: lines($('makeup-commands').value), leaderboard_command: $('leaderboard-command').value.trim(),
-      currency_name: $('currency-name').value.trim(), command_prefix: $('command-prefix').value.trim(),
+      currency_name: $('currency-name').value.trim(), checkin_prefix: $('checkin-prefix').value.trim(), command_prefix: $('command-prefix').value.trim(),
       admin_ids: lines($('admin-ids').value), confirmation_minutes: Number($('confirmation-minutes').value),
       mc_success_keywords: lines($('mc-success-keywords').value), mc_failure_keywords: lines($('mc-failure-keywords').value),
       products: [...$('products-list').children].map(row => ({ id: row.querySelector('[data-field="id"]').value.trim(), name: row.querySelector('[data-field="name"]').value.trim(), price: Number(row.querySelector('[data-field="price"]').value), purchase_limit: Number(row.querySelector('[data-field="purchase_limit"]').value), enabled: row.querySelector('[data-field="enabled"]').checked, reward_type: row.querySelector('[data-field="reward_type"]').value, reward_text: row.querySelector('[data-field="reward_text"]').value, codes: lines(row.querySelector('[data-field="codes"]').value) })),
@@ -164,6 +164,7 @@
   }
   function validate(data) {
     if (data.max_points < data.min_points) throw new Error('最高点数不能小于最低点数。');
+    if (/\s/.test(data.checkin_prefix) || /\s/.test(data.command_prefix)) throw new Error('签到指令前缀和商店及点数管理前缀均不能包含空格或其他空白字符。');
     try { new Intl.DateTimeFormat('zh-CN', { timeZone: data.timezone }); } catch { throw new Error('时区无效，请填写 Asia/Shanghai 等 IANA 时区名称。'); }
     const seen = new Set();
     for (const rule of data.date_rules) {
@@ -185,6 +186,9 @@
   }
   function preview() {
     const data = collect();
+    const checkinPrefix = data.checkin_prefix ? `${data.checkin_prefix} ` : '';
+    const managementPrefix = data.command_prefix ? `${data.command_prefix} ` : '';
+    $('prefix-preview').textContent = `以 # 为 AstrBot 唤醒头：#${checkinPrefix}签到、#${checkinPrefix}点数、#${managementPrefix}商店列表。非空前缀必须填写，两个前缀分别生效。`;
     $('stat-points').textContent = `${data.min_points}–${data.max_points}`;
     $('stat-currency').textContent = `${data.currency_name || '点数'} / 次`;
     $('stat-dates').textContent = data.date_rules.length;
@@ -208,6 +212,7 @@
     $('makeup-commands').value = settings.makeup_commands.join('\n');
     $('leaderboard-command').value = settings.leaderboard_command;
     $('currency-name').value = settings.currency_name;
+    $('checkin-prefix').value = settings.checkin_prefix;
     $('command-prefix').value = settings.command_prefix;
     $('admin-ids').value = settings.admin_ids.join('\n');
     $('confirmation-minutes').value = settings.confirmation_minutes;

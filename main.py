@@ -13,7 +13,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import request, json_response
 from astrbot.core.star.filter.command import GreedyStr
 
-from .core import TEMPLATE_FIELDS, classify_mc_output, validate_settings
+from .core import CHECKIN_COMMANDS, TEMPLATE_FIELDS, classify_mc_output, validate_settings
 from .command_filters import install_command_filters
 from .routing import render_reply
 from .store import Store
@@ -70,19 +70,21 @@ class CheckinPointsPlugin(Star):
         self._command_settings = {row["session"]: {
             "enabled": row["settings"]["enabled"],
             "command_prefix": row["settings"]["command_prefix"],
+            "checkin_prefix": row["settings"]["checkin_prefix"],
         } for row in sessions}
 
     def command_help(self, settings):
-        names = []
-        prefix = settings["command_prefix"]
+        groups = {"签到指令": [], "点数管理与商店": []}
         for canonical, entry in self._command_filters.items():
             if not entry.handler_md.enabled:
                 continue
+            is_checkin = canonical in CHECKIN_COMMANDS
+            prefix = settings["checkin_prefix" if is_checkin else "command_prefix"]
             name = entry.command_name
-            if prefix and canonical not in {"签到", "点数", "签到排行榜"}:
+            if prefix:
                 name = prefix + " " + name
-            names.append(name)
-        return "、".join(names)
+            groups["签到指令" if is_checkin else "点数管理与商店"].append(name)
+        return "\n".join(label + "：" + "、".join(names) for label, names in groups.items() if names)
 
     async def resume_pending(self):
         while True:
@@ -209,7 +211,7 @@ class CheckinPointsPlugin(Star):
 
     @filter.command("签到 排行榜", priority=20)
     async def cmd_mc_ranking(self, event: AstrMessageEvent, args: GreedyStr):
-        """查询 Minecraft 签到排行榜（不要求插件前缀）。"""
+        """查询 Minecraft 签到排行榜，使用本会话签到指令前缀。"""
         async for result in self.handle_command(event, "签到排行榜", args):
             yield result
 
@@ -221,13 +223,13 @@ class CheckinPointsPlugin(Star):
 
     @filter.command("签到", alias={"checkin"}, priority=10)
     async def cmd_checkin(self, event: AstrMessageEvent, args: GreedyStr):
-        """每日签到（不要求插件前缀）。"""
+        """每日签到，使用本会话签到指令前缀。"""
         async for result in self.handle_command(event, "签到", args):
             yield result
 
     @filter.command("点数", alias={"points"}, priority=10)
     async def cmd_points(self, event: AstrMessageEvent, args: GreedyStr):
-        """查询自己的点数（不要求插件前缀）。"""
+        """查询自己的点数，使用本会话签到指令前缀。"""
         async for result in self.handle_command(event, "点数", args):
             yield result
 

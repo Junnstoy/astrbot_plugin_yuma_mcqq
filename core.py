@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from string import Formatter
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+CHECKIN_COMMANDS = frozenset({"签到", "点数", "签到排行榜", "重置签到", "补签"})
+
 TEMPLATE_FIELDS = frozenset({
     "user_id", "player", "points", "total", "currency_name", "day", "mc_state",
     "minutes", "product_name", "product_id", "price", "order_id", "reward", "old",
@@ -38,7 +40,7 @@ DEFAULT_TEMPLATES = {
     "makeup_success": "已为 {target_id} 补签 {day}，获得 {points} {currency_name}，余额：{total} {currency_name}。",
     "makeup_duplicate": "{target_id} 在 {day} 已有签到记录，不会重复补签。余额：{total} {currency_name}。",
     "no_permission": "你没有本会话的{currency_name}管理权限。",
-    "usage": "签到、点数及签到排行榜仅需 AstrBot 唤醒头；其余命令需唤醒头和本会话插件前缀。可用命令：{command_list}",
+    "usage": "请先使用 AstrBot 唤醒头，再输入对应分组的前缀和命令（前缀为空时省略）。可用命令：\n{command_list}",
 }
 
 DEFAULT_SETTINGS = {
@@ -56,6 +58,7 @@ DEFAULT_SETTINGS = {
     "require_binding": True,
     "currency_name": "点数",
     "command_prefix": "",
+    "checkin_prefix": "",
     "admin_ids": [],
     "confirmation_minutes": 3,
     "mc_success_keywords": ["签到成功", "成功给玩家", "今日签到已完成", "sign in success", "signin success", "successfully signed in"],
@@ -161,9 +164,10 @@ def validate_settings(settings: dict) -> dict:
     result["currency_name"] = _clean_string(result["currency_name"], "点数名称", 30)
     if not result["currency_name"]:
         raise ValueError("点数名称不能为空")
-    result["command_prefix"] = _clean_string(result["command_prefix"], "指令前缀", 30)
-    if any(char.isspace() for char in result["command_prefix"]):
-        raise ValueError("指令前缀不能包含空白")
+    for key, label in (("command_prefix", "点数管理与商店前缀"), ("checkin_prefix", "签到指令前缀")):
+        result[key] = _clean_string(result[key], label, 30)
+        if any(char.isspace() for char in result[key]):
+            raise ValueError(f"{label}不能包含空白")
     if not isinstance(result["admin_ids"], list) or len(result["admin_ids"]) > 1000:
         raise ValueError("管理员 ID 必须为列表")
     result["admin_ids"] = list(dict.fromkeys(_clean_string(value, "管理员 ID", 256) for value in result["admin_ids"]))

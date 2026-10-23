@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 import sqlite3
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,8 +17,8 @@ PACKAGE = "checkin_points_test_package"
 package = types.ModuleType(PACKAGE)
 package.__path__ = [str(Path(__file__).resolve().parents[1])]
 sys.modules[PACKAGE] = package
-from checkin_points_test_package.core import award_points, classify_mc_output, validate_settings
-from checkin_points_test_package.store import Store
+from checkin_points_test_package.core import DEFAULT_TEMPLATES, award_points, classify_mc_output, render_commands, validate_settings
+from checkin_points_test_package.store import LEGACY_TEMPLATES, LEGACY_USAGE, Store
 
 
 class SettingsTests(unittest.TestCase):
@@ -86,6 +87,30 @@ class SettingsTests(unittest.TestCase):
         for price in [2**53, 2**63-1, 1.5, True]:
             with self.subTest(price=price), self.assertRaises(ValueError):
                 validate_settings({"products": [{**product, "price": price}]})
+
+    def test_purchase_limit_validation(self):
+        product = dict(id="limited", name="奖品", price=1, reward_text="奖励")
+        self.assertEqual(validate_settings({"products": [product]})["products"][0]["purchase_limit"], 0)
+        self.assertEqual(validate_settings({})["currency_name"], "点数")
+        for limit in [-1, True, 1.5, "2", 2**53]:
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                validate_settings({"products": [{**product, "purchase_limit": limit}]})
+
+    def test_makeup_and_leaderboard_command_validation(self):
+        settings = validate_settings({"commands": ["signin click {date} {player}"]})
+        self.assertEqual(settings["makeup_commands"], ["signin click {date} {player}"])
+        self.assertEqual(settings["leaderboard_command"], "signin leaderboard")
+        self.assertEqual(render_commands(settings, "Alex", 10, "1", date="2020-02-29"), ["signin click 2020-02-29 Alex"])
+        for value in [None, "2020-2-29", "2021-02-29", "2020-01-01\nstop"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                render_commands(settings, "Alex", 10, "1", date=value)
+        self.assertEqual(render_commands({"commands": ["signin {player}"]}, "Alex", 10, "1"), ["signin Alex"])
+        for value in [{"makeup_commands": ["signin {date.__class__}"]},
+                      {"makeup_commands": ["signin {date}\nstop"]},
+                      {"leaderboard_command": "signin leaderboard\nstop"},
+                      {"leaderboard_command": "signin {player}"}]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_settings(value)
 
 
 class StoreTests(unittest.TestCase):
@@ -343,6 +368,158 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.store.get_checkin(record["id"])["credited"])
         self.assertEqual(self.store.balance(self.session, "1"), 2**63-1)
 
+    def test_v3_migrates_only_old_currency_and_default_usage_once(self):
+        old = {**self.settings, "currency_name": "积分", "templates": dict(LEGACY_TEMPLATES)}
+        custom = {**self.settings, "currency_name": "金币", "templates": {
+            "usage": "自定义积分使用说明", "purchase_pending": "自定义兑换提醒", "purchase_failed": "自定义重试说明"}}
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE session_settings SET settings=? WHERE session=?", (json.dumps(old), self.session))
+            db.execute("INSERT INTO session_settings(session,settings) VALUES(?,?)", ("custom", json.dumps(custom)))
+            db.execute("PRAGMA user_version=2")
+        db.close()
+        upgraded = Store(self.path)
+        self.assertEqual(upgraded.get_settings(self.session)["currency_name"], "点数")
+        self.assertEqual(upgraded.get_settings(self.session)["templates"]["usage"], DEFAULT_TEMPLATES["usage"])
+        for key in LEGACY_TEMPLATES:
+            self.assertEqual(upgraded.get_settings(self.session)["templates"][key], DEFAULT_TEMPLATES[key])
+        self.assertEqual(upgraded.get_settings("custom")["currency_name"], "金币")
+        self.assertEqual(upgraded.get_settings("custom")["templates"]["usage"], "自定义积分使用说明")
+        self.assertEqual(upgraded.get_settings("custom")["templates"]["purchase_pending"], "自定义兑换提醒")
+        self.assertEqual(upgraded.get_settings("custom")["templates"]["purchase_failed"], "自定义重试说明")
+        upgraded.save_settings("custom", {**custom, "currency_name": "积分"})
+        self.assertEqual(Store(self.path).get_settings("custom")["currency_name"], "积分")
+
+    def test_makeup_ignores_window_uses_target_date_multiplier_and_real_audit_time(self):
+        self.mc_settings()
+        self.configure(windows=[{"start": "00:00", "end": "00:00"}],
+                       date_rules=[{"date": "2020-01-01", "multiplier": 2}])
+        self.assertEqual(self.checkin("1")["status"], "outside_window")
+        record = self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin-1")
+        self.assertEqual((record["status"], record["points"], record["day"], record["credited"]),
+                         ("success", 22, "2020-01-01", False))
+        self.assertEqual(self.store.balance(self.session, "1"), 0)
+        self.store.claim_mc(record["id"])
+        self.store.set_mc_state(record["id"], "sent")
+        self.assertTrue(self.store.get_checkin(record["id"])["credited"])
+        self.assertFalse(record["created_at"].startswith("2020-01-01"))
+        audit = next(row for row in self.store.audit(self.session) if row["operation"] == "makeup_requested")
+        self.assertEqual((audit["delta"], audit["actor"]), (0, "admin-1"))
+        duplicate = self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin-2")
+        self.assertEqual((duplicate["status"], duplicate["total"]), ("duplicate", 22))
+        self.assertEqual(sum(row["operation"] == "makeup_requested" for row in self.store.audit(self.session)), 1)
+
+    def test_makeup_future_or_invalid_dates_never_change_balance(self):
+        for day in ["2999-01-01", "2020-1-01", "2021-02-29", "2020-01-01\nstop", "2020-01-01T12:00:00"]:
+            with self.subTest(day=day), self.assertRaises(ValueError):
+                self.store.makeup_checkin(self.session, "1", "Alex", day, "admin")
+        self.assertEqual(self.store.balance(self.session, "1"), 0)
+        self.assertEqual(self.store.history(self.session), [])
+
+    def test_makeup_today_allowed_and_future_uses_session_local_day(self):
+        self.mc_settings()
+        with patch(f"{PACKAGE}.store.local_now", return_value=datetime(2026, 10, 23, 23, 59)):
+            self.assertEqual(self.store.makeup_checkin(self.session, "1", "Alex", "2026-10-23", "admin")["status"], "success")
+            with self.assertRaises(ValueError):
+                self.store.makeup_checkin(self.session, "1", "Alex", "2026-10-24", "admin")
+        with patch(f"{PACKAGE}.store.local_now", return_value=datetime(2026, 10, 24, 0, 0)):
+            self.assertEqual(self.store.makeup_checkin(self.session, "1", "Alex", "2026-10-24", "admin")["status"], "success")
+
+    def test_makeup_requires_mc_and_binding_even_when_binding_is_optional(self):
+        with self.assertRaisesRegex(ValueError, "开启 MC 联动"):
+            self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin")
+        self.assertEqual(self.store.history(self.session), [])
+        self.assertEqual(self.store.audit(self.session), [])
+        self.assertEqual(self.store.balance(self.session, "1"), 0)
+        self.mc_settings(require_binding=False)
+        for player in ["", "@a", "Alex\nstop"]:
+            with self.subTest(player=player):
+                self.assertEqual(self.store.makeup_checkin(self.session, "1", player, "2020-01-01", "admin")["status"], "unbound")
+        self.assertEqual(self.store.history(self.session), [])
+        self.assertEqual(self.store.audit(self.session), [])
+        # The transaction reads the latest configuration, not the caller's cached one.
+        self.configure(mc_enabled=False)
+        with self.assertRaisesRegex(ValueError, "开启 MC 联动"):
+            self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin")
+        self.assertEqual(self.checkin("1")["status"], "success")
+        self.assertEqual(self.store.balance(self.session, "1"), 11)
+
+    def test_makeup_mc_success_required_and_failed_day_cannot_replay(self):
+        self.mc_settings()
+        for user, state in [("1", "sent"), ("2", "failed"), ("3", "unknown")]:
+            record = self.store.makeup_checkin(self.session, user, "Alex", "2020-01-01", "admin")
+            self.assertEqual(record["commands"], ["signin click 2020-01-01 Alex"])
+            self.assertFalse(record["credited"])
+            self.store.claim_mc(record["id"])
+            self.store.set_mc_state(record["id"], state)
+            self.assertEqual(self.store.balance(self.session, user), 11 if state == "sent" else 0)
+            self.assertEqual(self.store.makeup_checkin(self.session, user, "Alex", "2020-01-01", "admin")["status"], "duplicate")
+
+    def test_makeup_honors_enabled_binding_and_configured_mc_commands(self):
+        self.mc_settings()
+        self.assertEqual(self.store.makeup_checkin(self.session, "1", "", "2020-01-01", "admin")["status"], "unbound")
+        self.configure(makeup_commands=[])
+        with self.assertRaisesRegex(ValueError, "补签指令"):
+            self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin")
+        self.configure(enabled=False)
+        self.assertEqual(self.store.makeup_checkin(self.session, "1", "Alex", "2020-01-01", "admin")["status"], "disabled")
+
+    def test_normal_command_date_is_current_session_day(self):
+        self.mc_settings()
+        self.configure(commands=["signin click {date} {player}"])
+        self.assertEqual(self.checkin(player="Alex")["commands"], ["signin click 2026-10-23 Alex"])
+
+    def test_reset_archives_record_preserves_points_and_allows_explicit_second_award(self):
+        first = self.checkin("1")
+        reset = self.store.reset_checkin(self.session, "1", "admin", now=self.today)
+        self.assertEqual((reset["removed"], reset["day"], reset["total"]), (True, "2026-10-23", 11))
+        self.assertIsNone(self.store.get_checkin(first["id"]))
+        archived = self.store.history(self.session)[0]
+        for key in ("id", "player", "points", "total", "created_at", "commands", "mc_state", "credited"):
+            self.assertEqual(archived[key], first[key])
+        self.assertEqual(archived["actor"], "admin")
+        self.assertTrue(archived["reset_at"])
+        second = self.checkin("1")
+        self.assertGreater(second["id"], first["id"])
+        self.assertEqual(second["total"], 22)
+        self.assertEqual(len(self.store.history(self.session)), 2)
+        self.assertEqual(self.store.history(self.session, 1)[0]["id"], second["id"])
+
+    def test_reset_pending_stops_stale_worker_and_sending_is_rejected(self):
+        self.mc_settings()
+        first = self.checkin("1", "Alex")
+        self.store.reset_checkin(self.session, "1", "admin", now=self.today)
+        self.assertFalse(self.store.claim_mc(first["id"]))
+        self.store.set_mc_state(first["id"], "sent")
+        self.assertEqual(self.store.balance(self.session, "1"), 0)
+        second = self.checkin("1", "Alex")
+        self.store.claim_mc(second["id"])
+        with self.assertRaisesRegex(ValueError, "正在执行"):
+            self.store.reset_checkin(self.session, "1", "admin", now=self.today)
+        self.assertEqual(self.store.get_checkin(second["id"])["mc_state"], "sending")
+        self.store.set_mc_state(second["id"], "failed")
+        self.assertTrue(self.store.reset_checkin(self.session, "1", "admin", now=self.today)["removed"])
+
+    def test_reset_only_todays_target_user_in_current_session(self):
+        self.checkin("1", now=datetime(2026, 10, 22))
+        self.checkin("2")
+        self.store.save_settings("other", self.settings)
+        self.store.checkin("other", "1", now=self.today)
+        result = self.store.reset_checkin(self.session, "1", "admin", now=self.today)
+        self.assertFalse(result["removed"])
+        self.assertEqual(len(self.store.history(self.session)), 2)
+        self.assertEqual(len(self.store.history("other")), 1)
+
+    def test_v4_migration_keeps_v3_balances_and_adds_reset_archive(self):
+        self.checkin("1")
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE checkin_resets")
+            db.execute("PRAGMA user_version=3")
+        db.close()
+        upgraded = Store(self.path)
+        self.assertEqual(upgraded.balance(self.session, "1"), 11)
+        self.assertTrue(upgraded.reset_checkin(self.session, "1", "admin", now=self.today)["removed"])
+        self.assertEqual(upgraded.history(self.session)[0]["actor"], "admin")
+
 
 class ShopTests(unittest.TestCase):
     session = "mybot:GroupMessage:123456789"
@@ -483,6 +660,101 @@ class ShopTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.create(product="text")
         self.assertEqual(len(self.store.orders(self.session)), 1)
+
+    def delivered(self, order):
+        self.assertTrue(self.store.claim_delivery(order["id"]))
+        self.store.finish_delivery(order["id"], True)
+
+    def test_allocated_codes_removed_from_storage_settings_and_sessions(self):
+        self.create()
+        paid = self.confirm()
+        self.assertEqual(self.store.get_settings(self.session)["products"][1]["codes"], ["secret-B"])
+        self.assertEqual(self.store.sessions()[0]["settings"]["products"][1]["codes"], ["secret-B"])
+        self.store.claim_delivery(paid["id"])
+        self.store.finish_delivery(paid["id"], False)
+        cleaned = self.store.save_settings(self.session, self.settings)
+        with sqlite3.connect(self.store.path) as db:
+            raw = json.loads(db.execute("SELECT settings FROM session_settings WHERE session=?", (self.session,)).fetchone()[0])
+        db.close()
+        self.assertEqual(cleaned["products"][1]["codes"], ["secret-B"])
+        self.assertEqual(raw["products"][1]["codes"], ["secret-B"])
+        self.assertEqual(self.confirm()["reward"], "secret-A")
+
+    def test_two_pending_users_can_buy_after_pool_changes(self):
+        self.create("1")
+        self.create("2")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            orders = list(pool.map(self.confirm, ["1", "2"]))
+        self.assertEqual({row["reward"] for row in orders}, {"secret-A", "secret-B"})
+        self.assertEqual(self.store.get_settings(self.session)["products"][1]["codes"], [])
+        self.assertEqual([self.store.balance(self.session, user) for user in ["1", "2"]], [70, 70])
+
+    def test_confirm_and_admin_add_code_do_not_lose_new_inventory(self):
+        self.create()
+        expanded = {**self.settings, "products": [dict(p) for p in self.settings["products"]]}
+        expanded["products"][1]["codes"] = ["secret-A", "secret-B", "secret-C"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            buy = pool.submit(self.confirm)
+            save = pool.submit(self.store.save_settings, self.session, expanded)
+            buy.result()
+            save.result()
+        self.assertEqual(self.store.get_settings(self.session)["products"][1]["codes"], ["secret-B", "secret-C"])
+
+    def test_purchase_limit_counts_paid_once_and_delivery_retries_do_not_count_again(self):
+        self.settings["products"][0]["purchase_limit"] = 2
+        self.store.save_settings(self.session, self.settings)
+        self.create(product="text")
+        first = self.confirm()
+        for _ in range(3):
+            self.store.claim_delivery(first["id"])
+            self.store.finish_delivery(first["id"], False)
+            self.assertEqual(self.confirm()["id"], first["id"])
+        self.delivered(first)
+        self.create(product="text")
+        second = self.confirm()
+        self.delivered(second)
+        with self.assertRaisesRegex(ValueError, "限购"):
+            self.create(product="text")
+        self.assertEqual(self.store.balance(self.session, "1"), 80)
+        self.assertEqual(self.store.product_catalog(self.session)[0]["purchase_limit"], 2)
+        self.create("2", "text")
+        self.assertEqual(self.confirm("2")["status"], "paid")
+
+    def test_limit_rechecked_using_latest_settings_at_confirmation(self):
+        self.create(product="text")
+        self.delivered(self.confirm())
+        self.create(product="text")
+        self.settings["products"][0]["purchase_limit"] = 1
+        self.store.save_settings(self.session, self.settings)
+        with self.assertRaisesRegex(ValueError, "限购"):
+            self.confirm()
+        self.assertEqual(self.store.balance(self.session, "1"), 90)
+        self.settings["products"][0]["purchase_limit"] = 2
+        self.store.save_settings(self.session, self.settings)
+        self.assertEqual(self.confirm()["status"], "paid")
+
+    def test_expired_cancelled_pending_do_not_use_purchase_limit(self):
+        self.settings["products"][0]["purchase_limit"] = 1
+        self.store.save_settings(self.session, self.settings)
+        self.create(product="text")
+        self.create(product="text")
+        with self.assertRaises(ValueError):
+            self.confirm(now=self.now + timedelta(minutes=3))
+        self.create(product="text")
+        self.delivered(self.confirm())
+        with self.assertRaisesRegex(ValueError, "限购"):
+            self.create(product="text")
+
+    def test_limit_and_code_usage_persist_across_delete_and_recreate(self):
+        self.settings["products"][1]["purchase_limit"] = 1
+        self.store.save_settings(self.session, self.settings)
+        self.create()
+        self.delivered(self.confirm())
+        self.store.delete_session(self.session)
+        self.store.save_settings(self.session, self.settings)
+        self.assertEqual(self.store.get_settings(self.session)["products"][1]["codes"], ["secret-B"])
+        with self.assertRaisesRegex(ValueError, "限购"):
+            self.create()
 
 
 if __name__ == "__main__":

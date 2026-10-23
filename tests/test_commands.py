@@ -21,44 +21,100 @@ package = types.ModuleType(PACKAGE)
 package.__path__ = [str(ROOT)]
 sys.modules[PACKAGE] = package
 from checkin_points_command_tests.core import TEMPLATE_FIELDS, classify_mc_output, validate_settings
-from checkin_points_command_tests.routing import COMMANDS, parse_command, render_reply
+from checkin_points_command_tests.routing import render_reply
 from checkin_points_command_tests.store import Store
 
-# Compile actual classes, replacing only framework bases/decorators. All command,
-# binding, dispatch, permission and delivery method bodies remain unchanged.
+
+class NativeCommandFilter:
+    """Small host boundary stub; session routing is compiled from the real file.
+
+    Actual AstrBot registration, management persistence and parameter parsing
+    are additionally exercised by the external native integration check.
+    """
+
+    def __init__(self, command_name, alias, handler_md):
+        self.command_name, self.alias, self.handler_md = command_name, alias, handler_md
+        self.custom_filter_list = []
+        self._cmpl_cmd_names = None
+
+    def get_complete_command_names(self):
+        if self._cmpl_cmd_names is None:
+            self._cmpl_cmd_names = [self.command_name, *self.alias]
+        return self._cmpl_cmd_names
+
+    def filter(self, event, cfg):
+        if not event.is_at_or_wake_command:
+            return False
+        if not all(item.filter(event, cfg) for item in self.custom_filter_list):
+            return False
+        text = " ".join(event.get_message_str().split())
+        matched = False
+        # Keep the host's current alias-loop behavior so the wrapper's guard
+        # against consuming an argument as a second alias is exercised.
+        for name in self.get_complete_command_names():
+            if text == name or text.startswith(name + " "):
+                matched = True
+                text = text[len(name):].strip()
+        if matched:
+            event.set_extra("parsed_params", {"args": text})
+        return matched
+
+
+registry = SimpleNamespace(handlers=[])
+registry.get_handlers_by_module_name = lambda module: [
+    handler for handler in registry.handlers if handler.handler_module_path == module]
+filter_tree = ast.parse((ROOT / "command_filters.py").read_text(encoding="utf-8"))
+filter_module = ast.Module(body=[node for node in filter_tree.body
+                                if isinstance(node, (ast.ClassDef, ast.FunctionDef))], type_ignores=[])
+filter_namespace = dict(CommandFilter=NativeCommandFilter, star_handlers_registry=registry)
+exec(compile(ast.fix_missing_locations(filter_module), "actual-command-filters-under-test", "exec"), filter_namespace)
+install_command_filters = filter_namespace["install_command_filters"]
+
+# Compile actual entry methods, replacing only the framework base/decorators.
+# Registration specifications are read from those same native decorators.
 tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
 classes = [node for node in tree.body if isinstance(node, ast.ClassDef)
-           and node.name in {"PointsCommandFilter", "CheckinPointsPlugin"}]
+           and node.name == "CheckinPointsPlugin"]
+command_specs = {}
 for cls in classes:
     cls.bases = [ast.Name(id="object", ctx=ast.Load())]
     for method in cls.body:
         if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in method.decorator_list:
+                if (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute)
+                        and decorator.func.attr == "command"):
+                    options = {item.arg: ast.literal_eval(item.value) for item in decorator.keywords}
+                    command_specs[method.name] = dict(name=ast.literal_eval(decorator.args[0]),
+                        alias=options.get("alias", set()), priority=options.get("priority", 0))
             method.decorator_list = [decorator for decorator in method.decorator_list
                                      if isinstance(decorator, ast.Name) and decorator.id == "staticmethod"]
 module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
                          *classes], type_ignores=[])
 namespace = dict(asyncio=asyncio, contextlib=contextlib, json=json, re=re, Path=Path,
                  logger=logging.getLogger("command-test"), NAME="checkin-test", MC_NAME="mc-test",
-                 COMMANDS=COMMANDS, TEMPLATE_FIELDS=TEMPLATE_FIELDS, Store=Store,
-                 parse_command=parse_command, render_reply=render_reply,
+                 __name__=PACKAGE + ".entry", TEMPLATE_FIELDS=TEMPLATE_FIELDS, Store=Store,
+                 render_reply=render_reply, install_command_filters=install_command_filters,
                  classify_mc_output=classify_mc_output, validate_settings=validate_settings)
 exec(compile(ast.fix_missing_locations(module), "actual-entry-under-test", "exec"), namespace)
 Plugin = namespace["CheckinPointsPlugin"]
-EntryFilter = namespace["PointsCommandFilter"]
 
 
 class Event:
     def __init__(self, text, bot, *, session="mybot:GroupMessage:123456789", user="100",
                  admin=False, woken=True, components=None):
-        self.text, self.bot = text, bot
+        self.message_str, self.bot = text, bot
         self.unified_msg_origin = session
         self.user, self.admin = user, admin
         self.is_at_or_wake_command = woken
         self.components = components or []
         self.stopped = False
+        self.extras = {}
 
     def get_message_str(self):
-        return self.text
+        return self.message_str
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
 
     def get_sender_id(self):
         return self.user
@@ -125,12 +181,40 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._sync_lock = asyncio.Lock()
         self.plugin.context = SimpleNamespace(get_registered_star=lambda _: SimpleNamespace(
             star_cls=mc, activated=True))
+        registry.handlers = []
+        for name, spec in command_specs.items():
+            handler = SimpleNamespace(handler_name=name, handler_module_path=Plugin.__module__,
+                                      priority=spec["priority"], enabled=True)
+            handler.event_filters = [NativeCommandFilter(spec["name"], spec["alias"].copy(), handler)]
+            registry.handlers.append(handler)
+        self.plugin._command_filters = install_command_filters(self.plugin, self.plugin._operations)
+        await self.plugin.refresh_command_settings()
 
     async def run_message(self, text, **kwargs):
+        # Direct store edits in tests simulate UI actions, which refresh this
+        # cache in production before accepting the next message.
+        await self.plugin.refresh_command_settings()
         event = Event(text, self.bot, **kwargs)
-        if not EntryFilter().filter(event, {}):
-            return event, []
-        return event, [reply async for reply in self.plugin.on_command(event)]
+        replies = []
+        for handler in sorted(registry.handlers, key=lambda item: item.priority, reverse=True):
+            if not handler.enabled:
+                continue
+            original = event.message_str, event.is_at_or_wake_command
+            matched = all(item.filter(event, {}) for item in handler.event_filters)
+            self.assertEqual((event.message_str, event.is_at_or_wake_command), original)
+            if matched:
+                arguments = event.extras["parsed_params"]["args"]
+                replies.extend([reply async for reply in getattr(self.plugin, handler.handler_name)(event, arguments)])
+                if event.stopped:
+                    break
+        return event, replies
+
+    def rename(self, canonical, name, aliases=()):
+        entry = self.plugin._command_filters[canonical]
+        entry.command_name, entry.alias, entry._cmpl_cmd_names = name, set(aliases), None
+
+    def disable(self, canonical):
+        self.plugin._command_filters[canonical].handler_md.enabled = False
 
     def configure(self, **changes):
         self.settings.update(changes)
@@ -160,17 +244,21 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.balance(self.session, "200"), 100)
 
     async def test_prefix_wake_and_ai_messages_not_swallowed(self):
-        for text, woken in (("cp 签到", False), ("签到", True), ("cp签到", True),
+        for text, woken in (("cp 签到", False), ("签到", False), ("cp签到", True),
                              ("wrong 签到", True), ("chat 你好", True), ("cp chat 你好", True),
                              ("#cp 签到", True), ("你好", False)):
             with self.subTest(text=text, woken=woken):
                 event, replies = await self.run_message(text, woken=woken)
                 self.assertEqual(replies, [])
                 self.assertFalse(event.stopped)
-        event, replies = await self.run_message("cp 签到")
+        event, replies = await self.run_message("签到")
         self.assertTrue(event.stopped)
         self.assertIn("签到成功", replies[0])
         self.assertEqual(self.store.balance(self.session, "100"), 11)
+        _, replies = await self.run_message("点数")
+        self.assertIn("11 星币", replies[0])
+        _, replies = await self.run_message("cp 点数")
+        self.assertIn("11 星币", replies[0])
 
     async def test_uppercase_english_alias_survives_entry_filter(self):
         _, replies = await self.run_message("cp CHECKIN")
@@ -256,7 +344,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.fund()
         await self.run_message("cp 商店 购买 card")
         self.store.delete_session(self.session)
-        for message in ("cp 签到", "cp 积分", "cp 商店列表", "兑换"):
+        for message in ("签到", "点数", "cp 商店列表", "兑换"):
             event, replies = await self.run_message(message)
             self.assertEqual(replies, [])
             self.assertFalse(event.stopped)
@@ -311,6 +399,203 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         _, second = await self.run_message("兑换", woken=False)
         self.assertNotIn("SECRET-", "\n".join(first + second))
         self.assertIn("SECRET-ONE", self.private_calls[0]["message"][0]["data"]["text"])
+
+    async def test_session_prefixes_are_independent(self):
+        self.store.save_settings(self.other, {**self.settings, "command_prefix": "gp"})
+        for message, session in (("gp 商店", self.session), ("cp 商店", self.other)):
+            event, replies = await self.run_message(message, session=session)
+            self.assertEqual(replies, [])
+            self.assertFalse(event.stopped)
+        _, replies = await self.run_message("gp 商店 列表", session=self.other)
+        self.assertIn("兑换卡", replies[0])
+        _, replies = await self.run_message("签到", session=self.other)
+        self.assertIn("签到成功", replies[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 0)
+
+    async def test_exempt_command_name_can_start_with_the_session_prefix(self):
+        self.configure(command_prefix="签到", mc_enabled=True, server_name="Server",
+                       commands=["litesignin click {player}"])
+        self.mc_results = [("1. Steve 10 次", "queqiao"), ("1. Steve 10 次", "queqiao")]
+        for message in ("签到 排行榜", "签到 签到 排行榜"):
+            event, replies = await self.run_message(message)
+            self.assertTrue(event.stopped)
+            self.assertEqual(replies, ["1. Steve 10 次"])
+        self.assertEqual(self.mc_calls, ["signin leaderboard", "signin leaderboard"])
+        _, replies = await self.run_message("签到")
+        self.assertIn("签到成功", replies[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 11)
+
+    async def test_bare_confirmation_name_and_alias_can_start_with_session_prefix(self):
+        self.fund()
+        self.rename("兑换", "cp 确认", {"cp confirm"})
+        for confirmation in ("cp 确认", "cp CONFIRM"):
+            _, pending = await self.run_message("cp 商店 购买 card")
+            self.assertIn("cp 确认", pending[0])
+            event, confirmed = await self.run_message(confirmation, woken=False)
+            self.assertTrue(event.stopped)
+            self.assertIn("已完成", confirmed[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 40)
+        self.assertEqual(len(self.private_calls), 2)
+        self.assertNotEqual(self.private_calls[0], self.private_calls[1])
+
+    async def test_renamed_exempt_name_can_start_with_prefix(self):
+        self.rename("签到", "cp 日常")
+        _, first = await self.run_message("cp 日常")
+        self.assertIn("签到成功", first[0])
+        _, second = await self.run_message("cp cp 日常")
+        self.assertIn("不会重复", second[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 11)
+
+    async def test_renames_and_disabled_handlers_have_no_legacy_route(self):
+        self.rename("签到", "日常 签到", {"daily"})
+        for message in ("签到", "cp 签到"):
+            event, replies = await self.run_message(message)
+            self.assertEqual(replies, [])
+            self.assertFalse(event.stopped)
+        _, replies = await self.run_message("DAILY")
+        self.assertIn("签到成功", replies[0])
+        self.disable("签到")
+        for message in ("日常 签到", "cp daily"):
+            _, replies = await self.run_message(message)
+            self.assertEqual(replies, [])
+        _, replies = await self.run_message("cp 帮助")
+        self.assertNotIn("日常 签到", replies[0])
+
+    async def test_bare_confirmation_respects_effective_name_and_disabled_flag(self):
+        self.fund()
+        self.rename("兑换", "确认 订单", {"confirm"})
+        _, pending = await self.run_message("cp 商店 购买 card")
+        self.assertIn("确认 订单", pending[0])
+        _, replies = await self.run_message("兑换", woken=False)
+        self.assertEqual(replies, [])
+        self.assertEqual(self.private_calls, [])
+        self.disable("兑换")
+        for message in ("确认 订单", "confirm", "cp 确认 订单"):
+            _, replies = await self.run_message(message, woken=message.startswith("cp "))
+            self.assertEqual(replies, [])
+        self.assertEqual(self.store.balance(self.session, "100"), 100)
+        self.plugin._command_filters["兑换"].handler_md.enabled = True
+        _, confirmed = await self.run_message("CONFIRM", woken=False)
+        self.assertIn("已完成", confirmed[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 70)
+
+    async def test_disabled_subcommands_do_not_fall_back_to_parent_commands(self):
+        self.fund()
+        self.disable("购买")
+        self.disable("签到排行榜")
+        for message in ("cp 商店 购买 card", "签到 排行榜", "cp 签到 排行榜"):
+            event, replies = await self.run_message(message)
+            self.assertEqual(replies, [])
+            self.assertFalse(event.stopped)
+        self.assertEqual(self.mc_calls, [])
+        self.assertEqual(self.private_calls, [])
+        self.assertEqual(self.store.balance(self.session, "100"), 100)
+        self.assertIsNone(self.store.active_purchase(self.session, "100"))
+
+    async def test_product_id_equal_to_alias_stays_an_argument(self):
+        self.fund()
+        self.rename("购买", "商店 购买", {"card"})
+        _, pending = await self.run_message("cp 商店 购买 card")
+        self.assertIn("兑换卡", pending[0])
+        self.assertEqual(self.store.active_purchase(self.session, "100")["status"], "pending")
+        self.assertEqual(set(self.plugin._command_filters["购买"].command_names()), {"商店 购买", "card"})
+
+    async def test_filter_exception_restores_shared_event_and_current_aliases(self):
+        entry = self.plugin._command_filters["购买"]
+        original_names = entry.command_names()
+
+        def fail(event, cfg):
+            raise RuntimeError("simulated custom-filter error")
+
+        entry.custom_filter_list.append(SimpleNamespace(filter=fail))
+        event = Event("cp 商店 购买 card", self.bot)
+        with self.assertRaisesRegex(RuntimeError, "custom-filter error"):
+            entry.filter(event, {})
+        self.assertEqual(event.message_str, "cp 商店 购买 card")
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertEqual(entry.command_names(), original_names)
+
+    async def test_at_component_display_name_is_normalized_for_admin_target(self):
+        At = type("At", (), {})
+        mention = At()
+        mention.qq, mention.name = "200", "测试昵称"
+        _, replies = await self.run_message("cp 修改 @测试昵称(200) 50", user="901", components=[mention])
+        self.assertIn("200", replies[0])
+        self.assertEqual(self.store.balance(self.session, "200"), 50)
+        # Some adapters omit the mention from message_str; the actual component
+        # still identifies the intended account rather than the administrator.
+        await self.run_message("cp 增加 5", user="901", components=[mention])
+        self.assertEqual(self.store.balance(self.session, "200"), 55)
+        self.assertEqual(self.store.balance(self.session, "901"), 0)
+
+    async def test_reset_requires_admin_and_preserves_balance_and_history(self):
+        await self.run_message("签到")
+        original_id = self.store.history(self.session)[0]["id"]
+        _, denied = await self.run_message("cp 重置签到 Steve")
+        self.assertIn("权限", denied[0])
+        self.assertIsNotNone(self.store.get_checkin(original_id))
+        _, reset = await self.run_message("cp 重置签到 Steve", user="901")
+        self.assertIn("已重置 100", reset[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 11)
+        self.assertIsNone(self.store.get_checkin(original_id))
+        self.assertIn("reset_at", self.store.history(self.session)[0])
+        self.assertEqual(self.mc_calls, [])
+        await self.run_message("签到")
+        _, reset_again = await self.run_message("cp 重置签到 @100", user="900", admin=True)
+        self.assertIn("已重置 100", reset_again[0])
+        self.assertEqual(self.store.balance(self.session, "100"), 22)
+
+    async def test_makeup_requires_admin_and_valid_past_date(self):
+        self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
+        _, denied = await self.run_message("cp 补签 Alex 2000-01-02")
+        self.assertIn("权限", denied[0])
+        for day in ("2000-02-30", "9999-12-31", "not-a-date"):
+            _, invalid = await self.run_message("cp 补签 Alex " + day, user="901")
+            self.assertTrue(invalid)
+            self.assertNotIn("已为 200 补签", invalid[0])
+        self.assertEqual(self.mc_calls, [])
+        self.assertEqual(self.store.history(self.session), [])
+        self.assertEqual(self.store.balance(self.session, "200"), 0)
+
+    async def test_makeup_mc_failure_returns_actual_response_and_never_credits(self):
+        self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
+        self.mc_results = [("§c玩家 Alex 已经签到，请不要重复签到。", "queqiao")]
+        _, failed = await self.run_message("cp 补签 Alex 2000-01-02", user="901")
+        self.assertIn("请不要重复签到", failed[0])
+        self.assertNotIn("§c", failed[0])
+        self.assertNotIn("已为 200 补签", failed[0])
+        self.assertEqual(self.store.balance(self.session, "200"), 0)
+        self.assertEqual(self.mc_calls, ["signin click 2000-01-02 Alex"])
+        await self.run_message("cp 补签 Alex 2000-01-02", user="901")
+        self.assertEqual(len(self.mc_calls), 1)
+        self.assertEqual(self.store.balance(self.session, "200"), 0)
+
+    async def test_makeup_success_uses_target_date_multiplier_and_credits_once(self):
+        self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"],
+                       date_rules=[dict(date="2000-01-03", multiplier=2)])
+        self.mc_results = [("成功给玩家 Alex 签到", "queqiao")]
+        _, success = await self.run_message("cp 补签 Alex 2000-01-03", user="900", admin=True)
+        self.assertIn("已为 200 补签 2000-01-03", success[0])
+        self.assertIn("22 星币", success[0])
+        _, duplicate = await self.run_message("cp 补签 Alex 2000-01-03", user="901")
+        self.assertIn("不会重复", duplicate[0])
+        self.assertEqual(self.mc_calls, ["signin click 2000-01-03 Alex"])
+        self.assertEqual(self.store.balance(self.session, "200"), 22)
+        self.assertEqual(self.store.balance(self.session, "900"), 0)
+
+    async def test_mc_ranking_executes_game_command_without_mutating_points(self):
+        self.configure(mc_enabled=True, server_name="Server", commands=["litesignin click {player}"])
+        self.mc_results = [("§6签到排行榜\n§a1. Steve 10 次", "queqiao")]
+        _, ranking = await self.run_message("签到 排行榜")
+        self.assertEqual(ranking, ["签到排行榜\n1. Steve 10 次"])
+        self.assertEqual(self.mc_calls, ["signin leaderboard"])
+        self.assertEqual(self.store.balance(self.session, "100"), 0)
+        self.assertEqual(self.store.history(self.session), [])
+        _, not_woken = await self.run_message("签到 排行榜", woken=False)
+        self.assertEqual(not_woken, [])
+        self.assertEqual(len(self.mc_calls), 1)
+        _, unprefixed_points_rank = await self.run_message("排行榜")
+        self.assertEqual(unprefixed_points_rank, [])
 
 
 if __name__ == "__main__":

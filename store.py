@@ -2,15 +2,23 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .core import award_points, date_multiplier, in_window, local_now, render_commands, validate_settings
+from .core import DEFAULT_TEMPLATES, award_points, date_multiplier, in_window, local_now, render_commands, validate_day, validate_settings
 
 MAX_BALANCE = 2**63 - 1
+LEGACY_USAGE = "请按本会话的唤醒头和插件前缀使用：签到、积分、查询 [玩家]、修改 玩家 数量、增加 玩家 数量、减少 玩家 数量、排行榜、商店列表、商店 购买 编号、兑换、补领。"
+LEGACY_TEMPLATES = {
+    "no_permission": "你没有本会话的积分管理权限。",
+    "usage": LEGACY_USAGE,
+    "purchase_pending": "是否消耗 {price}{currency_name}，来购买 {product_id} {product_name}？请在 {minutes} 分钟内回复“兑换”。",
+    "purchase_failed": "订单 {order_id} 的私聊发送失败，已扣款且奖励已保留。请在原会话回复“兑换”，或使用唤醒头和插件前缀发送“补领”，不会重复扣款。",
+}
 
 class Store:
     def __init__(self, path: str | Path):
@@ -37,6 +45,13 @@ class Store:
                     UNIQUE (session, user_id, day)
                 );
                 CREATE INDEX IF NOT EXISTS idx_checkins_session_id ON checkins (session, id DESC);
+                CREATE TABLE IF NOT EXISTS checkin_resets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_id INTEGER NOT NULL UNIQUE, session TEXT NOT NULL,
+                    user_id TEXT NOT NULL, record TEXT NOT NULL,
+                    actor TEXT NOT NULL, reset_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_checkin_resets_session ON checkin_resets(session, original_id DESC);
                 CREATE TABLE IF NOT EXISTS bindings (
                     account_key TEXT PRIMARY KEY, player TEXT NOT NULL
                 );
@@ -55,6 +70,7 @@ class Store:
                     expires_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_purchases_user ON purchases(session, user_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_purchases_limit ON purchases(session, user_id, product_id, status);
                 CREATE TABLE IF NOT EXISTS used_codes (
                     session TEXT NOT NULL, product_id TEXT NOT NULL, code TEXT NOT NULL,
                     order_id INTEGER NOT NULL,
@@ -62,12 +78,27 @@ class Store:
                 );
             """)
             db.execute("BEGIN IMMEDIATE")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
             columns = {row["name"] for row in db.execute("PRAGMA table_info(checkins)")}
             if "credited" not in columns:
                 # Version 1 awarded every stored check-in immediately. Keep those assets
                 # and mark them credited so old pending tasks can never award twice.
                 db.execute("ALTER TABLE checkins ADD COLUMN credited INTEGER NOT NULL DEFAULT 1")
-            db.execute("PRAGMA user_version=2")
+            if version < 3:
+                for row in db.execute("SELECT session,settings FROM session_settings").fetchall():
+                    settings = json.loads(row["settings"])
+                    if settings.get("currency_name", "积分") == "积分":
+                        settings["currency_name"] = "点数"
+                    templates = settings.get("templates", {})
+                    for key, old_default in LEGACY_TEMPLATES.items():
+                        if templates.get(key) == old_default:
+                            templates[key] = DEFAULT_TEMPLATES[key]
+                    settings = self._clean_code_pool(db, row["session"], validate_settings(settings))
+                    db.execute("UPDATE session_settings SET settings=? WHERE session=?",
+                               (json.dumps(settings, ensure_ascii=False), row["session"]))
+                db.execute("PRAGMA user_version=3")
+            if version < 4:
+                db.execute("PRAGMA user_version=4")
             db.commit()
 
     @contextmanager
@@ -88,7 +119,17 @@ class Store:
     @staticmethod
     def _settings(db, session: str) -> dict:
         row = db.execute("SELECT settings FROM session_settings WHERE session=?", (session,)).fetchone()
-        return validate_settings(json.loads(row[0]) if row else {})
+        return Store._clean_code_pool(db, session, validate_settings(json.loads(row[0]) if row else {}))
+
+    @staticmethod
+    def _clean_code_pool(db, session: str, settings: dict) -> dict:
+        used = {}
+        for row in db.execute("SELECT product_id,code FROM used_codes WHERE session=?", (session,)):
+            used.setdefault(row["product_id"], set()).add(row["code"])
+        for product in settings["products"]:
+            allocated = used.get(product["id"], set())
+            product["codes"] = [code for code in product["codes"] if code not in allocated]
+        return settings
 
     @staticmethod
     def _balance(db, session: str, user_id: str) -> int:
@@ -117,18 +158,20 @@ class Store:
         with self._connection() as db:
             return self._settings(db, session)
 
-    def save_settings(self, session: str, settings: dict) -> None:
+    def save_settings(self, session: str, settings: dict) -> dict:
         settings = validate_settings(settings)
         if not isinstance(session, str) or not session.strip():
             raise ValueError("会话 ID 不能为空")
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            settings = self._clean_code_pool(db, session, settings)
             db.execute("INSERT INTO session_settings(session, settings) VALUES (?, ?) "
                        "ON CONFLICT(session) DO UPDATE SET settings=excluded.settings",
                        (session, json.dumps(settings, ensure_ascii=False)))
             if not settings["enabled"] or not settings["mc_enabled"]:
                 self._cancel_mc(db, session, "会话或 MC 联动已停用，未完成入账已取消；已发往 MC 的指令仍需自行核实")
             db.commit()
+            return settings
 
     def _cancel_mc(self, db, session: str, reason: str) -> None:
         db.execute("UPDATE checkins SET mc_state='skipped',mc_detail=?,updated_at=? "
@@ -136,7 +179,7 @@ class Store:
 
     def sessions(self) -> list[dict]:
         with self._connection() as db:
-            return [{"session": row["session"], "settings": validate_settings(json.loads(row["settings"]))}
+            return [{"session": row["session"], "settings": self._clean_code_pool(db, row["session"], validate_settings(json.loads(row["settings"])))}
                     for row in db.execute("SELECT session, settings FROM session_settings ORDER BY session")]
 
     def balance(self, session: str, user_id: str) -> int:
@@ -144,33 +187,54 @@ class Store:
             return self._balance(db, session, str(user_id))
 
     def checkin(self, session: str, user_id: str, player: str = "", now: datetime | None = None) -> dict:
+        return self._checkin(session, user_id, player, now=now)
+
+    def makeup_checkin(self, session: str, user_id: str, player: str, day: str, actor: str) -> dict:
+        validate_day(day)
+        return self._checkin(session, user_id, player, makeup_day=day, actor=actor)
+
+    def _checkin(self, session: str, user_id: str, player: str = "", now: datetime | None = None,
+                 makeup_day: str | None = None, actor: str = "") -> dict:
         user_id = str(user_id)
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             settings = self._settings(db, session)
             current = local_now(settings, now)
-            day = current.date().isoformat()
+            target_date = validate_day(makeup_day) if makeup_day is not None else current.date()
+            if target_date > current.date():
+                raise ValueError("补签日期不能晚于本会话时区的今天")
+            day = target_date.isoformat()
             total = self._balance(db, session, user_id)
             common = {"total": total, "day": day}
             if not settings["enabled"]:
                 return {"status": "disabled", **common}
+            if makeup_day is not None:
+                if not settings["mc_enabled"]:
+                    raise ValueError("补签需要开启 MC 联动；未执行游戏补签，也未增加点数")
+                if not isinstance(player, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
+                    return {"status": "unbound", **common}
             row = db.execute("SELECT * FROM checkins WHERE session=? AND user_id=? AND day=?",
                              (session, user_id, day)).fetchone()
             if row:
                 return {**self._record(row), "status": "duplicate", "total": total}
-            if not in_window(settings, current):
+            if makeup_day is None and not in_window(settings, current):
                 return {"status": "outside_window", **common}
             if settings["mc_enabled"] and settings["require_binding"] and not player:
                 return {"status": "unbound", **common}
             base = secrets.randbelow(settings["max_points"] - settings["min_points"] + 1) + settings["min_points"]
-            multiplier = date_multiplier(settings, current.date())
+            multiplier = date_multiplier(settings, target_date)
             points = award_points(base, multiplier)
             credited = not settings["mc_enabled"]
             if credited:
                 total += points
                 if total > MAX_BALANCE:
                     raise ValueError("签到后余额超出 SQLite 整数上限，未入账")
-            commands = render_commands(settings, player, points, user_id) if settings["mc_enabled"] and player else []
+            command_settings = settings
+            if makeup_day is not None and settings["mc_enabled"]:
+                if not settings["makeup_commands"]:
+                    raise ValueError("本会话尚未配置 MC 补签指令")
+                command_settings = {**settings, "commands": settings["makeup_commands"]}
+            commands = render_commands(command_settings, player, points, user_id, date=day) if settings["mc_enabled"] and player else []
             state = "pending" if commands else "skipped"
             stamp = self._stamp()
             cursor = db.execute("""INSERT INTO checkins
@@ -179,6 +243,8 @@ class Store:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session, user_id, player, day, points, total, base, str(multiplier), state,
                  json.dumps(commands, ensure_ascii=False), settings["server_name"], stamp, stamp, int(credited)))
+            if makeup_day is not None:
+                self._audit(db, session, user_id, "makeup_requested", common["total"], common["total"], str(actor))
             if credited:
                 self._set_balance(db, session, user_id, total)
                 self._audit(db, session, user_id, "checkin", total-points, total, str(cursor.lastrowid))
@@ -189,8 +255,31 @@ class Store:
     def history(self, session: str, limit: int = 100) -> list[dict]:
         limit = max(1, min(int(limit), 1000))
         with self._connection() as db:
-            return [self._record(row) for row in db.execute(
+            records = [self._record(row) for row in db.execute(
                 "SELECT * FROM checkins WHERE session=? ORDER BY id DESC LIMIT ?", (session, limit))]
+            for row in db.execute("SELECT * FROM checkin_resets WHERE session=? ORDER BY original_id DESC LIMIT ?", (session, limit)):
+                records.append({**json.loads(row["record"]), "reset_at": row["reset_at"], "actor": row["actor"]})
+            return sorted(records, key=lambda record: record["id"], reverse=True)[:limit]
+
+    def reset_checkin(self, session: str, user_id: str, actor: str, now: datetime | None = None) -> dict:
+        user_id = str(user_id)
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            settings = self._settings(db, session)
+            day = local_now(settings, now).date().isoformat()
+            total = self._balance(db, session, user_id)
+            row = db.execute("SELECT * FROM checkins WHERE session=? AND user_id=? AND day=?", (session, user_id, day)).fetchone()
+            if row is None:
+                return dict(day=day, total=total, removed=False)
+            if row["mc_state"] == "sending":
+                raise ValueError("该玩家的 MC 签到正在执行，无法重置，请等待执行结束后核实结果")
+            stamp = self._stamp()
+            db.execute("INSERT INTO checkin_resets(original_id,session,user_id,record,actor,reset_at) VALUES(?,?,?,?,?,?)",
+                       (row["id"], session, user_id, json.dumps(self._record(row), ensure_ascii=False), str(actor), stamp))
+            db.execute("DELETE FROM checkins WHERE id=?", (row["id"],))
+            self._audit(db, session, user_id, "checkin_reset", total, total, str(actor))
+            db.commit()
+            return dict(day=day, total=total, removed=True, id=row["id"])
 
     def get_checkin(self, checkin_id: int) -> dict | None:
         with self._connection() as db:
@@ -334,9 +423,25 @@ class Store:
         with self._connection() as db:
             settings = self._settings(db, session)
             return [dict(id=product["id"], name=product["name"], price=product["price"],
-                         enabled=product["enabled"], reward_type=product["reward_type"],
+                         enabled=product["enabled"], reward_type=product["reward_type"], purchase_limit=product["purchase_limit"],
                          stock=len(self._available_codes(db, session, product)) if product["reward_type"] == "codes" else None)
                     for product in settings["products"] if product["enabled"]]
+
+    @staticmethod
+    def _check_purchase_limit(db, session: str, user_id: str, product: dict) -> None:
+        limit = product["purchase_limit"]
+        if not limit:
+            return
+        count = db.execute("SELECT COUNT(*) FROM purchases WHERE session=? AND user_id=? AND product_id=? "
+                           "AND status IN ('paid','sending','delivery_failed','delivered')",
+                           (session, user_id, product["id"])).fetchone()[0]
+        if count >= limit:
+            raise ValueError(f"该商品每人累计限购 {limit} 次，你已达到限购次数")
+
+    @staticmethod
+    def _same_purchase_terms(product: dict, snapshot: dict) -> bool:
+        return all(product.get(key) == snapshot.get(key)
+                   for key in ("id", "name", "price", "reward_type", "reward_text"))
 
     def _order(self, db, row, *, private=True) -> dict:
         result = dict(row)
@@ -360,10 +465,11 @@ class Store:
             unresolved = db.execute("SELECT id FROM purchases WHERE session=? AND user_id=? "
                                     "AND status IN ('paid','delivery_failed','sending') LIMIT 1", (session, user_id)).fetchone()
             if unresolved:
-                raise ValueError("你有已付款但尚未完成发货的订单，请在原会话回复“兑换”以重发原奖励")
+                raise ValueError("你有已付款但尚未完成发货的订单，请先使用本会话当前的确认或补领指令重发原奖励")
             product = next((item for item in settings["products"] if item["id"] == product_id and item["enabled"]), None)
             if product is None:
                 raise ValueError("商品不存在或已下架")
+            self._check_purchase_limit(db, session, user_id, product)
             if self._balance(db, session, user_id) < product["price"]:
                 raise ValueError(f"余额不足，购买需要 {product['price']} {settings['currency_name']}")
             if product["reward_type"] == "codes" and not self._available_codes(db, session, product):
@@ -410,8 +516,9 @@ class Store:
             product = next((item for item in settings["products"] if item["id"] == row["product_id"] and item["enabled"]), None)
             if product is None:
                 raise ValueError("商品不存在或已下架")
-            if product != json.loads(row["product_snapshot"]):
+            if not self._same_purchase_terms(product, json.loads(row["product_snapshot"])):
                 raise ValueError("商品配置已修改，请重新选择商品后确认")
+            self._check_purchase_limit(db, session, user_id, product)
             old = self._balance(db, session, user_id)
             if old < row["price"]:
                 raise ValueError("余额不足，未扣款")
@@ -422,6 +529,9 @@ class Store:
                 reward = available[0]
                 db.execute("INSERT INTO used_codes(session,product_id,code,order_id) VALUES(?,?,?,?)",
                            (session, product["id"], reward, row["id"]))
+                settings = self._clean_code_pool(db, session, settings)
+                db.execute("UPDATE session_settings SET settings=? WHERE session=?",
+                           (json.dumps(settings, ensure_ascii=False), session))
             else:
                 reward = product["reward_text"]
             total = old - row["price"]

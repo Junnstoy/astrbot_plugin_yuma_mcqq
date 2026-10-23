@@ -3,9 +3,9 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
-  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [], currency_name: '积分', command_prefix: '', admin_ids: [], confirmation_minutes: 3, mc_success_keywords: [], mc_failure_keywords: [], products: [], templates: {} };
-  const templateNames = { checkin_success: '签到成功', checkin_pending: '签到处理中', checkin_duplicate: '重复签到', checkin_disabled: '签到未启用', checkin_outside_window: '不在签到时间', checkin_unbound: '尚未绑定', checkin_mc_failed: '游戏签到失败', checkin_mc_unknown: '游戏结果未知', balance: '查询余额', shop_list: '商店列表', shop_item: '单件商品介绍', purchase_pending: '等待兑换确认', purchase_delivered: '奖励已发放', purchase_private: '私聊奖励内容', purchase_failed: '兑换发放失败', ranking: '排行榜', ranking_item: '单条排名', admin_adjust: '管理员调整余额', admin_query: '管理员查询余额', no_permission: '权限不足', usage: '指令使用说明' };
-  const templateFields = ['user_id', 'player', 'points', 'total', 'currency_name', 'day', 'mc_state', 'minutes', 'product_name', 'product_id', 'price', 'order_id', 'reward', 'old', 'delta', 'target_id', 'items', 'stock', 'rank'];
+  const defaults = { enabled: false, timezone: 'Asia/Shanghai', min_points: 10, max_points: 30, windows: [{ start: '00:00', end: '23:59' }], date_rules: [], mc_enabled: false, server_name: '', require_binding: true, commands: [], makeup_commands: ['signin click {date} {player}'], leaderboard_command: 'signin leaderboard', currency_name: '点数', command_prefix: '', admin_ids: [], confirmation_minutes: 3, mc_success_keywords: [], mc_failure_keywords: [], products: [], templates: {} };
+  const templateNames = { checkin_success: '签到成功', checkin_pending: '签到处理中', checkin_duplicate: '重复签到', checkin_disabled: '签到未启用', checkin_outside_window: '不在签到时间', checkin_unbound: '尚未绑定', checkin_mc_failed: '游戏签到失败', checkin_mc_unknown: '游戏结果未知', balance: '查询余额', shop_list: '商店列表', shop_item: '单件商品介绍', purchase_pending: '等待兑换确认', purchase_delivered: '奖励已发放', purchase_private: '私聊奖励内容', purchase_failed: '兑换发放失败', ranking: '排行榜', ranking_item: '单条排名', admin_reset: '管理员重置签到', makeup_success: '补签成功', makeup_duplicate: '补签日期已有签到', admin_adjust: '管理员调整余额', admin_query: '管理员查询余额', no_permission: '权限不足', usage: '指令使用说明' };
+  const templateFields = ['user_id', 'player', 'points', 'total', 'currency_name', 'day', 'mc_state', 'minutes', 'product_name', 'product_id', 'price', 'order_id', 'reward', 'old', 'delta', 'target_id', 'items', 'stock', 'rank', 'command_list', 'confirmation_command'];
   let state = { sessions: [], servers: [], session: '', binding_count: 0 };
   let settings = structuredClone(defaults);
   let dirty = false;
@@ -14,6 +14,8 @@
   let sequence = 0;
   let page = 'overview';
   let finishConfirmation = null;
+  let refreshingStock = false;
+  let stockRevision = 0;
   const lines = value => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
 
   function el(tag, text, className) {
@@ -28,6 +30,7 @@
     $('notice').hidden = !message;
   }
   function lock(value) {
+    if (value) stockRevision++;
     busy = value;
     $('settings-fields').disabled = value || !state.session || !ready;
     $('save').disabled = value || !state.session || !ready;
@@ -109,7 +112,7 @@
   function addProduct(value = {}) {
     const used = new Set([...$('products-list').querySelectorAll('[data-field="id"]')].map(input => input.value));
     let number = 1; while (used.has(String(number))) number++;
-    const product = { id: String(number), name: '', price: 100, enabled: true, reward_type: 'text', reward_text: '', codes: [], ...value };
+    const product = { id: String(number), name: '', price: 100, purchase_limit: 0, enabled: true, reward_type: 'text', reward_text: '', codes: [], ...value };
     const row = el('section', undefined, 'product-card');
     const heading = el('div', undefined, 'card-heading');
     heading.append(el('h3', '商品设置'));
@@ -118,17 +121,19 @@
     const remove = el('button', '删除商品', 'button danger small'); remove.type = 'button'; remove.addEventListener('click', () => { row.remove(); $('products-empty').hidden = !!$('products-list').children.length; markDirty(); });
     controls.append(enabledLabel, remove); heading.append(controls); row.append(heading);
     const fields = el('div', undefined, 'product-fields');
-    for (const [key, label, type] of [['id', '商品序号', 'text'], ['name', '商品名称', 'text'], ['price', '兑换价格', 'number']]) {
+    for (const [key, label, type] of [['id', '商品序号', 'text'], ['name', '商品名称', 'text'], ['price', '兑换价格', 'number'], ['purchase_limit', '每人累计限购（0 不限）', 'number']]) {
       const field = rowInput(label, type, product[key], type === 'number' ? { min: '0', max: String(Number.MAX_SAFE_INTEGER), step: '1' } : {});
       field.querySelector('input').dataset.field = key; fields.append(field);
     }
     row.append(fields);
+    row.append(el('p', '限购按本会话、用户及商品累计计算。已付款但待补发的订单也占额度；未扣款的取消、过期订单不计入。', 'hint'));
     const typeLabel = el('label', '奖励类型', 'field'); const select = el('select'); select.dataset.field = 'reward_type';
     for (const [type, text] of [['text', '固定文本奖励'], ['codes', '独立兑换码']]) { const option = el('option', text); option.value = type; select.append(option); }
     select.value = product.reward_type; typeLabel.append(select); row.append(typeLabel);
     const textLabel = el('label', '奖励文本（仅后台可见）', 'field'); const text = el('textarea'); text.dataset.field = 'reward_text'; text.value = product.reward_text; text.rows = 3; textLabel.append(text);
-    const codesLabel = el('label', '兑换码池（每行一个，仅后台可见）', 'field'); const codes = el('textarea'); codes.dataset.field = 'codes'; codes.value = product.codes.join('\n'); codes.rows = 4; codes.spellcheck = false; codesLabel.append(codes);
-    row.append(textLabel, codesLabel, el('p', '已使用的兑换码由后台自动排除，不会因重新保存而再次发放。商品列表只公开序号、名称和价格。', 'hint'));
+    const codesLabel = el('label', '剩余可售兑换码（每行一个，仅后台可见）', 'field'); const codes = el('textarea'); codes.dataset.field = 'codes'; codes.value = product.codes.join('\n'); codes.rows = 4; codes.spellcheck = false; codesLabel.append(codes);
+    const stockCount = el('span', `后台剩余 ${product.codes.length} 条`, 'stock-count'); stockCount.dataset.stockCount = ''; codesLabel.append(stockCount);
+    row.append(textLabel, codesLabel, el('p', '付款分配后，兑换码会从此码池移除；私聊失败仍为原订单保留，不重新出售。重新保存旧表单也不会复活已分配的码。', 'hint'));
     const updateType = () => { textLabel.hidden = select.value !== 'text'; codesLabel.hidden = select.value !== 'codes'; };
     select.addEventListener('change', updateType); updateType(); $('products-list').append(row); $('products-empty').hidden = true;
   }
@@ -149,16 +154,16 @@
       date_rules: [...$('dates-list').children].map(row => { const inputs = row.querySelectorAll('input'); return { date: inputs[0].value.trim(), multiplier: Number(inputs[1].value) }; }),
       mc_enabled: $('mc-enabled').checked, server_name: $('server-name').value,
       require_binding: $('require-binding').checked,
-      commands: lines($('commands').value),
+      commands: lines($('commands').value), makeup_commands: lines($('makeup-commands').value), leaderboard_command: $('leaderboard-command').value.trim(),
       currency_name: $('currency-name').value.trim(), command_prefix: $('command-prefix').value.trim(),
       admin_ids: lines($('admin-ids').value), confirmation_minutes: Number($('confirmation-minutes').value),
       mc_success_keywords: lines($('mc-success-keywords').value), mc_failure_keywords: lines($('mc-failure-keywords').value),
-      products: [...$('products-list').children].map(row => ({ id: row.querySelector('[data-field="id"]').value.trim(), name: row.querySelector('[data-field="name"]').value.trim(), price: Number(row.querySelector('[data-field="price"]').value), enabled: row.querySelector('[data-field="enabled"]').checked, reward_type: row.querySelector('[data-field="reward_type"]').value, reward_text: row.querySelector('[data-field="reward_text"]').value, codes: lines(row.querySelector('[data-field="codes"]').value) })),
+      products: [...$('products-list').children].map(row => ({ id: row.querySelector('[data-field="id"]').value.trim(), name: row.querySelector('[data-field="name"]').value.trim(), price: Number(row.querySelector('[data-field="price"]').value), purchase_limit: Number(row.querySelector('[data-field="purchase_limit"]').value), enabled: row.querySelector('[data-field="enabled"]').checked, reward_type: row.querySelector('[data-field="reward_type"]').value, reward_text: row.querySelector('[data-field="reward_text"]').value, codes: lines(row.querySelector('[data-field="codes"]').value) })),
       templates: Object.fromEntries([...$('templates-list').querySelectorAll('textarea')].map(input => [input.dataset.key, input.value]))
     };
   }
   function validate(data) {
-    if (data.max_points < data.min_points) throw new Error('最高积分不能小于最低积分。');
+    if (data.max_points < data.min_points) throw new Error('最高点数不能小于最低点数。');
     try { new Intl.DateTimeFormat('zh-CN', { timeZone: data.timezone }); } catch { throw new Error('时区无效，请填写 Asia/Shanghai 等 IANA 时区名称。'); }
     const seen = new Set();
     for (const rule of data.date_rules) {
@@ -173,6 +178,7 @@
     const products = new Set();
     for (const product of data.products) {
       if (!Number.isSafeInteger(product.price) || product.price < 0) throw new Error('商品价格必须为 0 至 9007199254740991 的整数。');
+      if (!Number.isSafeInteger(product.purchase_limit) || product.purchase_limit < 0) throw new Error('每人累计限购必须为 0 至 9007199254740991 的整数，0 表示不限。');
       if (products.has(product.id)) throw new Error(`商品序号重复：${product.id}。`);
       products.add(product.id);
     }
@@ -180,16 +186,18 @@
   function preview() {
     const data = collect();
     $('stat-points').textContent = `${data.min_points}–${data.max_points}`;
-    $('stat-currency').textContent = `${data.currency_name || '积分'} / 次`;
+    $('stat-currency').textContent = `${data.currency_name || '点数'} / 次`;
     $('stat-dates').textContent = data.date_rules.length;
     $('stat-status').textContent = data.enabled ? '签到已启用' : '签到已关闭';
     $('stat-status').className = `badge ${data.enabled ? 'good' : 'neutral'}`;
-    $('preview-summary').textContent = data.enabled ? `每天签到一次，基础奖励 ${data.min_points}–${data.max_points} ${data.currency_name || '积分'}。特别日期使用对应倍率。` : '此会话已关闭签到；启用并保存后，群成员即可参加。';
+    $('preview-summary').textContent = data.enabled ? `每天签到一次，基础奖励 ${data.min_points}–${data.max_points} ${data.currency_name || '点数'}。特别日期使用对应倍率。` : '此会话已关闭签到；启用并保存后，群成员即可参加。';
     $('preview-time').textContent = `${data.timezone || '未设置时区'} · ${data.windows.map(w => `${w.start || '…'}—${w.end || '…'}`).join(' / ')}`;
-    $('preview-mc').textContent = data.mc_enabled ? `同步至 ${data.server_name || '尚未选择的服务器'}，发送 ${data.commands.length} 条指令。仅命中成功关键词才入账，失败优先；未知结果不加分。` : 'MC 同步已关闭，直接记录群内签到与积分。';
+    $('preview-mc').textContent = data.mc_enabled ? `同步至 ${data.server_name || '尚未选择的服务器'}，发送 ${data.commands.length} 条指令。仅命中成功关键词才入账，失败优先；未知结果不加分。` : 'MC 同步已关闭，直接记录群内签到与点数。';
   }
   function renderForm(data) {
     settings = { ...structuredClone(defaults), ...(data || {}) };
+    $('stock-status').textContent = '每 12 秒同步库存与订单；编辑中的表单不会被覆盖。';
+    $('stock-status').className = 'hint stock-status';
     $('enabled').checked = settings.enabled;
     $('min-points').value = settings.min_points;
     $('max-points').value = settings.max_points;
@@ -197,6 +205,8 @@
     $('mc-enabled').checked = settings.mc_enabled;
     $('require-binding').checked = settings.require_binding;
     $('commands').value = settings.commands.join('\n');
+    $('makeup-commands').value = settings.makeup_commands.join('\n');
+    $('leaderboard-command').value = settings.leaderboard_command;
     $('currency-name').value = settings.currency_name;
     $('command-prefix').value = settings.command_prefix;
     $('admin-ids').value = settings.admin_ids.join('\n');
@@ -261,13 +271,13 @@
     }
   }
   async function deleteSession(session) {
-    if (!await confirmAction('删除此会话的配置？', `${session}\n只删除会话配置，保留积分、签到和兑换历史，并停用待执行任务。重新添加相同会话可继续查看历史。`, '确认删除配置')) return;
+    if (!await confirmAction('删除此会话的配置？', `${session}\n只删除会话配置，保留点数、签到和兑换历史，并停用待执行任务。重新添加相同会话可继续查看历史。`, '确认删除配置')) return;
     lock(true);
     try {
       result(await bridge.apiPost('sessions/delete', { session }));
       state.sessions = state.sessions.filter(item => item.session !== session);
       if (state.session === session) state.session = '';
-      renderSessions(); notify('会话配置已删除，积分与历史记录已保留。', 'success');
+      renderSessions(); notify('会话配置已删除，点数与历史记录已保留。', 'success');
     } catch (error) { notify(`删除失败，会话仍保留：${error.message || error}`, 'error'); }
     finally { lock(false); }
   }
@@ -286,7 +296,8 @@
       if (record.player) user.append(el('div', record.user_id, 'user-secondary'));
       const status = labels[record.mc_state] || [record.mc_state || '无同步记录', 'neutral'];
       const statusCell = el('td'); statusCell.append(el('span', status[0], `badge ${status[1]}`));
-      const points = el('td'); points.append(el('div', record.credited ? `+${record.points ?? 0}` : `预计 ${record.points ?? 0}`, record.credited ? 'points-cell' : 'pending-points'), el('div', record.credited ? '已入账' : '未入账', 'user-secondary'));
+      if (record.reset_at) { row.classList.add('archived-record'); user.append(el('div', '管理员已重置 · 归档记录', 'archive-label')); statusCell.append(el('div', '原 MC 状态', 'user-secondary')); }
+      const points = el('td'); points.append(el('div', record.credited ? `+${record.points ?? 0}` : `预计 ${record.points ?? 0}`, record.credited ? 'points-cell' : 'pending-points'), el('div', record.reset_at ? (record.credited ? '归档时已入账（未扣回）' : '归档时未入账') : (record.credited ? '已入账' : '未入账'), 'user-secondary'));
       row.append(user, el('td', record.day || '—'), points, el('td', String(record.total ?? '—')), statusCell, el('td', record.mc_detail || '—', 'detail-cell'));
       $('history-body').append(row);
     }
@@ -296,11 +307,45 @@
     const leaderboard = state.leaderboard || []; const orders = state.orders || [];
     $('leaderboard-empty').hidden = !!leaderboard.length; $('orders-empty').hidden = !!orders.length;
     leaderboard.forEach((item, index) => { const row = el('tr'); row.append(el('td', String(index + 1)), el('td', item.user_id), el('td', `${item.total} ${settings.currency_name}`)); $('leaderboard-body').append(row); });
-    const orderLabels = { pending: '待确认', confirmed: '已确认', delivered: '已发放', expired: '已过期', cancelled: '已取消', failed: '失败' };
+    const orderLabels = { pending: '待确认', confirmed: '已确认', paid: '已付款待发放', sending: '发货中', delivery_failed: '待补领', delivered: '已发放', expired: '已过期', cancelled: '已取消', failed: '失败' };
     for (const order of orders) {
       const row = el('tr'); const account = el('td'); account.append(el('div', String(order.id), 'user-primary'), el('div', order.user_id, 'user-secondary'));
       row.append(account, el('td', order.product_name), el('td', `${order.price} ${order.currency_name || settings.currency_name}`), el('td', orderLabels[order.status] || order.status), el('td', order.detail || '—', 'detail-cell')); $('orders-body').append(row);
     }
+  }
+  async function refreshStock() {
+    if (!ready || busy || refreshingStock || page !== 'editor' || !state.session || finishConfirmation || document.hidden) return;
+    const session = state.session;
+    const version = sequence;
+    const revision = stockRevision;
+    refreshingStock = true;
+    try {
+      const data = result(await bridge.apiGet('state', { session }));
+      if (busy || page !== 'editor' || state.session !== session || version !== sequence || revision !== stockRevision) return;
+      const remote = new Map((data.settings?.products || []).map(product => [product.id, product]));
+      const focused = $('settings-form').contains(document.activeElement) && document.activeElement.matches('input,textarea,select');
+      let deferred = false;
+      for (const row of $('products-list').children) {
+        const id = row.querySelector('[data-field="id"]').value.trim();
+        const product = remote.get(id);
+        if (!product || product.reward_type !== 'codes') continue;
+        const codes = row.querySelector('[data-field="codes"]');
+        row.querySelector('[data-stock-count]').textContent = `后台剩余 ${product.codes.length} 条`;
+        const previous = settings.products.find(item => item.id === id);
+        const stockChanged = !previous || JSON.stringify(previous.codes) !== JSON.stringify(product.codes);
+        if (stockChanged && (dirty || focused)) { deferred = true; continue; }
+        if (!dirty && !focused) {
+          codes.value = product.codes.join('\n');
+          if (previous) previous.codes = [...product.codes];
+        }
+      }
+      state.orders = data.orders || []; state.leaderboard = data.leaderboard || [];
+      renderActivity();
+      $('stock-status').textContent = deferred ? '后台库存已变化。正在编辑的内容已保留；下次保存时会自动剔除已分配的兑换码。' : `库存与订单已同步 · ${new Date().toLocaleTimeString('zh-CN')}；编辑中的表单不会被覆盖。`;
+      $('stock-status').className = `hint stock-status${deferred ? ' stock-changed' : ''}`;
+    } catch (error) {
+      if (state.session === session && version === sequence && revision === stockRevision && page === 'editor') $('stock-status').textContent = '库存同步暂时失败，将自动重试；保存时仍会核对已分配的兑换码。';
+    } finally { refreshingStock = false; }
   }
   async function load(session = '') {
     const request = ++sequence;
@@ -376,7 +421,7 @@
   async function init() {
     if (!bridge || typeof bridge.ready !== 'function') { notify('无法连接 AstrBot。请从 AstrBot 的插件页面打开此面板。', 'error'); $('save-state').textContent = '未连接 AstrBot'; return; }
     lock(true);
-    try { await bridge.ready(); ready = true; await load(); }
+    try { await bridge.ready(); ready = true; await load(); window.setInterval(refreshStock, 12000); }
     catch (error) { notify(`AstrBot 连接失败：${error.message || error}`, 'error'); $('save-state').textContent = '连接失败'; lock(false); }
   }
   init();

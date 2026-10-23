@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 TEMPLATE_FIELDS = frozenset({
     "user_id", "player", "points", "total", "currency_name", "day", "mc_state",
     "minutes", "product_name", "product_id", "price", "order_id", "reward", "old",
-    "delta", "target_id", "items", "stock", "rank",
+    "delta", "target_id", "items", "stock", "rank", "command_list", "confirmation_command",
 })
 DEFAULT_TEMPLATES = {
     "checkin_success": "签到成功！获得 {points} {currency_name}，余额：{total} {currency_name}。",
@@ -26,16 +26,19 @@ DEFAULT_TEMPLATES = {
     "balance": "你的余额：{total} {currency_name}。",
     "shop_list": "本会话商店：\n{items}",
     "shop_item": "{product_id}. {product_name} — {price} {currency_name}（库存：{stock}）",
-    "purchase_pending": "是否消耗 {price}{currency_name}，来购买 {product_id} {product_name}？请在 {minutes} 分钟内回复“兑换”。",
+    "purchase_pending": "是否消耗 {price}{currency_name}，来购买 {product_id} {product_name}？请在 {minutes} 分钟内回复“{confirmation_command}”。",
     "purchase_delivered": "订单 {order_id} 已完成，奖励已私聊发送。余额：{total} {currency_name}。",
     "purchase_private": "你购买的 {product_name}，订单 {order_id}：\n{reward}",
-    "purchase_failed": "订单 {order_id} 的私聊发送失败，已扣款且奖励已保留。请在原会话回复“兑换”，或使用唤醒头和插件前缀发送“补领”，不会重复扣款。",
+    "purchase_failed": "订单 {order_id} 的私聊发送失败，已扣款且奖励已保留。请在原会话回复“{confirmation_command}”，不会重复扣款。",
     "ranking": "本会话排行榜：\n{items}",
     "ranking_item": "{rank}. {player}（{user_id}）：{total} {currency_name}",
     "admin_adjust": "已调整 {target_id}：{old} → {total} {currency_name}（变化 {delta}）。",
     "admin_query": "{target_id} 的余额：{total} {currency_name}。",
-    "no_permission": "你没有本会话的积分管理权限。",
-    "usage": "请按本会话的唤醒头和插件前缀使用：签到、积分、查询 [玩家]、修改 玩家 数量、增加 玩家 数量、减少 玩家 数量、排行榜、商店列表、商店 购买 编号、兑换、补领。",
+    "admin_reset": "已重置 {target_id} 今天（{day}）的插件签到状态；已有{currency_name}不扣除，未发送 MC 重置命令。游戏签到状态请管理员自行核实。",
+    "makeup_success": "已为 {target_id} 补签 {day}，获得 {points} {currency_name}，余额：{total} {currency_name}。",
+    "makeup_duplicate": "{target_id} 在 {day} 已有签到记录，不会重复补签。余额：{total} {currency_name}。",
+    "no_permission": "你没有本会话的{currency_name}管理权限。",
+    "usage": "签到、点数及签到排行榜仅需 AstrBot 唤醒头；其余命令需唤醒头和本会话插件前缀。可用命令：{command_list}",
 }
 
 DEFAULT_SETTINGS = {
@@ -48,8 +51,10 @@ DEFAULT_SETTINGS = {
     "mc_enabled": False,
     "server_name": "",
     "commands": [],
+    "makeup_commands": ["signin click {date} {player}"],
+    "leaderboard_command": "signin leaderboard",
     "require_binding": True,
-    "currency_name": "积分",
+    "currency_name": "点数",
     "command_prefix": "",
     "admin_ids": [],
     "confirmation_minutes": 3,
@@ -91,9 +96,9 @@ def validate_settings(settings: dict) -> dict:
         raise ValueError("无效时区，请使用 Asia/Shanghai 等 IANA 时区名称") from exc
     for key in ("min_points", "max_points"):
         if type(result[key]) is not int or not 0 <= result[key] <= 1_000_000_000:
-            raise ValueError("积分范围必须为 0 至 1000000000 的整数")
+            raise ValueError("点数范围必须为 0 至 1000000000 的整数")
     if result["max_points"] < result["min_points"]:
-        raise ValueError("最大积分不能小于最小积分")
+        raise ValueError("最大点数不能小于最小点数")
     if not isinstance(result["windows"], list) or not 1 <= len(result["windows"]) <= 100:
         raise ValueError("请配置 1 至 100 个签到时间段")
     windows = []
@@ -132,26 +137,30 @@ def validate_settings(settings: dict) -> dict:
         rules.append({"date": day, "multiplier": float(multiplier)})
     result["date_rules"] = rules
     result["server_name"] = _clean_string(result["server_name"], "MC 服务器名称", 255)
-    if not isinstance(result["commands"], list) or len(result["commands"]) > 100:
-        raise ValueError("MC 指令必须为列表，最多 100 条")
-    commands = []
-    for raw in result["commands"]:
-        command = _clean_string(raw, "MC 指令")
-        if not command:
-            raise ValueError("MC 指令不能为空")
-        try:
-            for _, field, spec, conversion in Formatter().parse(command):
-                if field is not None and (field not in {"player", "points", "user_id"} or spec or conversion):
-                    raise ValueError("MC 指令仅支持 {player}、{points}、{user_id} 占位符")
-        except ValueError as exc:
-            raise ValueError(f"MC 指令模板格式错误：{exc}") from exc
-        commands.append(command)
-    result["commands"] = commands
-    if result["mc_enabled"] and (not result["server_name"] or not commands):
+    for key in ("commands", "makeup_commands"):
+        if not isinstance(result[key], list) or len(result[key]) > 100:
+            raise ValueError("MC 指令必须为列表，最多 100 条")
+        commands = []
+        for raw in result[key]:
+            command = _clean_string(raw, "MC 指令")
+            if not command:
+                raise ValueError("MC 指令不能为空")
+            try:
+                for _, field, spec, conversion in Formatter().parse(command):
+                    if field is not None and (field not in {"player", "points", "user_id", "date"} or spec or conversion):
+                        raise ValueError("MC 指令仅支持 {player}、{points}、{user_id}、{date} 占位符")
+            except ValueError as exc:
+                raise ValueError(f"MC 指令模板格式错误：{exc}") from exc
+            commands.append(command)
+        result[key] = commands
+    result["leaderboard_command"] = _clean_string(result["leaderboard_command"], "MC 签到排行指令")
+    if not result["leaderboard_command"] or any(char in result["leaderboard_command"] for char in "{}"):
+        raise ValueError("MC 签到排行指令不能为空，且必须为不含占位符的固定指令")
+    if result["mc_enabled"] and (not result["server_name"] or not result["commands"]):
         raise ValueError("开启 MC 联动前，请选择服务器并填写签到指令")
-    result["currency_name"] = _clean_string(result["currency_name"], "积分名称", 30)
+    result["currency_name"] = _clean_string(result["currency_name"], "点数名称", 30)
     if not result["currency_name"]:
-        raise ValueError("积分名称不能为空")
+        raise ValueError("点数名称不能为空")
     result["command_prefix"] = _clean_string(result["command_prefix"], "指令前缀", 30)
     if any(char.isspace() for char in result["command_prefix"]):
         raise ValueError("指令前缀不能包含空白")
@@ -202,6 +211,9 @@ def validate_settings(settings: dict) -> dict:
         price = raw.get("price")
         if type(price) is not int or not 0 <= price <= 2**53 - 1:
             raise ValueError("商品价格必须为 0 至 9007199254740991 的整数，避免网页数字精度丢失")
+        purchase_limit = raw.get("purchase_limit", 0)
+        if type(purchase_limit) is not int or not 0 <= purchase_limit <= 2**53 - 1:
+            raise ValueError("商品限购次数必须为 0 至 9007199254740991 的整数，0 表示不限购")
         enabled = raw.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("商品启用状态必须为布尔值")
@@ -220,7 +232,8 @@ def validate_settings(settings: dict) -> dict:
         if any(not code for code in codes) or len(set(codes)) != len(codes):
             raise ValueError("兑换码不能重复或为空")
         products.append(dict(id=identifier, name=name, price=price, enabled=enabled,
-                             reward_type=reward_type, reward_text=reward_text, codes=codes))
+                             reward_type=reward_type, reward_text=reward_text, codes=codes,
+                             purchase_limit=purchase_limit))
     result["products"] = products
     return result
 
@@ -261,12 +274,23 @@ def award_points(base: int, multiplier: Decimal) -> int:
     return int((Decimal(base) * multiplier).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def render_commands(settings: dict, player: str, points: int, user_id: str) -> list[str]:
+def validate_day(value: str) -> date:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("日期必须为 YYYY-MM-DD 格式")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("日期不存在，请检查年月日") from exc
+
+
+def render_commands(settings: dict, player: str, points: int, user_id: str, date: str | None = None) -> list[str]:
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
         raise ValueError("MC 玩家名必须为 1 至 16 位字母、数字或下划线")
-    if any(field == "user_id" for command in settings["commands"]
-           for _, field, _, _ in Formatter().parse(command)):
+    fields = {field for command in settings["commands"] for _, field, _, _ in Formatter().parse(command)}
+    if "user_id" in fields:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", user_id):
             raise ValueError("用户 ID 包含无法安全填入 MC 指令的字符")
-    return [command.format(player=player, points=points, user_id=user_id)
+    if date is not None or "date" in fields:
+        validate_day(date)
+    return [command.format(player=player, points=points, user_id=user_id, date=date or "")
             for command in settings["commands"]]

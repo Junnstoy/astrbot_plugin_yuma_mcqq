@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>群签到 · 积分管理</title>
+  <title>群签到 · 点数管理</title>
   <link rel="stylesheet" href="./style.css">
   <script src="/api/plugin/page/bridge-sdk.js"></script>
   <script src="./app.js" defer></script>
@@ -12,7 +12,7 @@
 <body>
 <main class="workspace">
   <header class="page-heading">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="5" width="16" height="16" rx="4"/><path d="M8 3v5m8-5v5M4 11h16m-12 5 3 3 5-5"/></svg></span><div><p class="eyebrow">DAILY CHECK-IN</p><h1>群签到 · 积分管理</h1></div></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="5" width="16" height="16" rx="4"/><path d="M8 3v5m8-5v5M4 11h16m-12 5 3 3 5-5"/></svg></span><div><p class="eyebrow">DAILY CHECK-IN</p><h1>群签到 · 点数管理</h1></div></div>
     <button id="refresh" class="button secondary" type="button">刷新数据</button>
   </header>
   <p class="page-description">为每个群设置签到奖励，让群内签到与 Minecraft 相连。</p>
@@ -21,12 +21,12 @@
     <section class="session-card overview-heading"><div class="session-label"><span class="section-number">01</span><div><h2>会话总览</h2><p>按群独立配置签到、货币与兑换商品</p></div></div><button id="new-session" class="button primary" type="button" disabled>＋ 新增会话</button>
       <div id="new-session-panel" class="new-session-panel" hidden><label for="session-input">会话标识（UMO）</label><div class="input-action"><input id="session-input" type="text" placeholder="mybot:GroupMessage:123456789" autocomplete="off" spellcheck="false"><button id="add-session" class="button primary" type="button">开始配置</button><button id="cancel-session" class="button text-button" type="button">取消</button></div><p class="hint">填写 平台ID:GroupMessage:群号。完成配置并保存后，会话才会出现在列表中。</p></div>
     </section>
-    <div id="sessions-list" class="sessions-grid"></div><div id="sessions-empty" class="history-empty"><span aria-hidden="true">◇</span><strong>还没有已保存的会话</strong><p>新增第一个会话，配置它的签到与积分规则。</p></div>
+    <div id="sessions-list" class="sessions-grid"></div><div id="sessions-empty" class="history-empty"><span aria-hidden="true">◇</span><strong>还没有已保存的会话</strong><p>新增第一个会话，配置它的签到与点数规则。</p></div>
   </section>
   <section id="editor-page" hidden>
     <section class="session-card"><button id="back-overview" class="button secondary" type="button">← 返回总览</button><div class="session-picker"><label class="sr-only" for="session-select">选择配置会话</label><select id="session-select" disabled><option value="">请选择会话</option></select></div></section>
   <section class="stats-grid" aria-label="当前会话概况">
-    <div class="stat"><span class="stat-label">基础签到奖励</span><div><strong id="stat-points">—</strong><span id="stat-currency" class="stat-unit">积分 / 次</span></div></div>
+    <div class="stat"><span class="stat-label">基础签到奖励</span><div><strong id="stat-points">—</strong><span id="stat-currency" class="stat-unit">点数 / 次</span></div></div>
     <div class="stat"><span class="stat-label">特别日期</span><div><strong id="stat-dates">—</strong><span class="stat-unit">条倍率规则</span></div></div>
     <div class="stat"><span class="stat-label">已同步 MC 绑定</span><div><strong id="stat-bindings">—</strong><span class="stat-unit">位玩家</span></div></div>
     <div class="stat"><span class="stat-label">当前会话状态</span><div><span id="stat-status" class="badge neutral">等待加载</span></div></div>
@@ -38,9 +38,9 @@
         <div class="main-column">
           <section class="card" aria-labelledby="reward-heading">
             <div class="card-heading"><div><p class="eyebrow">REWARDS</p><h2 id="reward-heading">基础奖励</h2></div><label class="switch-label"><input id="enabled" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span>启用签到</span></label></div>
-            <p class="description">每个用户在本会话每天签到一次，积分在指定范围内随机发放。</p>
-            <div class="form-grid"><label>货币名称<input id="currency-name" type="text" maxlength="30" required placeholder="积分 / 萌妹点"></label><label>指令前缀<input id="command-prefix" type="text" maxlength="30" placeholder="留空则不附加前缀"></label></div><p class="hint">继承 AstrBot 的唤醒头，例如唤醒头 #、前缀 萌妹点，对应指令为 <code>#萌妹点 签到</code>；前缀留空时为 <code>#签到</code>。</p>
-            <div class="form-grid spaced"><label>最低积分<input id="min-points" type="number" min="0" max="1000000000" step="1" required></label><label>最高积分<input id="max-points" type="number" min="0" max="1000000000" step="1" required></label></div>
+            <p class="description">每个用户在本会话每天签到一次，点数在指定范围内随机发放。</p>
+            <div class="form-grid"><label>货币名称<input id="currency-name" type="text" maxlength="30" required placeholder="点数 / 萌妹点"></label><label>指令前缀<input id="command-prefix" type="text" maxlength="30" placeholder="留空则不附加前缀"></label></div><p class="hint">签到与点数查询只需 AstrBot 唤醒头，例如 <code>#签到</code>、<code>#点数</code>、<code>#签到 排行榜</code>，不加插件前缀。其他指令使用会话前缀，例如 <code>#萌妹点 商店列表</code>；前缀留空时为 <code>#商店列表</code>。所有指令可在 AstrBot「管理行为」中改名或停用。</p><p class="hint">管理员可用 <code>#萌妹点 重置签到 玩家</code> 重置插件的今日签到状态（不扣回点数、不清除游戏签到）；用 <code>#萌妹点 补签 玩家 YYYY-MM-DD</code> 执行指定日期补签，MC 确认成功后才增加点数。</p>
+            <div class="form-grid spaced"><label>最低奖励<input id="min-points" type="number" min="0" max="1000000000" step="1" required></label><label>最高奖励<input id="max-points" type="number" min="0" max="1000000000" step="1" required></label></div>
             <label class="field">签到时区<input id="timezone" type="text" list="timezones" required placeholder="Asia/Shanghai" autocomplete="off"><datalist id="timezones"><option value="Asia/Shanghai"></option><option value="Asia/Hong_Kong"></option><option value="Asia/Tokyo"></option><option value="UTC"></option></datalist></label><p class="hint">日期、每日次数与可签到时间均按此时区计算。</p>
           </section>
           <section class="card" aria-labelledby="window-heading">
@@ -51,19 +51,20 @@
           </section>
           <section class="card" aria-labelledby="dates-heading">
             <div class="card-heading"><div><p class="eyebrow">SPECIAL DAYS</p><h2 id="dates-heading">指定日期倍率</h2></div><button id="add-date" class="button small secondary" type="button">＋ 添加日期</button></div>
-            <p class="description">为节日与特别的日子增加奖励。未匹配日期时使用 1 倍积分。</p>
+            <p class="description">为节日与特别的日子增加奖励。未匹配日期时使用 1 倍点数。</p>
             <div id="dates-list" class="repeat-list"></div><p id="dates-empty" class="empty-inline">还没有特别日期，所有日期使用基础奖励。</p>
-            <p class="hint">日期填 YYYY-MM-DD（指定某一天）或 MM-DD（每年重复）。指定年份的规则优先，倍率不叠加；积分按四舍五入取整。</p>
+            <p class="hint">日期填 YYYY-MM-DD（指定某一天）或 MM-DD（每年重复）。指定年份的规则优先，倍率不叠加；点数按四舍五入取整。</p>
           </section>
         </div>
         <aside class="side-column">
           <section class="card mc-card" aria-labelledby="mc-heading">
             <div class="card-heading"><div><p class="eyebrow">MINECRAFT</p><h2 id="mc-heading">同步游戏签到</h2></div><label class="switch-label"><input id="mc-enabled" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span class="sr-only">启用同步游戏签到</span></label></div>
-            <p class="description">开启联动后，先发送游戏签到指令，仅确认 MC 成功才增加群积分。失败或结果未知均不入账。</p>
+            <p class="description">开启联动后，先发送游戏签到指令，仅确认 MC 成功才增加群点数。失败或结果未知均不入账。</p>
             <label class="field">目标服务器<select id="server-name"><option value="">请选择服务器</option></select></label>
             <label class="check-label"><input id="require-binding" type="checkbox"><span>签到前必须绑定游戏账号</span></label><p class="hint">仅开启 MC 同步时生效。绑定数据来自现有鹊桥插件。</p>
             <label class="field" for="commands">游戏签到指令</label><textarea id="commands" rows="5" spellcheck="false" placeholder="填写服务端签到插件的实际指令，每行一条"></textarea>
-            <div class="tokens" aria-label="插入指令占位符"><button type="button" data-token="{player}">{player}</button><button type="button" data-token="{points}">{points}</button><button type="button" data-token="{user_id}">{user_id}</button></div><p class="hint">点击插入占位符：绑定的游戏名、本次积分、用户账号。指令由服务器执行，请填写你使用的签到插件支持的命令。</p>
+            <div class="tokens" aria-label="插入指令占位符"><button type="button" data-token="{player}">{player}</button><button type="button" data-token="{points}">{points}</button><button type="button" data-token="{user_id}">{user_id}</button><button type="button" data-token="{date}">{date}</button></div><p class="hint">点击插入占位符：绑定的游戏名、本次奖励、用户账号、签到日期（YYYY-MM-DD）。指令由服务器执行，请填写你使用的签到插件支持的命令。</p>
+            <label class="field" for="makeup-commands">管理员补签指令（每行一条）</label><textarea id="makeup-commands" rows="3" spellcheck="false" placeholder="signin click {date} {player}"></textarea><p class="hint">{date} 是指定补签日期，格式 YYYY-MM-DD；也支持 {player}、{points}、{user_id}。普通签到指令同样支持 {date}。请根据游戏签到插件设置命令。</p><label class="field" for="leaderboard-command">游戏签到排行榜指令</label><input id="leaderboard-command" type="text" spellcheck="false" placeholder="signin leaderboard"><p class="hint">群内发送「签到 排行榜」时执行，不影响点数余额；同样遵守 AstrBot 唤醒头。</p>
             <label class="field" for="mc-success-keywords">成功关键词（每行一个）</label><textarea id="mc-success-keywords" rows="3" placeholder="例如：成功给玩家 / Successfully signed in"></textarea><label class="field" for="mc-failure-keywords">失败关键词（每行一个）</label><textarea id="mc-failure-keywords" rows="3" placeholder="例如：已经签到"></textarea><p class="hint">失败关键词优先。只有 MC 返回内容命中成功关键词才入账；成功词留空、空响应或未匹配结果均不加分。请按游戏签到插件的实际回复填写。</p>
             <div class="binding-row"><span id="binding-note">绑定信息待加载</span><button id="sync-bindings" class="button small secondary" type="button">同步绑定</button></div>
           </section>
@@ -71,16 +72,16 @@
         </aside>
       </div>
       <section class="card extra-card" aria-labelledby="administration-heading"><div class="card-heading"><div><p class="eyebrow">SESSION ADMINISTRATION</p><h2 id="administration-heading">会话管理员与兑换确认</h2></div></div><div class="form-grid"><div><label class="field" for="admin-ids">额外会话管理员（每行一个账号 ID）</label><textarea id="admin-ids" rows="3" placeholder="100000001"></textarea><p class="hint">AstrBot 机器人管理员自动拥有权限，无须重复填写。</p></div><div><label class="field">兑换确认有效期（分钟）<input id="confirmation-minutes" type="number" min="1" max="1440" step="1" required></label><p class="hint">用户发起兑换后，须在有效期内确认；到期订单不会发放奖励。</p></div></div></section>
-      <section class="card extra-card" aria-labelledby="products-heading"><div class="card-heading"><div><p class="eyebrow">REWARD SHOP</p><h2 id="products-heading">兑换商品</h2></div><button id="add-product" class="button secondary small" type="button">＋ 添加商品</button></div><p class="description">商品列表仅展示序号、名称与价格。奖励文本和兑换码只在此管理页面编辑，不向群商品列表公开。</p><div id="products-list" class="products-list"></div><p id="products-empty" class="empty-inline">暂无商品，添加商品后即可配置兑换奖励。</p></section>
-      <section class="card extra-card" aria-labelledby="templates-heading"><div class="card-heading"><div><p class="eyebrow">REPLY TEMPLATES</p><h2 id="templates-heading">对话模板</h2></div></div><p class="description">自定义签到、积分、兑换与管理操作的回复。保留需要的占位符，保存后对当前会话生效。</p><p id="template-fields" class="hint template-hint"></p><div id="templates-list" class="templates-grid"></div></section>
+      <section class="card extra-card" aria-labelledby="products-heading"><div class="card-heading"><div><p class="eyebrow">REWARD SHOP</p><h2 id="products-heading">兑换商品</h2></div><button id="add-product" class="button secondary small" type="button">＋ 添加商品</button></div><p class="description">商品列表仅展示序号、名称与价格。奖励文本和兑换码只在此管理页面编辑，不向群商品列表公开。</p><p id="stock-status" class="hint stock-status" role="status">每 12 秒同步库存与订单；编辑中的表单不会被覆盖。</p><div id="products-list" class="products-list"></div><p id="products-empty" class="empty-inline">暂无商品，添加商品后即可配置兑换奖励。</p></section>
+      <section class="card extra-card" aria-labelledby="templates-heading"><div class="card-heading"><div><p class="eyebrow">REPLY TEMPLATES</p><h2 id="templates-heading">对话模板</h2></div></div><p class="description">自定义签到、点数、兑换与管理操作的回复。保留需要的占位符，保存后对当前会话生效。</p><p id="template-fields" class="hint template-hint"></p><div id="templates-list" class="templates-grid"></div></section>
     </fieldset>
     <div class="save-bar"><div><span id="save-state" class="save-state">正在连接 AstrBot…</span><p id="save-caption">设置仅应用于当前会话</p></div><div class="save-actions"><button id="discard" class="button secondary" type="button" disabled>放弃修改</button><button id="save" class="button primary" type="submit" disabled>保存当前会话</button></div></div>
   </form>
 
-  <section class="card history-card" aria-labelledby="history-heading"><div class="card-heading"><div><p class="eyebrow">ACTIVITY</p><h2 id="history-heading">近期签到记录</h2></div><span id="history-count" class="count-pill">0 条</span></div><p class="description">当前会话的签到积分与游戏指令发送结果。积分入账与 MC 发送状态分别记录。</p><div class="table-scroll"><table><thead><tr><th>用户 / 游戏名</th><th>签到日期</th><th>签到积分 / 入账</th><th>累计积分</th><th>MC 状态</th><th>详情</th></tr></thead><tbody id="history-body"></tbody></table></div><div id="history-empty" class="history-empty"><span aria-hidden="true">◇</span><strong>还没有签到记录</strong><p>群成员完成首次签到后，记录会出现在这里。</p></div></section>
-  <div class="activity-columns"><section class="card extra-card"><div class="card-heading"><div><p class="eyebrow">LEADERBOARD</p><h2>会话排行榜</h2></div></div><div class="table-scroll"><table><thead><tr><th>名次</th><th>用户</th><th>余额</th></tr></thead><tbody id="leaderboard-body"></tbody></table></div><p id="leaderboard-empty" class="empty-inline">暂无积分排名。</p></section><section class="card extra-card"><div class="card-heading"><div><p class="eyebrow">REDEMPTIONS</p><h2>近期兑换订单</h2></div></div><p class="hint">此处只显示订单状态，不展示奖励内容或兑换码。</p><div class="table-scroll"><table><thead><tr><th>订单 / 用户</th><th>商品</th><th>价格</th><th>状态</th><th>详情</th></tr></thead><tbody id="orders-body"></tbody></table></div><p id="orders-empty" class="empty-inline">暂无兑换订单。</p></section></div>
+  <section class="card history-card" aria-labelledby="history-heading"><div class="card-heading"><div><p class="eyebrow">ACTIVITY</p><h2 id="history-heading">近期签到记录</h2></div><span id="history-count" class="count-pill">0 条</span></div><p class="description">当前会话的签到点数与游戏指令发送结果。点数入账与 MC 发送状态分别记录。标记「管理员已重置」的是归档历史，不代表当前有效签到，旧点数不会被扣回。</p><div class="table-scroll"><table><thead><tr><th>用户 / 游戏名</th><th>签到日期</th><th>签到奖励 / 入账</th><th>累计余额</th><th>MC 状态</th><th>详情</th></tr></thead><tbody id="history-body"></tbody></table></div><div id="history-empty" class="history-empty"><span aria-hidden="true">◇</span><strong>还没有签到记录</strong><p>群成员完成首次签到后，记录会出现在这里。</p></div></section>
+  <div class="activity-columns"><section class="card extra-card"><div class="card-heading"><div><p class="eyebrow">LEADERBOARD</p><h2>会话排行榜</h2></div></div><div class="table-scroll"><table><thead><tr><th>名次</th><th>用户</th><th>余额</th></tr></thead><tbody id="leaderboard-body"></tbody></table></div><p id="leaderboard-empty" class="empty-inline">暂无点数排名。</p></section><section class="card extra-card"><div class="card-heading"><div><p class="eyebrow">REDEMPTIONS</p><h2>近期兑换订单</h2></div></div><p class="hint">此处只显示订单状态，不展示奖励内容或兑换码。</p><div class="table-scroll"><table><thead><tr><th>订单 / 用户</th><th>商品</th><th>价格</th><th>状态</th><th>详情</th></tr></thead><tbody id="orders-body"></tbody></table></div><p id="orders-empty" class="empty-inline">暂无兑换订单。</p></section></div>
   </section>
-  <footer class="page-footer"><span>群签到 · 积分系统</span><span>SQLite 本地存储 · 按会话独立记账</span></footer>
+  <footer class="page-footer"><span>群签到 · 点数系统</span><span>SQLite 本地存储 · 按会话独立记账</span></footer>
 </main>
 <div id="confirm-overlay" class="modal-backdrop" hidden><section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-description"><h2 id="confirm-title"></h2><p id="confirm-description"></p><div class="dialog-actions"><button id="confirm-cancel" class="button secondary" type="button">取消</button><button id="confirm-accept" class="button primary" type="button">确认</button></div></section></div>
 </body>

@@ -11,9 +11,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import request, json_response
+from astrbot.core.star.filter.command import GreedyStr
 
 from .core import TEMPLATE_FIELDS, classify_mc_output, validate_settings
-from .routing import COMMANDS, parse_command, render_reply
+from .command_filters import install_command_filters
+from .routing import render_reply
 from .store import Store
 
 NAME = "astrbot_plugin_checkin_points"
@@ -27,35 +29,30 @@ def session_id(value):
     return value
 
 
-class PointsCommandFilter(filter.CustomFilter):
-    """Do not wake normal MC/AI chat; the handler verifies the session prefix."""
-
-    def filter(self, event, cfg):
-        text = event.get_message_str().strip()
-        if text == "兑换":
-            return True
-        if not event.is_at_or_wake_command:
-            return False
-        words = text.lower().split()
-        candidates = set(COMMANDS) | {"checkin", "points"}
-        return bool(words and (words[0] in candidates or
-                               (len(words) > 1 and words[1] in candidates)))
-
-
 class CheckinPointsPlugin(Star):
+    _operations = {
+        "cmd_checkin": "签到", "cmd_points": "点数", "cmd_query": "查询",
+        "cmd_set": "修改", "cmd_add": "增加", "cmd_subtract": "减少",
+        "cmd_ranking": "排行榜", "cmd_shop_list": "商店列表", "cmd_buy": "购买",
+        "cmd_exchange": "兑换", "cmd_collect": "补领", "cmd_help": "帮助",
+        "cmd_reset": "重置签到", "cmd_makeup": "补签", "cmd_mc_ranking": "签到排行榜",
+    }
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.store = Store(Path(StarTools.get_data_dir(NAME)) / "checkin.sqlite3")
         self._sync_lock = asyncio.Lock()
         self._worker = None
+        self._command_settings = {}
+        self._command_filters = {}
         for endpoint, method, handler in (
             ("state", "GET", self.web_state), ("settings", "POST", self.web_settings),
             ("sessions/toggle", "POST", self.web_toggle),
             ("sessions/delete", "POST", self.web_delete),
             ("bindings/sync", "POST", self.web_sync),
         ):
-            context.register_web_api(f"/{NAME}/{endpoint}", handler, [method], "签到积分管理")
+            context.register_web_api(f"/{NAME}/{endpoint}", handler, [method], "签到点数管理")
 
     def mc_plugin(self):
         meta = self.context.get_registered_star(MC_NAME)
@@ -64,7 +61,28 @@ class CheckinPointsPlugin(Star):
     async def initialize(self):
         await asyncio.to_thread(self.store.recover_inflight)
         await self.sync_bindings()
+        await self.refresh_command_settings()
+        self._command_filters = install_command_filters(self, self._operations)
         self._worker = asyncio.create_task(self.resume_pending())
+
+    async def refresh_command_settings(self):
+        sessions = await asyncio.to_thread(self.store.sessions)
+        self._command_settings = {row["session"]: {
+            "enabled": row["settings"]["enabled"],
+            "command_prefix": row["settings"]["command_prefix"],
+        } for row in sessions}
+
+    def command_help(self, settings):
+        names = []
+        prefix = settings["command_prefix"]
+        for canonical, entry in self._command_filters.items():
+            if not entry.handler_md.enabled:
+                continue
+            name = entry.command_name
+            if prefix and canonical not in {"签到", "点数", "签到排行榜"}:
+                name = prefix + " " + name
+            names.append(name)
+        return "、".join(names)
 
     async def resume_pending(self):
         while True:
@@ -108,11 +126,11 @@ class CheckinPointsPlugin(Star):
             return record.get("mc_state", "skipped")
         if not await asyncio.to_thread(self.store.claim_mc, record["id"]):
             return "unknown"
-        state, detail = "unknown", "MC 返回结果未确认，未增加积分，请先检查游戏记录"
+        state, detail = "unknown", "MC 返回结果未确认，未增加点数，请先检查游戏记录"
         try:
             settings = await asyncio.to_thread(self.store.get_settings, record["session"])
             if not self.config.get("enabled", True) or not settings["enabled"] or not settings["mc_enabled"]:
-                state, detail = "skipped", "会话签到或 MC 联动已关闭，未执行指令、未增加积分"
+                state, detail = "skipped", "会话签到或 MC 联动已关闭，未执行指令、未增加点数"
                 return state
             await self.sync_bindings()
             account = f"{record['session'].split(':', 1)[0]}:User:{record['user_id']}"
@@ -145,7 +163,7 @@ class CheckinPointsPlugin(Star):
                         break
                     output, channel = await instance.execute_command_with_channel(command)
                     if output is None or not channel:
-                        outputs.append("MC 未返回可确认的响应，已停止后续指令，未增加积分")
+                        outputs.append("MC 未返回可确认的响应，已停止后续指令，未增加点数")
                         break
                     result, clean = classify_mc_output(str(output), settings)
                     outputs.append(clean or "MC 返回空内容，无法确认签到成功")
@@ -156,11 +174,11 @@ class CheckinPointsPlugin(Star):
                     state = "sent"
                 detail = "\n".join(outputs)
         except asyncio.CancelledError:
-            detail = "发送过程被中断，执行结果未知，未增加积分且不自动重试"
+            detail = "发送过程被中断，执行结果未知，未增加点数且不自动重试"
             raise
         except Exception as exc:
             logger.warning("[%s] MC 签到发送异常: %s", NAME, type(exc).__name__)
-            detail = "发送发生异常，结果未知，未增加积分，请检查游戏记录"
+            detail = "发送发生异常，结果未知，未增加点数，请检查游戏记录"
         finally:
             await asyncio.shield(asyncio.to_thread(self.store.set_mc_state, record["id"], state, detail))
         return state
@@ -189,34 +207,120 @@ class CheckinPointsPlugin(Star):
     async def display_player(self, event, user_id):
         return await asyncio.to_thread(self.store.get_binding, f"{event.get_platform_id()}:User:{user_id}") or user_id
 
-    @filter.custom_filter(PointsCommandFilter, priority=10)
-    async def on_command(self, event: AstrMessageEvent):
+    @filter.command("签到 排行榜", priority=20)
+    async def cmd_mc_ranking(self, event: AstrMessageEvent, args: GreedyStr):
+        """查询 Minecraft 签到排行榜（不要求插件前缀）。"""
+        async for result in self.handle_command(event, "签到排行榜", args):
+            yield result
+
+    @filter.command("商店 购买", priority=20)
+    async def cmd_buy(self, event: AstrMessageEvent, args: GreedyStr):
+        """发起商品购买：商店 购买 商品序号。"""
+        async for result in self.handle_command(event, "购买", args):
+            yield result
+
+    @filter.command("签到", alias={"checkin"}, priority=10)
+    async def cmd_checkin(self, event: AstrMessageEvent, args: GreedyStr):
+        """每日签到（不要求插件前缀）。"""
+        async for result in self.handle_command(event, "签到", args):
+            yield result
+
+    @filter.command("点数", alias={"points"}, priority=10)
+    async def cmd_points(self, event: AstrMessageEvent, args: GreedyStr):
+        """查询自己的点数（不要求插件前缀）。"""
+        async for result in self.handle_command(event, "点数", args):
+            yield result
+
+    @filter.command("查询", priority=10)
+    async def cmd_query(self, event: AstrMessageEvent, args: GreedyStr):
+        """查询余额；查询他人需要会话管理员或机器人管理员权限。"""
+        async for result in self.handle_command(event, "查询", args):
+            yield result
+
+    @filter.command("修改", priority=10)
+    async def cmd_set(self, event: AstrMessageEvent, args: GreedyStr):
+        """管理员设定余额：修改 玩家 点数；省略玩家则修改自己。"""
+        async for result in self.handle_command(event, "修改", args):
+            yield result
+
+    @filter.command("增加", priority=10)
+    async def cmd_add(self, event: AstrMessageEvent, args: GreedyStr):
+        """管理员增加余额：增加 玩家 点数。"""
+        async for result in self.handle_command(event, "增加", args):
+            yield result
+
+    @filter.command("减少", priority=10)
+    async def cmd_subtract(self, event: AstrMessageEvent, args: GreedyStr):
+        """管理员减少余额：减少 玩家 点数。"""
+        async for result in self.handle_command(event, "减少", args):
+            yield result
+
+    @filter.command("排行榜", priority=10)
+    async def cmd_ranking(self, event: AstrMessageEvent, args: GreedyStr):
+        """查询本会话点数排行榜。"""
+        async for result in self.handle_command(event, "排行榜", args):
+            yield result
+
+    @filter.command("商店列表", alias={"商店", "商店 列表"}, priority=10)
+    async def cmd_shop_list(self, event: AstrMessageEvent, args: GreedyStr):
+        """查看商品序号、价格、可售库存与每人限购数量。"""
+        async for result in self.handle_command(event, "商店列表", args):
+            yield result
+
+    @filter.command("兑换", priority=10)
+    async def cmd_exchange(self, event: AstrMessageEvent, args: GreedyStr):
+        """确认本人的购买或补发已付奖励；有订单时支持直接回复确认词。"""
+        async for result in self.handle_command(event, "兑换", args):
+            yield result
+
+    @filter.command("补领", priority=10)
+    async def cmd_collect(self, event: AstrMessageEvent, args: GreedyStr):
+        """重发已付订单的同一奖励，不重复扣款。"""
+        async for result in self.handle_command(event, "补领", args):
+            yield result
+
+    @filter.command("帮助", priority=10)
+    async def cmd_help(self, event: AstrMessageEvent, args: GreedyStr):
+        """显示当前可用指令（反映管理行为中的改名与停用）。"""
+        async for result in self.handle_command(event, "帮助", args):
+            yield result
+
+    @filter.command("重置签到", priority=10)
+    async def cmd_reset(self, event: AstrMessageEvent, args: GreedyStr):
+        """管理员重置玩家今日插件签到状态，保留余额及历史，不清除 MC 记录。"""
+        async for result in self.handle_command(event, "重置签到", args):
+            yield result
+
+    @filter.command("补签", priority=10)
+    async def cmd_makeup(self, event: AstrMessageEvent, args: GreedyStr):
+        """管理员补签：补签 玩家 YYYY-MM-DD；通过配置的游戏指令确认。"""
+        async for result in self.handle_command(event, "补签", args):
+            yield result
+
+    async def handle_command(self, event: AstrMessageEvent, command: str, argument_text: str):
+        """Run a canonical action already selected by its native command filter."""
         if not self.config.get("enabled", True):
             return
         session, user_id = event.unified_msg_origin, str(event.get_sender_id())
         settings = await asyncio.to_thread(self.store.get_settings, session)
-        text = self.command_text(event)
-        parsed = parse_command(text, settings["command_prefix"], event.is_at_or_wake_command)
-        if parsed is None:
-            return
-        command, args = parsed
+        args = argument_text.split()
         active = None
         if command in {"兑换", "补领"}:
             active = await asyncio.to_thread(self.store.active_purchase, session, user_id)
-            if text == "兑换" and not active:
-                return
         if not settings["enabled"] and not (active and active["status"] in {"paid", "delivery_failed", "sending"}):
             return  # Closing a session must not strand an already paid reward.
         event.stop_event()
         await self.sync_bindings()
+        confirm_filter = self._command_filters.get("兑换")
         values = dict(user_id=user_id, player=await self.display_player(event, user_id),
-                      minutes=settings["confirmation_minutes"])
+                      minutes=settings["confirmation_minutes"], command_list=self.command_help(settings),
+                      confirmation_command=confirm_filter.command_name if confirm_filter else "兑换")
         try:
             answer = await self.execute_command(event, settings, command, args, values)
         except ValueError as exc:
             answer = str(exc)
         except Exception as exc:
-            logger.warning("[%s] 积分指令失败: %s", NAME, type(exc).__name__)
+            logger.warning("[%s] 点数指令失败: %s", NAME, type(exc).__name__)
             answer = "处理未完成，请管理员查看记录；请勿重复操作未确认的游戏奖励。"
         yield event.plain_result(answer)
 
@@ -224,26 +328,51 @@ class CheckinPointsPlugin(Star):
         session, user_id = event.unified_msg_origin, str(event.get_sender_id())
         reply = lambda key, **more: render_reply(settings, key, **{**values, **more})
         is_admin = event.is_admin() or user_id in settings["admin_ids"]
-        if command == "签到" and not args:
-            player = await asyncio.to_thread(self.store.get_binding, f"{event.get_platform_id()}:User:{user_id}")
-            record = await asyncio.to_thread(self.store.checkin, session, user_id, player)
+        if command == "重置签到":
+            if not is_admin:
+                return reply("no_permission")
+            if len(args) != 1:
+                return "用法：重置签到 玩家（可用 @用户、账号 ID 或绑定游戏名）。"
+            target = await self.resolve_user(event, args[0])
+            record = await asyncio.to_thread(self.store.reset_checkin, session, target, user_id)
+            if not record["removed"]:
+                return f"{record['day']} 没有该玩家的插件签到记录，余额未改变。"
+            return reply("admin_reset", **{**record, "target_id": target,
+                         "player": await self.display_player(event, target)})
+        if command == "签到排行榜" and not args:
+            return await self.mc_leaderboard(settings)
+        if (command == "签到" and not args) or command == "补签":
+            target = user_id
+            if command == "补签":
+                if not is_admin:
+                    return reply("no_permission")
+                if len(args) != 2:
+                    return "用法：补签 玩家 YYYY-MM-DD，例如：补签 Steve 2026-10-23。"
+                target = await self.resolve_user(event, args[0])
+            player = await asyncio.to_thread(self.store.get_binding, f"{event.get_platform_id()}:User:{target}")
+            if command == "补签":
+                record = await asyncio.to_thread(self.store.makeup_checkin, session, target, player, args[1], user_id)
+            else:
+                record = await asyncio.to_thread(self.store.checkin, session, target, player)
             status = record["status"]
             if status == "success":
                 await self.dispatch_mc(record)
                 record = await asyncio.to_thread(self.store.get_checkin, record["id"])
-                key = "checkin_success" if record["credited"] else (
+                if record is None:
+                    return "该次签到已被管理员重置，未继续执行。"
+                key = ("makeup_success" if command == "补签" else "checkin_success") if record["credited"] else (
                     "checkin_mc_failed" if record["mc_state"] == "failed" else "checkin_mc_unknown")
             elif status == "duplicate":
-                key = "checkin_duplicate" if record["credited"] else (
+                key = ("makeup_duplicate" if command == "补签" else "checkin_duplicate") if record["credited"] else (
                     "checkin_pending" if record["mc_state"] in {"pending", "sending"} else
                     "checkin_mc_failed" if record["mc_state"] == "failed" else "checkin_mc_unknown")
             else:
                 key = "checkin_" + status
-            output = reply(key, **record)
+            output = reply(key, **{**record, "target_id": target, "player": player or target})
             if record.get("mc_detail"):
                 output += "\nMC：" + record["mc_detail"]
             return output
-        if command in {"积分", "查询"}:
+        if command in {"点数", "查询"}:
             if len(args) > 1:
                 return reply("usage")
             target = await self.resolve_user(event, args[0] if args else "")
@@ -275,16 +404,20 @@ class CheckinPointsPlugin(Star):
             for rank, row in enumerate(rows, 1):
                 items.append(reply("ranking_item", **{**row, "rank": rank,
                                    "player": await self.display_player(event, row["user_id"])}))
-            return reply("ranking", items="\n".join(items) or "暂无积分记录。")
-        if (command == "商店列表" and not args) or (command == "商店" and args == ["列表"]):
+            return reply("ranking", items="\n".join(items) or "暂无点数记录。")
+        if command == "商店列表" and not args:
             products = await asyncio.to_thread(self.store.product_catalog, session)
             items = [reply("shop_item", product_id=p["id"], product_name=p["name"], price=p["price"],
-                           stock="不限" if p["stock"] is None else p["stock"]) for p in products]
+                           stock="不限" if p["stock"] is None else p["stock"])
+                     + (f"；每人累计限购 {p['purchase_limit']} 件" if p["purchase_limit"] else "") for p in products]
             return reply("shop_list", items="\n".join(items) or "暂无在售商品。")
-        if command == "商店" and len(args) == 2 and args[0] == "购买":
+        if command == "购买" and len(args) == 1:
             if event.get_platform_name() != "aiocqhttp":
                 return "当前平台无法确认主动私聊发货，请在 OneBot / NapCat 会话中购买；本次未扣款。"
-            order = await asyncio.to_thread(self.store.create_purchase, session, user_id, args[1])
+            confirmation = self._command_filters.get("兑换")
+            if confirmation is None or not confirmation.handler_md.enabled:
+                return "购买确认指令已在管理行为中停用，请管理员启用后再购买；本次未扣款。"
+            order = await asyncio.to_thread(self.store.create_purchase, session, user_id, args[0])
             return reply("purchase_pending", **{**order, "order_id": order["id"]})
         if command in {"兑换", "补领"} and not args:
             if event.get_platform_name() != "aiocqhttp":
@@ -304,6 +437,19 @@ class CheckinPointsPlugin(Star):
             return reply("purchase_delivered" if delivered else "purchase_failed",
                          **{**order, "order_id": order["id"]})
         return reply("usage")
+
+    async def mc_leaderboard(self, settings):
+        if not settings["mc_enabled"]:
+            return "本会话尚未开启 MC 联动。"
+        mc = self.mc_plugin()
+        instance = mc.server_manager.get(settings["server_name"]) if mc else None
+        if instance is None:
+            return "鹊桥插件或目标服务器未加载，无法查询签到排行榜。"
+        output, channel = await instance.execute_command_with_channel(settings["leaderboard_command"])
+        if output is None or not channel:
+            return "MC 签到排行榜查询未收到响应，请检查服务器连接。"
+        _, clean = classify_mc_output(str(output), settings)
+        return clean or "MC 未返回签到排行榜内容。"
 
     async def deliver_purchase(self, event, settings, order, values):
         if not await asyncio.to_thread(self.store.claim_delivery, order["id"]):
@@ -346,7 +492,8 @@ class CheckinPointsPlugin(Star):
                 raise ValueError("请求必须是 JSON 对象")
             session = session_id(body.get("session"))
             settings = validate_settings(body.get("settings", {}))
-            await asyncio.to_thread(self.store.save_settings, session, settings)
+            settings = await asyncio.to_thread(self.store.save_settings, session, settings)
+            await self.refresh_command_settings()
             return json_response(dict(ok=True, settings=settings))
         except (ValueError, TypeError, KeyError) as exc:
             return json_response(dict(ok=False, error=str(exc)), status_code=400)
@@ -357,6 +504,7 @@ class CheckinPointsPlugin(Star):
             if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
                 raise ValueError("请提供会话 ID 和布尔类型的 enabled")
             await asyncio.to_thread(self.store.toggle_session, session_id(body.get("session")), body["enabled"])
+            await self.refresh_command_settings()
             return json_response(dict(ok=True))
         except (ValueError, TypeError, KeyError) as exc:
             return json_response(dict(ok=False, error=str(exc)), status_code=400)
@@ -367,6 +515,7 @@ class CheckinPointsPlugin(Star):
             if not isinstance(body, dict):
                 raise ValueError("请求必须是 JSON 对象")
             await asyncio.to_thread(self.store.delete_session, session_id(body.get("session")))
+            await self.refresh_command_settings()
             return json_response(dict(ok=True))
         except (ValueError, TypeError, KeyError) as exc:
             return json_response(dict(ok=False, error=str(exc)), status_code=400)

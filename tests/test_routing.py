@@ -9,51 +9,7 @@ package = types.ModuleType(PACKAGE)
 package.__path__ = [str(Path(__file__).resolve().parents[1])]
 sys.modules[PACKAGE] = package
 from checkin_points_routing_tests.core import DEFAULT_TEMPLATES, TEMPLATE_FIELDS, validate_settings
-from checkin_points_routing_tests.routing import COMMANDS, parse_command, render_reply
-
-
-class RoutingTests(unittest.TestCase):
-    def test_commands_and_arguments_are_preserved(self):
-        for command in COMMANDS:
-            with self.subTest(command=command):
-                self.assertEqual(parse_command(command, "", True), (command, []))
-        self.assertEqual(parse_command("商店 购买 42", "", True), ("商店", ["购买", "42"]))
-        self.assertEqual(parse_command("修改 @123 100", "", True), ("修改", ["@123", "100"]))
-        self.assertEqual(parse_command("签到 多余参数", "", True), ("签到", ["多余参数"]))
-
-    def test_unwoken_commands_are_not_captured(self):
-        for command in COMMANDS - {"兑换"}:
-            self.assertIsNone(parse_command(command, "", False))
-            self.assertIsNone(parse_command("cp " + command, "cp", False))
-        self.assertIsNone(parse_command("cp 兑换", "cp", False))
-
-    def test_only_bare_confirmation_bypasses_wake_and_prefix(self):
-        for prefix in ("", "cp"):
-            for woken in (True, False):
-                self.assertEqual(parse_command(" \t兑换\n", prefix, woken), ("兑换", []))
-        for message in ("兑换 1", "请兑换", "兑换吧", "兑换码", "我想兑换"):
-            self.assertIsNone(parse_command(message, "cp", False))
-        self.assertEqual(parse_command("cp 兑换", "cp", True), ("兑换", []))
-
-    def test_prefix_is_a_complete_token(self):
-        self.assertEqual(parse_command(" cp \t 签到 \n", "cp", True), ("签到", []))
-        for message in ("签到", "cp签到", "cp2 签到", "other 签到", "cp", "cp cp 签到"):
-            self.assertIsNone(parse_command(message, "cp", True))
-        self.assertIsNone(parse_command("cp 签到", "", True))
-
-    def test_aliases_and_whitespace(self):
-        self.assertEqual(parse_command("cp CHECKIN", "cp", True), ("签到", []))
-        self.assertEqual(parse_command(" \t points \t", "", True), ("积分", []))
-        self.assertEqual(parse_command("cp\u3000商店\t购买\n7", "cp", True), ("商店", ["购买", "7"]))
-
-    def test_host_wake_is_never_removed_twice(self):
-        self.assertIsNone(parse_command("#cp 签到", "cp", True))
-        self.assertIsNone(parse_command("/签到", "", True))
-
-    def test_ai_and_ordinary_chat_pass_through(self):
-        for message in ("chat 你好", "chat 签到", "cp chat 你好", "你好", "日常", "", "   "):
-            for prefix in ("", "cp"):
-                self.assertIsNone(parse_command(message, prefix, True))
+from checkin_points_routing_tests.routing import render_reply
 
 
 class ReplyTests(unittest.TestCase):
@@ -80,7 +36,7 @@ class ReplyTests(unittest.TestCase):
 
     def test_fallback_and_currency(self):
         self.assertEqual(render_reply({"currency_name": "星币"}, "balance", total=3), "你的余额：3 星币。")
-        self.assertEqual(render_reply({}, "balance", total=3), "你的余额：3 积分。")
+        self.assertEqual(render_reply({}, "balance", total=3), "你的余额：3 点数。")
 
     def test_oversized_reward_fails_instead_of_truncating(self):
         settings = {"templates": {"purchase_private": "{reward}"}}

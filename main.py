@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Mapping
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -24,6 +25,7 @@ from .services.help_renderer import build_help_document, help_catalog, render_he
 
 PLUGIN_NAME = "astrbot_plugin_yuma_mcqq"
 CONSUMED_KEY = "yuma_mcqq.consumed"
+RELAY_ATTEMPTED_KEY = "yuma_mcqq.relay_attempted"
 AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
 
 
@@ -32,7 +34,7 @@ AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
     PLUGIN_NAME,
     "Junnstoy",
     "Paper / QueQiao 群服互通、绑定、签到点数商店与性能监控",
-    "1.4.1",
+    "1.4.2",
     "https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq",
 )
 class YumaMCQQPlugin(Star):
@@ -221,20 +223,66 @@ class YumaMCQQPlugin(Star):
     async def _send_game_message(self, umo: str, text: str) -> None:
         await self._send_result(umo, {"text": text})
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)
-    async def ordinary_message(self, event: AstrMessageEvent) -> None:
-        if not self._enabled() or event.is_stopped() or event.get_extra(CONSUMED_KEY, False):
-            return
+    def _ordinary_route(self, event: AstrMessageEvent) -> dict | None:
+        if (not self._enabled() or event.is_stopped() or event.get_extra(CONSUMED_KEY, False)
+                or event.get_extra(RELAY_ATTEMPTED_KEY, False)):
+            return None
         if not event.get_group_id() or str(event.get_sender_id()) == str(event.get_self_id()):
-            return
+            return None
         # is_wake is also set by generic listeners and is not an AI signal.
         if event.is_at_or_wake_command or event.call_llm or getattr(event, "_has_send_oper", False):
-            return
+            return None
         if any(event.get_extra(key, False) for key in AI_TAKEOVER_KEYS):
-            return
+            return None
+        # AstrBot completes command matching before invoking any handler. This
+        # also excludes another plugin's command whose priority is below ours.
+        if event.get_extra("handlers_parsed_params", {}):
+            return None
         route = self.app.settings.route(str(event.unified_msg_origin))
         if not route or not route.get("enabled", True) or not route.get("qq_to_mc", True):
+            return None
+        return route
+
+    def _may_auto_reply(self, event: AstrMessageEvent) -> bool:
+        # Do not call need_active_reply: it draws randomly and the built-in
+        # handler must remain the sole owner of that decision.
+        try:
+            config = self.context.get_config(str(event.unified_msg_origin))
+            ltm = config.get("provider_ltm_settings", {})
+            active = ltm.get("active_reply", {})
+            if not isinstance(active, Mapping):
+                return True
+            if not active.get("enable", False):
+                return False
+            whitelist = active.get("whitelist", [])
+            if not isinstance(whitelist, list):
+                return True
+            return (not whitelist or str(event.unified_msg_origin) in whitelist
+                    or str(event.get_group_id()) in whitelist)
+        except Exception:
+            # Unknown session configuration retains the previous late path.
+            return True
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
+    async def ordinary_message_early(self, event: AstrMessageEvent) -> None:
+        # Commands run at 20, group-context captioning at 0. Keep the event
+        # intact so recording/captioning still runs after ordinary forwarding.
+        route = self._ordinary_route(event)
+        if route is not None and not self._may_auto_reply(event):
+            await self._relay_ordinary(event, route)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)
+    async def ordinary_message(self, event: AstrMessageEvent) -> None:
+        route = self._ordinary_route(event)
+        if route is not None:
+            await self._relay_ordinary(event, route)
+
+    async def _relay_ordinary(self, event: AstrMessageEvent, route: dict) -> None:
+        # Mark before awaiting, including failure/cancellation: a late retry
+        # must not duplicate a broadcast whose delivery may be uncertain.
+        if event.get_extra(RELAY_ATTEMPTED_KEY, False):
             return
+        event.set_extra(RELAY_ATTEMPTED_KEY, True)
         try:
             await self.app.relay_from_qq(event, route)
         except Exception as exc:

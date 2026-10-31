@@ -1,7 +1,7 @@
 name: astrbot_plugin_yuma_mcqq
 display_name: Yuma MCQQ
 desc: Paper/QueQiao 群服互通、双向唯一绑定、游戏与群签到、点数商店、自定义指令和性能监控。
-version: 1.4.1
+version: 1.4.2
 author: Junnstoy
 repo: https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq
 astrbot_version: ">=4.29.0,<5.0.0"

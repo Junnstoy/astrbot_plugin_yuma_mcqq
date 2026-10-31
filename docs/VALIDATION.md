@@ -16,13 +16,19 @@ python tests/gui_signin_policy_smoke.py
 python tests/render_help_previews.py
 ```
 
+1.4.2（2026-11-01）最终本地全量结果：**304 / 304 项通过**，耗时 59.229 秒，无跳过，使用官方 AstrBot 4.29.1。优先级专项 **14 项通过**，耗时 0.511 秒；媒体/转发专项 **50 项通过**，耗时 3.523 秒。Python 编译、JavaScript 语法及 Git 空白检查通过，运行代码和测试中已无临时慢阶段计时、`framework_wait`、就绪提示及日志注入参数残留。下方 1.4.1 日志专项保留为历史记录。
+
+优先级测试使用官方 `StarHandlerRegistry` 和 `StarRequestSubStage` 调度真实 MCQQ 处理器与模拟优先级 0 的图片理解处理器；通过屏障断言转发先完成，而图片理解仍在等待，释放后继续执行。覆盖命令/唤醒/接管过滤、主动回复回退、原 UMO 及单次转发等行为。这是实际框架调度与模拟图片理解的隔离验证，不是真实模型或 QQ/Paper 端到端验收；用户此前确认的是关闭旧图片理解后转发变快。
+
+1.4.2 仅同步 GUI 总览中的处理顺序说明，未改交互、布局或帮助图片排版；本轮未重跑浏览器，交互与图片验收引用此前对应版本记录。
+
 1.4.1（2026-11-01）最终本地全量结果：**293 / 293 项通过**，耗时 58.330 秒，无跳过，使用官方 AstrBot 4.29.1。排行覆盖固定前 10 名、总余额及冻结额口径、作用域隔离、同分次序、当前绑定/换绑/解绑名称、不输出 QQ、空榜与单次关联查询；另包含转发 URL 保留、有限并发及慢阶段计时回归。Python 编译、JavaScript 语法及 Git 空白检查通过。
 
 1.4.1 的四组帮助预览已重新生成并通过场景断言，尺寸仍为 1500 × 2891、2220 × 2891、2940 × 2865、3660 × 2865；已目检 5 条自定义指令样图，新的排行说明显示正常。本补丁未修改 GUI，浏览器结果引用下方 1.4.0 已执行记录，未宣称本轮重新运行浏览器验收。新版远程 CI 结果以 PR 检查为准，不将本地通过等同远程通过。
 
 1.4.1 媒体/转发专项 **53 项通过**，耗时 2.845 秒，覆盖已有 URL 不下载/不多做查询、原始与框架消息合并保留 URL、`file_path` 链接、有限并发与原顺序、嵌套预算、任务取消清理、私网与本地可信路径限制、引用同会话校验、慢阶段日志和 `framework_wait` 的有效/异常时间输入。日志仅记录阶段与时长，不含正文、QQ、UMO、文件 ID 或资源 URL；此专项随后纳入上述全量验证。
 
-额外核对了本地隔离导入的官方 AstrBot 4.29.1 wheel 源码：`core/pipeline/preprocess_stage/stage.py` 的 `process` / `_normalize_image_component` 会在插件前逐张本地化正文及引用图片；`builtin_stars/astrbot/main.py` 的 `on_message` 与 `group_chat_context.py` 的 `_format_message` 在相关群聊配置启用时会等待图片转述。配置项及关闭范围见 [转发耗时排查](UPGRADE_1_4.md#转发耗时排查)。这些源码事实不是生产故障复现；当前没有生产转发日志，未确认实服延迟具体来源。`framework_wait` 是队列/预处理/前序处理器的总等待估计，不能等同 QQ 网络延迟；单张只有文件 ID 的图片也仍可能等待 NapCat 返回地址。
+额外核对了本地隔离导入的官方 AstrBot 4.29.1 wheel 源码：`core/pipeline/preprocess_stage/stage.py` 的 `process` / `_normalize_image_component` 会在插件前逐张本地化正文及引用图片；`builtin_stars/astrbot/main.py` 的 `on_message` 与 `group_chat_context.py` 的 `_format_message` 在相关群聊配置启用时会等待图片转述。相关边界见 [图片转发顺序](UPGRADE_1_4.md#图片转发顺序)。用户随后反馈关闭自动理解图片后变快，但尚未完成新版真实 QQ/Paper 验收。1.4.1 的 `framework_wait` 等计时已在 1.4.2 移除；单张只有文件 ID 的图片仍可能等待 NapCat 返回地址。
 
 1.3.0 本地全量结果：**237 / 237 项通过**，耗时52.066秒，无跳过；包含真实 AstrBot 4.29.1 管理接口、分页、服务器 ID 迁移与中断恢复、旧上下文竞态、配置回退与重命名并发、帮助图片/文字及配置和同序号稳定排序、绑定迁移、签到、消息传输和监控。Python 编译、JavaScript 语法、Git 空白检查均通过。历史基线：1.0 为66项、1.1.0 为116项、1.1.1 为156项、1.2.0 为197项通过。
 
@@ -58,7 +64,7 @@ python tests/render_help_previews.py
 
 浏览器最终结果：7页、13项操作流程通过，移动端无横向溢出，JS异常0；新增帮助开关/说明/显隐/排序、23条绑定和125条诊断记录翻页、原值12ms显示0.24ticks及20个纵轴刻度、服务器ID修改。另在官方同样的 iframe sandbox 中独立验证解绑取消不发请求、失败原因留在表单、成功只调用一次；其他删除也可使用页面内确认，原生confirm调用数为0。旧实现已在相同限制下复现“confirm被禁止、请求数0”。
 
-新增合成截图：[帮助设置](screenshots/help-settings.png)、[绑定分页](screenshots/bindings-pagination.png)、[ticks坐标](screenshots/monitor-ticks.png)、[沙箱内解绑](screenshots/admin-unbind-sandbox.png)。1.3.0 的帮助分页排版曾通过目检；1.4.0 改为[单图样张](screenshots/help-example.png)，以及 [5](screenshots/help-preview-custom-5.png) / [15](screenshots/help-preview-custom-15.png) / [30](screenshots/help-preview-custom-30.png) / [50](screenshots/help-preview-custom-50.png) 条自定义指令预览，四组另含 23 个默认指令，总数为 28 / 38 / 53 / 73，对应 2 / 3 / 4 / 5 列。样张将帮助排第一、首条自定义排第三，核对跨分类插入不改变全局顺序。可运行 `python tests/render_help_previews.py` 重新生成，不读取真实用户数据。1.2.0 已验证的4张Mermaid和[静态拓扑SVG](architecture.svg)保留（86节点、142连线）；当前签到策略已补入 Markdown 源图，SVG 未随本次变更重新生成。
+新增合成截图：[帮助设置](screenshots/help-settings.png)、[绑定分页](screenshots/bindings-pagination.png)、[ticks坐标](screenshots/monitor-ticks.png)、[沙箱内解绑](screenshots/admin-unbind-sandbox.png)。1.3.0 的帮助分页排版曾通过目检；1.4.0 改为[单图样张](screenshots/help-example.png)，以及 [5](screenshots/help-preview-custom-5.png) / [15](screenshots/help-preview-custom-15.png) / [30](screenshots/help-preview-custom-30.png) / [50](screenshots/help-preview-custom-50.png) 条自定义指令预览，四组另含 23 个默认指令，总数为 28 / 38 / 53 / 73，对应 2 / 3 / 4 / 5 列。样张将帮助排第一、首条自定义排第三，核对跨分类插入不改变全局顺序。可运行 `python tests/render_help_previews.py` 重新生成，不读取真实用户数据。1.2.0 已验证的4张Mermaid和[静态拓扑SVG](architecture.svg)保留（86节点、142连线）；当前签到策略及 1.4.2 普通转发前置/兜底流程已补入 Markdown 源图；当前流程以 Markdown 为准，静态 SVG 仍为早期快照，未随本次变更重新生成。
 
 四张最终图均已目检；`mc帮助` 为 01，插入的自定义命令为 03。生成脚本断言每列序号连续、每条只出现一次，并输出[场景报告](screenshots/help-preview-report.json)。各列按从上至下、从左至右阅读，分类被其他指令打断或跨列时用独立“续”框。用户已确认此排版；图内使用说明移除“排版预览/排序测试”和“按序号……每列最多 15 条”等测试与排版提示，测试场景说明保留在本验证文档和报告中。
 

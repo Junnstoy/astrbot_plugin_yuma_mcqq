@@ -8,6 +8,7 @@ an action is renamed, reordered, or the plugin is reloaded.
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import hashlib
 from types import SimpleNamespace
@@ -26,10 +27,11 @@ BUILTINS = (
     ("confirm", "确认兑换", "确认待处理的兑换：确认兑换 订单ID。"),
     ("reclaim", "补领", "重新发送本人已分配的奖励，不重复扣点。"),
     ("orders", "兑换记录", "查看本人的兑换订单。"),
-    ("status", "服务器状态", "查看服务器连接和性能状态。"),
-    ("tps", "tps", "查看服务器 TPS 历史图。"),
-    ("mspt", "mspt", "查看服务器 MSPT 历史图。"),
-    ("ping", "ping", "查看已标明测量对象的延迟。"),
+    ("status", "服务器状态", "仅返回服务器在线或离线。"),
+    ("tps", "tps", "执行 TPS 查询并返回清洗后的 RCON 文字。"),
+    ("mspt", "mspt", "执行 MSPT 查询并返回清洗后的 RCON 文字。"),
+    ("ping", "ping", "执行玩家延迟查询并返回清洗后的 RCON 文字。"),
+    ("performance", "性能图", "查看 TPS、MSPT 与延迟的历史 PNG 图片。"),
     ("help", "mc帮助", "查看本插件帮助；触发名称可在管理行为中修改。"),
     ("points_add", "添加点数", "管理员添加点数：添加点数 QQ号 数量 [原因]。"),
     ("points_sub", "扣除点数", "管理员扣除点数：扣除点数 QQ号 数量 [原因]。"),
@@ -38,6 +40,49 @@ BUILTINS = (
 )
 
 ADMIN_ACTIONS = frozenset({"points_add", "points_sub", "points_set", "order_reconcile"})
+_PREFIX_FILTER_TYPE = None
+
+
+def with_plugin_prefix(original, prefix_getter):
+    """Keep a real CommandFilter so AstrBot still manages this exact action.
+
+    AstrBot filters run synchronously. Temporarily adapting only this filter's
+    input supports a plugin wake prefix without changing another handler's text,
+    wake state, permissions, or global bot configuration.
+    """
+    global _PREFIX_FILTER_TYPE
+    if _PREFIX_FILTER_TYPE is None:
+        base = _framework().CommandFilter
+
+        class PluginCommandFilter(base):
+            def filter(self, event, cfg):
+                prefix = str(self.prefix_getter() or "").strip()
+                if not prefix:
+                    return super().filter(event, cfg)
+                text = event.get_message_str().strip()
+                if not text.startswith(prefix):
+                    # The framework may already have stripped a global wake
+                    # prefix which is also part (or all) of this plugin prefix.
+                    original = str(getattr(event.message_obj, "message_str", "") or "").strip()
+                    if not event.is_at_or_wake_command or not original.startswith(prefix):
+                        return False
+                    text = original
+                text = text[len(prefix):].lstrip()
+                previous_text = event.message_str
+                previous_wake = event.is_at_or_wake_command
+                try:
+                    event.message_str = text
+                    event.is_at_or_wake_command = True
+                    return super().filter(event, cfg)
+                finally:
+                    event.message_str = previous_text
+                    event.is_at_or_wake_command = previous_wake
+
+        _PREFIX_FILTER_TYPE = PluginCommandFilter
+    adapted = copy.copy(original)
+    adapted.__class__ = _PREFIX_FILTER_TYPE
+    adapted.prefix_getter = prefix_getter
+    return adapted
 
 
 def _framework() -> SimpleNamespace:
@@ -98,6 +143,18 @@ class CommandRegistryBridge:
         self._owned: dict[str, object] = {}
         self._lock = asyncio.Lock()
         self._signature: tuple | None = None
+        # Built-ins were registered during module import. Adapt their filter
+        # objects while preserving stable IDs and any persisted overrides.
+        framework = _framework()
+        for metadata in framework.registry.get_handlers_by_module_name(self.module):
+            metadata.event_filters = [
+                with_plugin_prefix(item, self._prefix) if isinstance(item, framework.CommandFilter) else item
+                for item in metadata.event_filters
+            ]
+
+    def _prefix(self) -> str:
+        app = getattr(self.plugin, "app", None)
+        return str(app.settings.data.get("command_prefix", "")) if app is not None else ""
 
     def handler_name(self, action_id: str) -> str:
         digest = hashlib.sha256(action_id.encode("utf-8")).hexdigest()[:24]
@@ -192,7 +249,7 @@ class CommandRegistryBridge:
                 command_filter = framework.CommandFilter(
                     str(definition["name"]), set(definition.get("aliases", [])), metadata,
                 )
-                metadata.event_filters.append(command_filter)
+                metadata.event_filters.append(with_plugin_prefix(command_filter, self._prefix))
                 permission_name = plugin_permissions.get(method_name, {}).get("permission")
                 if permission_name in framework.permissions:
                     metadata.event_filters.append(framework.PermissionTypeFilter(

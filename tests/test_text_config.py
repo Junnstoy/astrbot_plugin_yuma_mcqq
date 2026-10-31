@@ -82,5 +82,25 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.settings.save({'routes':[one,{**two,**change}]})
 
+    def test_defaults_and_migration_preserve_explicit_face_off(self):
+        self.assertFalse(self.settings.data['binding_verification_enabled'])
+        self.assertEqual(self.settings.data['command_prefix'],'')
+        old = {'servers':[{'id':'s'}], 'routes':[{'umo':'b:GroupMessage:1','server_id':'s','types':['text','image']}]}
+        self.settings.path.write_text(json.dumps(old),encoding='utf-8')
+        upgraded = Settings(self.settings.path)
+        self.assertIn('face',upgraded.data['routes'][0]['types'])
+        upgraded.data['routes'][0]['types'].remove('face')
+        upgraded.save(upgraded.data)
+        self.assertNotIn('face',Settings(self.settings.path).data['routes'][0]['types'])
+
+    def test_reverse_requires_token_and_preserves_display_name(self):
+        server={'id':'s','connection_mode':'reverse','url':'','display_name':'生存服'}
+        with self.assertRaisesRegex(ValueError,'Token'): self.settings.save({'servers':[server]})
+        self.settings.save({'servers':[{**server,'token':'test-only-secret'}]})
+        self.assertEqual(self.settings.server('s')['display_name'],'生存服')
+        self.assertEqual(self.settings.server('s')['reverse_path'],'/queqiao')
+        with self.assertRaises(ValueError): self.settings.save({'command_prefix':'mc command'})
+        with self.assertRaises(ValueError): self.settings.save({'points_name':'{balance}'})
+
 
 if __name__ == '__main__': unittest.main()

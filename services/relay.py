@@ -8,18 +8,29 @@ import logging
 import re
 import time
 from collections import deque
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from ..core.text import render_template
 from .media import MediaRejected, MediaUnavailable
 
 log = logging.getLogger(__name__)
-URL = re.compile(r"https?://[^\s<>\[\]]+", re.I)
-COLORS = re.compile(r"§[0-9a-fk-orx]", re.I)
+URL = re.compile(r"(?<![\w@])(?:https?://|www\.)[^\s<>\[\]§]+", re.I)
+FORMAT = re.compile(r"[§&]x(?:[§&][0-9a-f]){6}|[§&]#[0-9a-f]{6}|[§&][0-9a-fk-or]", re.I)
+COLOR_NAMES = dict(zip("0123456789abcdef", ("black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white")))
+DECORATIONS = {"k": "obfuscated", "l": "bold", "m": "strikethrough", "n": "underlined", "o": "italic"}
 LABELS = {"image": "图片", "record": "语音", "video": "视频", "file": "文件"}
+EVENTS = {"player_chat": "PlayerChatEvent", "player_join": "PlayerJoinEvent", "player_quit": "PlayerQuitEvent", "player_death": "PlayerDeathEvent", "player_achievement": "PlayerAchievementEvent", "player_advancement": "PlayerAchievementEvent"}
 
 
 def _safe_url(value: str) -> str:
+    value = str(value).strip()
+    if any(ord(char) < 32 for char in value):
+        return ""
+    if value.lower().startswith("www."):
+        value = "https://" + value
+    elif value.startswith("//"):
+        value = "https:" + value
     try:
         parsed = urlsplit(value)
         if parsed.scheme in ("http", "https") and parsed.hostname and not parsed.username and not parsed.password:
@@ -29,47 +40,179 @@ def _safe_url(value: str) -> str:
     return ""
 
 
+def strip_styles(value: str) -> str:
+    # Ampersands in URL query strings are data, not Minecraft style markers.
+    output, start = [], 0
+    for match in URL.finditer(value):
+        output.extend((FORMAT.sub("", value[start:match.start()]), match.group()))
+        start = match.end()
+    output.append(FORMAT.sub("", value[start:]))
+    return "".join(output)
+
+
+def styled_components(text: str, *, modern: bool = False, color: str = "white", links: bool = True) -> list[dict]:
+    """Translate legacy colour/style codes to actual JSON properties, preserving URLs."""
+    state = {"color": color, **{name: False for name in DECORATIONS.values()}}
+    result = []
+
+    def emit(value: str):
+        if value:
+            result.append({**minecraft_component(value, color=state["color"]), **state})
+
+    def plain(value: str):
+        cursor = 0
+        for match in FORMAT.finditer(value):
+            emit(value[cursor:match.start()])
+            token = match.group().lower()
+            code = token[1]
+            if code in COLOR_NAMES or code in ("x", "#", "r"):
+                state.update({name: False for name in DECORATIONS.values()})
+                state["color"] = ("#" + token[3::2]) if code == "x" else token[1:] if code == "#" else COLOR_NAMES.get(code, color)
+            else:
+                state[DECORATIONS[code]] = True
+            cursor = match.end()
+        emit(value[cursor:])
+
+    cursor = 0
+    for match in URL.finditer(text):
+        plain(text[cursor:match.start()])
+        source = match.group().rstrip("。，！；,;)")
+        if links:
+            result.append(minecraft_component("[链接]", hover=source, url=_safe_url(source), modern=modern, color="blue"))
+        else:
+            emit(source)
+        cursor = match.start() + len(source)
+    plain(text[cursor:])
+    return result
+
+
 def component_text(value, depth: int = 0) -> str:
     if depth > 6:
         return ""
     if isinstance(value, str):
-        return COLORS.sub("", value)
+        if value.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, (dict, list)):
+                    return component_text(parsed, depth + 1)
+            except ValueError:
+                pass
+        return strip_styles(value)
     if isinstance(value, list):
         return "".join(component_text(item, depth + 1) for item in value[:100])
-    if isinstance(value, dict):
-        text = str(value.get("text", ""))
+    value = _as_dict(value)
+    if value:
+        text = component_text(value.get("text", ""), depth + 1)
+        if not text:
+            for key in ("translation", "translate", "message", "raw_message"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    text = component_text(nested, depth + 1)
+                    if text:
+                        break
         if not text and value.get("translate"):
             text = str(value["translate"]) + " " + " ".join(component_text(item, depth + 1) for item in value.get("with", [])[:10])
-        return COLORS.sub("", text) + component_text(value.get("extra", []), depth + 1)
+        return strip_styles(text) + component_text(value.get("extra", []), depth + 1)
     return ""
 
 
 def minecraft_component(text: str, *, hover: str = "", url: str = "", modern: bool = False, color: str = "white") -> dict:
-    result = {"text": text, "color": color}
+    result = {"text": text, "color": color, **{name: False for name in DECORATIONS.values()}}
     if hover:
+        hover = hover[:1800]
+        contents = {"text": hover}
+        if strip_styles(hover) != hover:
+            contents = {"text": "", "extra": styled_components(hover, modern=modern, links=False)}
         if modern:
-            result["hover_event"] = {"action": "show_text", "value": {"text": hover[:1800]}}
+            result["hover_event"] = {"action": "show_text", "value": contents}
         else:
-            result["hoverEvent"] = {"action": "show_text", "contents": {"text": hover[:1800]}}
-    if _safe_url(url):
+            result["hoverEvent"] = {"action": "show_text", "contents": contents}
+    url = _safe_url(url)
+    if url:
         result["underlined"] = True
         result["click_event" if modern else "clickEvent"] = {"action": "open_url", "url" if modern else "value": url}
     return result
 
 
 def _as_dict(value) -> dict:
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "toDict"):
+    if isinstance(value, Mapping):
+        return dict(value)
+    # AstrBot Reply.toDict() intentionally drops everything except id. Prefer the
+    # complete pydantic representation, including pydantic.v1 used by AstrBot 4.29.
+    for method in ("model_dump", "dict", "toDict"):
+        callback = getattr(value, method, None)
+        if not callable(callback):
+            continue
         try:
-            result = value.toDict()
+            result = callback()
             if isinstance(result, dict):
                 return result
         except Exception:
             pass
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
+    fields = getattr(value, "__dict__", None)
+    if isinstance(fields, dict):
+        return {key: data for key, data in fields.items() if not key.startswith("_")}
     return {}
+
+
+def _kind(value) -> str:
+    name = str(getattr(value, "value", value)).lower()
+    return {"plain": "text", "nodes": "forward", "node": "forward", "json": "link", "share": "link", "attachment": "image", "audio": "record", "emoji": "face", "mface": "face", "dice": "face", "rps": "face"}.get(name, name)
+
+
+def _segment(value) -> dict:
+    raw = _as_dict(value)
+    kind = _kind(raw.get("type", "text"))
+    data = raw.get("data", {key: value for key, value in raw.items() if key != "type"})
+    if not isinstance(data, dict):
+        data = {"data": data}
+    original_kind = str(getattr(raw.get("type"), "value", raw.get("type"))).lower()
+    if original_kind in ("mface", "dice", "rps"):
+        data = {**data, "_face_kind": original_kind}
+    if original_kind == "node":
+        data = {"content": [data]}
+    return {"type": kind, "data": data}
+
+
+def _cq_unescape(text: str) -> str:
+    return text.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]").replace("&amp;", "&")
+
+
+def _message_segments(value) -> list[dict]:
+    if isinstance(value, (list, tuple)):
+        return [_segment(item) for item in value[:200]]
+    if not isinstance(value, str):
+        return []
+    result, cursor = [], 0
+    for match in re.finditer(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]", value[:65536], re.I):
+        if match.start() > cursor:
+            result.append({"type": "text", "data": {"text": _cq_unescape(value[cursor:match.start()])}})
+        data = {}
+        for field in match[2].lstrip(",").split(","):
+            key, separator, content = field.partition("=")
+            if separator:
+                data[key] = _cq_unescape(content)
+        result.append(_segment({"type": match[1], "data": data}))
+        cursor = match.end()
+    if cursor < len(value):
+        result.append({"type": "text", "data": {"text": _cq_unescape(value[cursor:65536])}})
+    return result[:200]
+
+
+def _raw_event(event) -> dict:
+    raw = getattr(getattr(event, "message_obj", None), "raw_message", {})
+    if isinstance(raw, str) and raw.lstrip().startswith("{"):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            pass
+    return _as_dict(raw)
+
+
+def _group_id(event) -> str:
+    callback = getattr(event, "get_group_id", None)
+    group = callback() if callable(callback) else None
+    return str(group or getattr(getattr(event, "message_obj", None), "group_id", "") or _raw_event(event).get("group_id") or "")
 
 
 class Relay:
@@ -108,12 +251,29 @@ class Relay:
 
     @staticmethod
     def _segments(event) -> list:
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", {})
-        raw = _as_dict(raw)
+        raw = _raw_event(event)
+        callback = getattr(event, "get_messages", None)
+        adapted = _message_segments(callback() if callable(callback) else [])
         message = raw.get("message")
-        if isinstance(message, list):
-            return message[:200]
-        return [_as_dict(item) for item in event.get_messages()][:200]
+        if message is None:
+            # A raw CQ string is a valid AstrBot raw_message representation too.
+            candidate = getattr(getattr(event, "message_obj", None), "raw_message", "")
+            message = candidate if isinstance(candidate, str) and not candidate.lstrip().startswith("{") else None
+        original = _message_segments(message)
+        if not original:
+            return adapted
+        remaining = list(adapted)
+        for segment in original:
+            kind, data = segment["type"], segment["data"]
+            for index, extra in enumerate(remaining):
+                if extra["type"] != kind:
+                    continue
+                if kind == "reply" and str(data.get("id", "")) != str(extra["data"].get("id", "")):
+                    continue
+                segment["data"] = {**extra["data"], **data}
+                remaining.pop(index)
+                break
+        return original
 
     @staticmethod
     async def _api(event, action: str, **params) -> dict:
@@ -123,6 +283,9 @@ class Relay:
             callback = getattr(getattr(bot, "api", None), "call_action", None)
         if not callback:
             raise MediaUnavailable("当前平台未提供 OneBot 媒体查询")
+        self_id = _raw_event(event).get("self_id") or (event.get_self_id() if hasattr(event, "get_self_id") else None)
+        if self_id:
+            params.setdefault("self_id", self_id)
         result = await asyncio.wait_for(callback(action=action, **params), timeout=8)
         if not isinstance(result, dict):
             raise MediaRejected("OneBot 返回格式异常")
@@ -137,7 +300,7 @@ class Relay:
         own = str(event.get_self_id()) if hasattr(event, "get_self_id") else ""
         if user == own:
             return
-        message_id = str(getattr(getattr(event, "message_obj", None), "message_id", ""))
+        message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
         umo = str(event.unified_msg_origin)
         if message_id and not self._once(f"qq:{umo}:{message_id}"):
             return
@@ -162,7 +325,7 @@ class Relay:
                 bounded.append(component)
                 remaining -= len(text)
             components = bounded
-            components.insert(0, minecraft_component(prefix[:300], color="aqua"))
+            components[:0] = styled_components(prefix[:300], color="aqua", modern=modern, links=False)
             rendered = "".join(item["text"] for item in components)
             digest = hashlib.sha256(rendered.encode()).hexdigest()
             self._echoes[(route["server_id"], digest)] = time.monotonic() + 30
@@ -173,37 +336,40 @@ class Relay:
         if depth > 3:
             return [minecraft_component("[嵌套消息已截断]", color="gray")]
         result = []
-        enabled = set(route.get("types", ["text", "link", "image", "record", "video", "file", "reply", "forward", "at"]))
+        enabled = set(route.get("types", ["text", "link", "image", "record", "video", "file", "reply", "forward", "at", "face"]))
         for raw in segments[:100]:
             if budget[0] >= 200:
                 result.append(minecraft_component("[消息过长，已截断]", color="gray"))
                 break
             budget[0] += 1
-            raw = _as_dict(raw)
-            original_kind = str(raw.get("type", "text")).lower()
-            kind = original_kind
-            kind = {"plain": "text", "nodes": "forward", "node": "forward", "json": "link", "share": "link"}.get(kind, kind)
+            raw = _segment(raw)
+            kind = raw["type"]
             if kind not in enabled:
                 continue
-            data = raw.get("data", raw)
-            if not isinstance(data, dict):
-                data = {"data": data}
-            if original_kind == "node":
-                data = {"content": [data]}
+            data = raw["data"]
             if kind == "text":
                 text = str(data.get("text", ""))[:4000]
-                cursor = 0
-                for match in URL.finditer(text):
-                    if match.start() > cursor:
-                        result.append(minecraft_component(text[cursor:match.start()]))
-                    url = match.group().rstrip("。，！；,;)")
-                    result.append(minecraft_component("[链接]", hover=url, url=url, modern=modern, color="blue"))
-                    cursor = match.start() + len(url)
-                if cursor < len(text):
-                    result.append(minecraft_component(text[cursor:]))
+                result.extend(styled_components(text, modern=modern, links="link" in enabled))
             elif kind == "at":
                 target = str(data.get("qq", data.get("id", "")))
                 result.append(minecraft_component("@全体成员" if target == "all" else "@" + str(data.get("name") or target), color="yellow"))
+            elif kind == "face":
+                face_kind = data.get("_face_kind", "face")
+                label, url = "表情", ""
+                if face_kind in ("dice", "rps"):
+                    label = "骰子" if face_kind == "dice" else "猜拳"
+                    value = str(data.get("result") or data.get("value") or "")
+                    if value:
+                        label += "：" + value[:20]
+                elif face_kind == "mface" and _safe_url(data.get("url", "")):
+                    direct = getattr(self.media, "public_source_url", None)
+                    if callable(direct):
+                        try:
+                            url = direct(_safe_url(data["url"]))
+                        except (MediaRejected, ValueError):
+                            pass
+                hover = str(data.get("name") or data.get("summary") or "QQ 表情 " + str(data.get("id", "")))
+                result.append(minecraft_component("[" + label + "]", hover=hover, url=url, modern=modern, color="green"))
             elif kind in LABELS:
                 label = LABELS[kind]
                 name = str(data.get("name") or data.get("file_name") or "")
@@ -211,7 +377,8 @@ class Relay:
                     label += "：" + name[:100]
                 try:
                     source = await self._media_source(event, kind, data)
-                    url = await self.media.publish(source, kind, name)
+                    direct = getattr(self.media, "public_source_url", None)
+                    url = direct(source) if callable(direct) and _safe_url(source) else await self.media.publish(source, kind, name)
                     result.append(minecraft_component(f"[{label}]", hover=name or "点击访问，有效期内可用", url=url, modern=modern, color="blue"))
                 except Exception as exc:
                     if isinstance(exc, asyncio.CancelledError):
@@ -238,39 +405,63 @@ class Relay:
     async def _media_source(self, event, kind: str, data: dict) -> str:
         source = str(data.get("url") or data.get("path") or "")
         file_id = str(data.get("file") or data.get("file_id") or "")
+        for candidate in (source, file_id):
+            if _safe_url(candidate):
+                return _safe_url(candidate)
+        if not source and file_id.startswith("base64://"):
+            return file_id
         if kind == "record" and file_id:
             try:
                 info = await self._api(event, "get_record", file=file_id, out_format="mp3")
-                source = str(info.get("url") or info.get("file") or info.get("path") or source)
+                source = self._source_from_api(info, source)
             except Exception:
                 if not source:
                     raise
         elif kind == "file" and not source and file_id:
-            info = await self._api(event, "get_file", file_id=file_id)
-            source = str(info.get("url") or info.get("file") or info.get("file_path") or "")
+            group = _group_id(event)
+            try:
+                info = await self._api(event, "get_group_file_url" if group else "get_private_file_url", file_id=file_id, **({"group_id": int(group)} if group else {}))
+                source = self._source_from_api(info)
+            except Exception:
+                pass
+            if not source:
+                info = await self._api(event, "get_file", file_id=file_id)
+                source = self._source_from_api(info)
         elif kind == "image" and not source and file_id:
             info = await self._api(event, "get_image", file=file_id)
-            source = str(info.get("url") or info.get("file") or "")
-        if not source and file_id.startswith(("http://", "https://", "file://")):
+            source = self._source_from_api(info)
+        elif kind == "video" and not source and file_id:
+            info = await self._api(event, "get_file", file_id=file_id)
+            source = self._source_from_api(info)
+        if not source and file_id.startswith(("http://", "https://", "file://", "base64://")):
             source = file_id
         if not source:
             raise MediaUnavailable("媒体来源不可用")
         return source
 
+    @staticmethod
+    def _source_from_api(info: dict, fallback: str = "") -> str:
+        values = [str(info.get(key) or "") for key in ("url", "file", "file_path", "path")]
+        for value in values:
+            if _safe_url(value):
+                return _safe_url(value)
+        if info.get("base64"):
+            return "base64://" + str(info["base64"])
+        return next((value for value in values if value), fallback)
+
     async def _quote(self, event, data: dict) -> tuple[str, str]:
-        if data.get("chain") or data.get("message_str"):
-            return str(data.get("sender_nickname") or data.get("sender_id") or "某人"), str(data.get("message_str") or self._summary(data["chain"]))[:1600]
         try:
             info = await self._api(event, "get_msg", message_id=int(data["id"]))
-            raw = _as_dict(getattr(getattr(event, "message_obj", None), "raw_message", {}))
-            if raw.get("group_id"):
-                if str(raw["group_id"]) != str(info.get("group_id", "")):
+            group = _group_id(event)
+            if group:
+                if group != str(info.get("group_id", "")):
                     raise MediaRejected("引用消息不属于当前群聊")
             elif info.get("group_id") or str(info.get("user_id", "")) != str(event.get_sender_id()):
                 raise MediaRejected("引用消息不属于当前私聊")
             sender = _as_dict(info.get("sender", {}))
-            author = str(sender.get("card") or sender.get("nickname") or sender.get("user_id") or "某人")
-            return author, self._summary(info.get("message", []))[:1600]
+            author = str(sender.get("card") or sender.get("nickname") or data.get("sender_nickname") or sender.get("user_id") or "某人")
+            quoted = info.get("message") or info.get("raw_message") or data.get("chain") or data.get("message_str") or ""
+            return strip_styles(author), self._summary(quoted, preserve_styles=True)[:1600]
         except Exception:
             return "某人", "引用内容暂不可用"
 
@@ -307,18 +498,15 @@ class Relay:
         return records
 
     @staticmethod
-    def _summary(segments) -> str:
-        if isinstance(segments, str):
-            return segments[:1600]
+    def _summary(segments, *, preserve_styles: bool = False) -> str:
         result = []
-        for raw in list(segments or [])[:50]:
-            raw = _as_dict(raw)
-            kind = str(raw.get("type", "text")).lower()
-            data = _as_dict(raw.get("data", raw))
-            if kind in ("text", "plain"):
-                result.append(str(data.get("text", "")))
+        for raw in _message_segments(segments)[:50]:
+            kind, data = raw["type"], raw["data"]
+            if kind == "text":
+                value = str(data.get("text", ""))
+                result.append(value if preserve_styles else strip_styles(value))
             else:
-                result.append("[" + LABELS.get(kind, {"reply": "引用", "forward": "合并消息", "at": "提及"}.get(kind, "消息")) + "]")
+                result.append("[" + LABELS.get(kind, {"reply": "引用", "forward": "合并消息", "at": "提及", "face": "表情", "link": "链接"}.get(kind, "消息")) + "]")
         return "".join(result)[:1600]
 
     @staticmethod
@@ -346,14 +534,15 @@ class Relay:
     async def from_game(self, server_id: str, payload: dict) -> list[tuple[str, str]]:
         if not self.settings.data.get("enabled", True):
             return []
-        event_name = str(payload.get("event_name", ""))
+        event_name = str(payload.get("event_name") or EVENTS.get(str(payload.get("sub_type", "")), ""))
         if event_name == "PlayerCommandEvent":
             return []
-        message_id = str(payload.get("message_id", ""))
-        if message_id and not self._once(f"mc:{server_id}:{message_id}"):
+        # Notice events may carry null/empty IDs. They are not a shared event ID.
+        message_id = str(payload.get("message_id") or "")
+        if message_id and not self._once(f"mc:{server_id}:{event_name}:{message_id}"):
             return []
         player = _as_dict(payload.get("player"))
-        name = str(player.get("nickname") or player.get("name") or "玩家")
+        name = strip_styles(str(player.get("nickname") or player.get("name") or "玩家"))
         text = component_text(payload.get("message") or payload.get("raw_message") or "")
         if text.startswith(("{", "[")):
             try:
@@ -369,7 +558,7 @@ class Relay:
             text = name + " 离开了游戏"
         elif event_name == "PlayerDeathEvent":
             death = payload.get("death") or {}
-            text = component_text(death) or component_text(payload.get("message")) or name + " 死亡了"
+            text = component_text(death) or component_text(payload.get("death_message")) or component_text(payload.get("message")) or name + " 死亡了"
         elif event_name == "PlayerAchievementEvent":
             achievement = _as_dict(payload.get("achievement"))
             translated = achievement.get("translation") or achievement.get("translate") or achievement.get("text")
@@ -384,10 +573,12 @@ class Relay:
         for route in self.settings.data.get("routes", []):
             if route.get("server_id") != server_id or not route.get("enabled", True) or not route.get("mc_to_qq", True):
                 continue
-            if event_name not in route.get("events", ["PlayerChatEvent"]):
+            if event_name not in route.get("events", list(EVENTS.values())):
+                log.debug("[YumaMCQQ] route event disabled: server=%s event=%s", server_id, event_name)
                 continue
-            if not self._rate("mc:" + route["umo"]):
+            if not self._rate("mc:" + route["umo"] + ":" + event_name):
                 continue
             template = route.get("templates", {}).get("mc_to_qq", "[{server}] {message}")
-            output.append((route["umo"], render_template(template, {"server": server.get("name", server_id), "player": name, "message": text[:4000]})))
+            shown = server.get("display_name") or server.get("name", server_id)
+            output.append((route["umo"], strip_styles(render_template(template, {"server": shown, "server_name": server.get("name", server_id), "server_id": server_id, "player": name, "message": text[:4000]}))))
         return output

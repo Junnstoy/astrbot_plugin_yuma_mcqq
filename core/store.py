@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -42,8 +43,9 @@ class Store:
             db.executescript("""
             CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS bindings(
-                qq_id TEXT PRIMARY KEY,mc_uuid TEXT UNIQUE NOT NULL,player TEXT NOT NULL,
-                server_id TEXT NOT NULL,version INTEGER NOT NULL,updated REAL NOT NULL);
+                qq_id TEXT PRIMARY KEY,identity TEXT UNIQUE NOT NULL,mc_uuid TEXT UNIQUE,
+                player TEXT COLLATE NOCASE UNIQUE NOT NULL,server_id TEXT NOT NULL,
+                version INTEGER NOT NULL,updated REAL NOT NULL,verified INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS binding_cooldowns(
                 identity TEXT PRIMARY KEY,until_time REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS binding_history(
@@ -92,6 +94,36 @@ class Store:
                 PRIMARY KEY(batch,table_name,source_id));
             """)
             db.execute("INSERT OR IGNORE INTO schema_meta VALUES('version','1')")
+        self._upgrade_bindings()
+
+    def _upgrade_bindings(self):
+        """Preserve verified UUIDs while allowing explicit, non-UUID name identities."""
+        try:
+            with self.connection(True) as db:
+                columns = {r[1] for r in db.execute("PRAGMA table_info(bindings)")}
+                if "identity" not in columns:
+                    db.execute("""CREATE TABLE bindings_v2(
+                        qq_id TEXT PRIMARY KEY,identity TEXT UNIQUE NOT NULL,mc_uuid TEXT UNIQUE,
+                        player TEXT COLLATE NOCASE UNIQUE NOT NULL,server_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,updated REAL NOT NULL,verified INTEGER NOT NULL)""")
+                    db.execute("""INSERT INTO bindings_v2
+                        SELECT qq_id,'uuid:'||lower(mc_uuid),lower(mc_uuid),player,server_id,version,updated,1 FROM bindings""")
+                    db.execute("DROP TABLE bindings")
+                    db.execute("ALTER TABLE bindings_v2 RENAME TO bindings")
+                    # Old releases keyed MC cooldowns by UUID only. Preserve the
+                    # corresponding name restriction when enabling direct binds.
+                    records = [dict(r) for r in db.execute("SELECT * FROM bindings")]
+                    for row in db.execute("SELECT old_binding,new_binding FROM binding_history"):
+                        records.extend(json.loads(v) for v in row if v)
+                    for value in records:
+                        if value.get("player"):
+                            until = max(self._cooldown(db, "qq:" + str(value["qq_id"])),
+                                        self._cooldown(db, "mc:" + str(value.get("mc_uuid", ""))))
+                            db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)",
+                                       ("name:" + value["player"].casefold(), until))
+                db.execute("INSERT INTO schema_meta VALUES('version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
+        except sqlite3.IntegrityError as exc:
+            raise DomainError("历史绑定存在重复玩家名或 UUID，请保留备份并先解除冲突绑定后重试升级") from exc
 
     @contextmanager
     def connection(self, write=False):
@@ -169,9 +201,29 @@ class Store:
             row = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
             if not row:
                 return None
-            value = dict(row)
-            value["cooldown_until"] = max(self._cooldown(db, "qq:" + str(qq_id)), self._cooldown(db, "mc:" + value["mc_uuid"]))
+            value = self._binding_value(row)
+            value["cooldown_until"] = max(self._cooldown(db, key) for key in self._binding_identities(value))
             return value
+
+    @staticmethod
+    def _binding_value(row):
+        value = dict(row)
+        value["verified"] = bool(value["verified"])
+        return value
+
+    @staticmethod
+    def _binding_identities(value):
+        value = dict(value)
+        keys = {"qq:" + str(value["qq_id"]), "name:" + value["player"].casefold()}
+        if value.get("mc_uuid"):
+            keys.add("mc:" + value["mc_uuid"])
+        return keys
+
+    @staticmethod
+    def _player_name(player):
+        if not isinstance(player, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
+            raise DomainError("玩家名需为 1–16 位字母、数字或下划线")
+        return player
 
     def resolve_user(self, identifier):
         with self.connection() as db:
@@ -194,22 +246,72 @@ class Store:
             raise DomainError(f"绑定变更冷却中，还需等待 {int(remaining) + 1} 秒")
 
     def begin_binding(self, qq_id, player, server_id, umo, *, rebind=False, ttl=300, now=None):
+        player = self._player_name(player)
         now = time.time() if now is None else now
         with self.connection(True) as db:
             old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
-            if old and old["player"].casefold() == player.casefold() and old["server_id"] == server_id:
-                return dict(already=True, binding=dict(old))
-            if old and not rebind:
+            same = old and old["player"].casefold() == player.casefold() and old["server_id"] == server_id
+            if same and old["verified"]:
+                return dict(already=True, binding=self._binding_value(old))
+            if old and not same and not rebind:
                 raise DomainError("已经绑定其他游戏账号，请使用修改绑定")
-            identities = ["qq:" + str(qq_id)] + (["mc:" + old["mc_uuid"]] if old else [])
-            self._check_cooldowns(db, identities, now)
+            if not same:
+                identities = {"qq:" + str(qq_id), "name:" + player.casefold()}
+                if old:
+                    identities.update(self._binding_identities(old))
+                self._check_cooldowns(db, identities, now)
             code = secrets.token_hex(5).upper()
             digest = hashlib.sha256(code.encode()).hexdigest()
             db.execute("DELETE FROM binding_challenges WHERE qq_id=? OR expires<?", (str(qq_id), now))
             db.execute("INSERT INTO binding_challenges VALUES(?,?,?,?,?,?)", (digest, str(qq_id), player, server_id, umo, now + ttl))
             return dict(code=code, expires=now + ttl, already=False)
 
+    def bind_name(self, qq_id, player, server_id, cooldown_seconds, *, rebind=False, now=None):
+        """Bind a declared player name without claiming a verified Minecraft UUID."""
+        player = self._player_name(player)
+        now = time.time() if now is None else now
+        with self.connection(True) as db:
+            old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
+            if old and old["player"].casefold() == player.casefold() and old["server_id"] == server_id:
+                return dict(already=True, binding=self._binding_value(old))
+            if old and not rebind:
+                raise DomainError("已经绑定其他游戏账号，请使用修改绑定")
+            value = self._save_binding(db, str(qq_id), player, server_id, None, cooldown_seconds, now)
+            return dict(already=False, binding=value)
+
+    def _save_binding(self, db, qq_id, player, server_id, mc_uuid, cooldown_seconds, now):
+        old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (qq_id,)).fetchone()
+        identity = "uuid:" + mc_uuid if mc_uuid else "name:" + player.casefold()
+        owner = db.execute("SELECT qq_id FROM bindings WHERE identity=? OR lower(player)=lower(?)", (identity, player)).fetchall()
+        if any(row[0] != qq_id for row in owner):
+            raise DomainError("该游戏账号或玩家名已被其他 QQ 绑定")
+        value = dict(qq_id=qq_id, identity=identity, mc_uuid=mc_uuid, player=player,
+                     server_id=server_id, verified=bool(mc_uuid), updated=now)
+        identities = self._binding_identities(value)
+        if old:
+            identities.update(self._binding_identities(old))
+        upgrade = bool(old and not old["verified"] and mc_uuid and old["player"].casefold() == player.casefold() and old["server_id"] == server_id)
+        # Proving ownership of the same declared name is not a rebind. Preserve
+        # its remaining cooldown, but never bypass a UUID's own existing cooldown.
+        check_keys = {"mc:" + mc_uuid} if upgrade else identities
+        self._check_cooldowns(db, check_keys, now)
+        history_count = db.execute("SELECT COUNT(*) FROM binding_history WHERE qq_id=?", (qq_id,)).fetchone()[0]
+        value["version"] = max(int(old["version"]) if old else 0, history_count) + 1
+        db.execute("""INSERT INTO bindings(qq_id,identity,mc_uuid,player,server_id,version,updated,verified)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(qq_id) DO UPDATE SET identity=excluded.identity,
+            mc_uuid=excluded.mc_uuid,player=excluded.player,server_id=excluded.server_id,
+            version=excluded.version,updated=excluded.updated,verified=excluded.verified""",
+            (qq_id, identity, mc_uuid, player, server_id, value["version"], now, int(value["verified"])))
+        until = max(self._cooldown(db, key) for key in identities) if upgrade else now + max(0, int(cooldown_seconds))
+        for key in identities:
+            db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)", (key, until))
+        db.execute("INSERT INTO binding_history(qq_id,old_binding,new_binding,actor,created) VALUES(?,?,?,?,?)",
+                   (qq_id, encode(dict(old)) if old else None, encode(value), qq_id, now))
+        db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (qq_id,))
+        return value
+
     def complete_binding(self, code, mc_uuid, player, server_id, cooldown_seconds, *, now=None):
+        player = self._player_name(player)
         now = time.time() if now is None else now
         canonical_uuid = str(uuid.UUID(str(mc_uuid)))
         digest = hashlib.sha256(code.upper().encode()).hexdigest()
@@ -220,27 +322,7 @@ class Store:
             if challenge["server_id"] != server_id or challenge["player"].casefold() != player.casefold():
                 raise DomainError("验证码与当前玩家或服务器不匹配")
             qq_id = challenge["qq_id"]
-            old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (qq_id,)).fetchone()
-            owner = db.execute("SELECT qq_id FROM bindings WHERE mc_uuid=?", (canonical_uuid,)).fetchone()
-            if owner and owner[0] != qq_id:
-                raise DomainError("该游戏账号已被其他 QQ 绑定")
-            identities = {"qq:" + qq_id, "mc:" + canonical_uuid}
-            if old:
-                identities.add("mc:" + old["mc_uuid"])
-            self._check_cooldowns(db, identities, now)
-            # Unbinding removes the live row, not its identity history. A later
-            # bind must not reuse an old version that a pending order captured.
-            history_count = db.execute("SELECT COUNT(*) FROM binding_history WHERE qq_id=?", (qq_id,)).fetchone()[0]
-            version = max(int(old["version"]) if old else 0, history_count) + 1
-            value = dict(qq_id=qq_id, mc_uuid=canonical_uuid, player=player, server_id=server_id, version=version, updated=now)
-            db.execute("INSERT INTO bindings VALUES(?,?,?,?,?,?) ON CONFLICT(qq_id) DO UPDATE SET mc_uuid=excluded.mc_uuid,player=excluded.player,server_id=excluded.server_id,version=excluded.version,updated=excluded.updated",
-                       (qq_id, canonical_uuid, player, server_id, version, now))
-            for identity in identities:
-                db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)",
-                           (identity, now + max(0, int(cooldown_seconds))))
-            db.execute("INSERT INTO binding_history(qq_id,old_binding,new_binding,actor,created) VALUES(?,?,?,?,?)",
-                       (qq_id, encode(dict(old)) if old else None, encode(value), qq_id, now))
-            db.execute("DELETE FROM binding_challenges WHERE digest=?", (digest,))
+            value = self._save_binding(db, qq_id, player, server_id, canonical_uuid, cooldown_seconds, now)
             return dict(binding=value, umo=challenge["umo"])
 
     def unbind(self, qq_id, cooldown_seconds, *, actor=None, force=False, now=None):
@@ -249,7 +331,7 @@ class Store:
             old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
             if not old:
                 raise DomainError("尚未绑定游戏账号")
-            identities = ("qq:" + str(qq_id), "mc:" + old["mc_uuid"])
+            identities = self._binding_identities(old)
             if not force:
                 self._check_cooldowns(db, identities, now)
             db.execute("DELETE FROM bindings WHERE qq_id=?", (str(qq_id),))
@@ -259,7 +341,7 @@ class Store:
                            (identity, now + max(0, int(cooldown_seconds))))
             db.execute("INSERT INTO binding_history(qq_id,old_binding,new_binding,actor,created) VALUES(?,?,?,?,?)",
                        (str(qq_id), encode(dict(old)), None, str(actor or qq_id), now))
-            return dict(old)
+            return self._binding_value(old)
 
     def begin_signin(self, operation_id, scope, qq_id, day, points, binding, umo):
         integer(points)
@@ -310,6 +392,8 @@ class Store:
             result = dict(group_status="ALREADY_SIGNED" if existing else "SIGNED", points_delta=points, balance=total, game_status=op["game_status"], day=op["day"])
             confirmed_fields = json.loads(op["result_json"]) if op["result_json"] else {}
             result["game_continuous_days"] = confirmed_fields.get("game_continuous_days", "")
+            result["rcon"] = confirmed_fields.get("rcon", op["detail"])
+            result["points_name"] = confirmed_fields.get("points_name", "点数")
             db.execute("UPDATE signin_operations SET state='completed',result_json=?,updated=? WHERE id=?", (encode(result), time.time(), operation_id))
             return result
 
@@ -543,9 +627,9 @@ class Store:
         clause = " WHERE scope=?" if scope is not None else ""
         params = (scope,) if scope is not None else ()
         with self.connection() as db:
-            bindings = [dict(r) for r in db.execute("SELECT * FROM bindings ORDER BY qq_id LIMIT 1000")]
+            bindings = [self._binding_value(r) for r in db.execute("SELECT * FROM bindings ORDER BY qq_id LIMIT 1000")]
             for binding in bindings:
-                binding["cooldown_until"] = max(self._cooldown(db, "qq:" + binding["qq_id"]), self._cooldown(db, "mc:" + binding["mc_uuid"]))
+                binding["cooldown_until"] = max(self._cooldown(db, key) for key in self._binding_identities(binding))
             balances = [dict(r) for r in db.execute("SELECT * FROM accounts" + clause + " ORDER BY total DESC LIMIT 1000", params)]
             ledger = [dict(r) for r in db.execute("SELECT * FROM ledger" + clause + " ORDER BY id DESC LIMIT 200", params)]
             signins = [dict(r) for r in db.execute("SELECT scope,qq_id,day,points,game_status,created FROM signins" + clause + " ORDER BY created DESC LIMIT 200", params)]
@@ -584,7 +668,7 @@ class Store:
             scope = str(row["session"])
             totals[scope] = totals.get(scope, 0) + integer(row["total"])
         return dict(digest=digest, counts={key: len(value) for key, value in data.items()}, balance_totals=totals,
-                    warnings=["仅迁移数据，不启用旧插件配置或旧指令。", "只有玩家名的旧绑定不导入，需要重新验证 UUID。",
+                    warnings=["仅迁移数据，不启用旧插件配置或旧指令。", "只有玩家名的旧绑定仅归档，请重新绑定；是否验证 UUID 由当前配置决定。",
                               "旧流水与完整记录归档保留，余额以迁移期初值入账。", "旧未付款订单取消；已付款未交付奖励保留，可补领同一份奖励且不再次扣款。"])
 
     def preview_legacy(self, path):

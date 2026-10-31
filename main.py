@@ -30,7 +30,7 @@ AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
     PLUGIN_NAME,
     "Junnstoy",
     "Paper / QueQiao 群服互通、绑定、签到点数商店与性能监控",
-    "1.0.0",
+    "1.1.0",
     "https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq",
 )
 class YumaMCQQPlugin(Star):
@@ -157,6 +157,9 @@ class YumaMCQQPlugin(Star):
         await self._send_result(ctx["umo"], result)
 
     def _command_hint(self, name: str, umo: str) -> str:
+        plugin_prefix = str(self.app.settings.data.get("command_prefix", "") or "").strip()
+        if plugin_prefix:
+            return plugin_prefix + " " + name
         prefixes = self.context.get_config(umo).get("wake_prefix", [])
         if isinstance(prefixes, list) and prefixes:
             return str(prefixes[0]) + name

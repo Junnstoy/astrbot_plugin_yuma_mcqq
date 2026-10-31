@@ -235,6 +235,7 @@ class MediaService:
         return path
 
     async def publish(self, source: str, kind: str, name: str = "") -> str:
+        """Explicitly cache a source; callers wanting a direct link use public_source_url."""
         self._ready()
         if kind not in ("image", "record", "audio", "video", "file"):
             raise MediaRejected("不支持的媒体类型")

@@ -231,10 +231,11 @@ class Store:
             value["available"] = value["total"] - value["frozen"]
             return value
 
-    def rank(self, scope, limit=20):
+    def rank(self, scope):
         with self.connection() as db:
-            return [dict(r) for r in db.execute("SELECT qq_id,total,frozen FROM accounts WHERE scope=? ORDER BY total DESC,qq_id LIMIT ?",
-                                                (scope, max(1, min(int(limit), 100))))]
+            return [dict(r) for r in db.execute("""SELECT COALESCE(b.player,'未绑定玩家') AS player,a.total,a.frozen
+                FROM accounts AS a LEFT JOIN bindings AS b ON b.qq_id=a.qq_id
+                WHERE a.scope=? ORDER BY a.total DESC,a.qq_id LIMIT 10""", (scope,))]
 
     def adjust_points(self, scope, qq_id, mode, amount, actor, operation_id, reason=""):
         integer(amount)

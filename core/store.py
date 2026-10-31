@@ -429,12 +429,13 @@ class Store:
                 "admin_override": bool(force), "cancelled_challenges": cancelled})
             return self._binding_value(old)
 
-    def begin_signin(self, operation_id, scope, qq_id, day, points, binding, umo):
+    def begin_signin(self, operation_id, scope, qq_id, day, points, binding, umo, *, reward_policy=None):
         integer(points)
         now = time.time()
         with self.connection(True) as db:
-            db.execute("INSERT OR IGNORE INTO signin_operations(id,scope,qq_id,day,points,binding_json,umo,state,created,updated) VALUES(?,?,?,?,?,?,?,'pending',?,?)",
-                       (operation_id, scope, str(qq_id), day, points, encode(binding), umo, now, now))
+            db.execute("INSERT OR IGNORE INTO signin_operations(id,scope,qq_id,day,points,binding_json,umo,state,result_json,created,updated) VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
+                       (operation_id, scope, str(qq_id), day, points, encode(binding), umo,
+                        encode({"reward_policy": reward_policy}) if reward_policy is not None else None, now, now))
         return self.signin_operation(operation_id)
 
     def signin_operation(self, operation_id):
@@ -453,7 +454,11 @@ class Store:
             db.execute("UPDATE signin_operations SET state=?,game_status=?,detail=?,updated=? WHERE id=? AND state!='completed'",
                        (state, game_status, str(detail)[:12000], time.time(), operation_id))
             if fields is not None:
-                db.execute("UPDATE signin_operations SET result_json=? WHERE id=? AND state!='completed'", (encode(fields), operation_id))
+                previous = db.execute("SELECT result_json FROM signin_operations WHERE id=?", (operation_id,)).fetchone()
+                saved = json.loads(previous[0]) if previous and previous[0] else {}
+                values = {"reward_policy": saved["reward_policy"]} if "reward_policy" in saved else {}
+                values.update(fields)
+                db.execute("UPDATE signin_operations SET result_json=? WHERE id=? AND state!='completed'", (encode(values), operation_id))
 
     def credit_signin(self, operation_id):
         with self.connection(True) as db:
@@ -480,6 +485,8 @@ class Store:
             result["game_continuous_days"] = confirmed_fields.get("game_continuous_days", "")
             result["rcon"] = confirmed_fields.get("rcon", op["detail"])
             result["points_name"] = confirmed_fields.get("points_name", "点数")
+            if "reward_policy" in confirmed_fields:
+                result["reward_policy"] = confirmed_fields["reward_policy"]
             db.execute("UPDATE signin_operations SET state='completed',result_json=?,updated=? WHERE id=?", (encode(result), time.time(), operation_id))
             return result
 

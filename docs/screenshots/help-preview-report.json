@@ -1,0 +1,68 @@
+[
+  {
+    "custom": 5,
+    "total": 28,
+    "size": [
+      1500,
+      2891
+    ],
+    "columns": 2,
+    "per_column": [
+      15,
+      13
+    ],
+    "bytes": 514495,
+    "path": "docs/screenshots/help-preview-custom-5.png"
+  },
+  {
+    "custom": 15,
+    "total": 38,
+    "size": [
+      2220,
+      2891
+    ],
+    "columns": 3,
+    "per_column": [
+      15,
+      15,
+      8
+    ],
+    "bytes": 788190,
+    "path": "docs/screenshots/help-preview-custom-15.png"
+  },
+  {
+    "custom": 30,
+    "total": 53,
+    "size": [
+      2940,
+      2865
+    ],
+    "columns": 4,
+    "per_column": [
+      15,
+      15,
+      15,
+      8
+    ],
+    "bytes": 1100642,
+    "path": "docs/screenshots/help-preview-custom-30.png"
+  },
+  {
+    "custom": 50,
+    "total": 73,
+    "size": [
+      3660,
+      2865
+    ],
+    "columns": 5,
+    "per_column": [
+      15,
+      15,
+      15,
+      15,
+      13
+    ],
+    "bytes": 1372658,
+    "path": "docs/screenshots/help-preview-custom-50.png"
+  }
+]

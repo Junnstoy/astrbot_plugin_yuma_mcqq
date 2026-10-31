@@ -19,7 +19,7 @@ from .adapters.astrbot_commands import (
     install_builtin_commands,
 )
 from .services.application import Application
-from .services.help_renderer import build_help_document, help_catalog, render_help_pages
+from .services.help_renderer import build_help_document, help_catalog, render_help_image
 
 
 PLUGIN_NAME = "astrbot_plugin_yuma_mcqq"
@@ -32,7 +32,7 @@ AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
     PLUGIN_NAME,
     "Junnstoy",
     "Paper / QueQiao 群服互通、绑定、签到点数商店与性能监控",
-    "1.3.0",
+    "1.4.0",
     "https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq",
 )
 class YumaMCQQPlugin(Star):
@@ -151,15 +151,11 @@ class YumaMCQQPlugin(Star):
                 result = {"text": document.as_text(), "status": "ok"}
                 if self.app.settings.data.get("help", {}).get("image_enabled", True):
                     try:
-                        pages = await asyncio.to_thread(render_help_pages, document, self.data_dir / "help")
+                        image_path = await asyncio.to_thread(render_help_image, document, self.data_dir / "help")
                     except Exception as exc:
                         logger.warning("[%s] 帮助图片生成失败，改用完整文字：%s", PLUGIN_NAME, str(exc))
                     else:
-                        for path in pages:
-                            if not await self._send_result(ctx["umo"], {"image_path": path}):
-                                await self._send_result(ctx["umo"], result)
-                                return
-                        if pages:
+                        if await self._send_result(ctx["umo"], {"image_path": image_path}):
                             return
             else:
                 result = await self.app.execute(action, ctx, str(args or ""))

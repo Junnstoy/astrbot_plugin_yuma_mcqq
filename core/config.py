@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .text import template_fields
+from .signin_policy import DEFAULT_SIGNIN_TIME, normalize_signin_policy
 
 MASK = "********"
 IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
@@ -39,6 +40,7 @@ ROUTE_DEFAULTS = {"enabled": True, "qq_to_mc": True, "mc_to_qq": True, "admins":
                   "display_name": "",
                   "message_colors": MESSAGE_COLORS,
                   "points_min": 10, "points_max": 10, "timezone": "Asia/Shanghai",
+                  "signin_time": DEFAULT_SIGNIN_TIME, "reward_events": [],
                   "signin_command": "signin click {player}", "templates": {},
                   "signin_prefixes": ["[手记人偶]"], "signin_rules": [],
                   "events": ["PlayerChatEvent", "PlayerJoinEvent", "PlayerQuitEvent", "PlayerDeathEvent", "PlayerAchievementEvent"],
@@ -175,9 +177,13 @@ def validate(data: dict) -> dict:
         _timezone(route["timezone"])
         _number(route["points_min"], 0, 1000000, "签到最小点数", integer=True)
         _number(route["points_max"], route["points_min"], 1000000, "签到最大点数", integer=True)
-        policy = (route["timezone"], route["points_min"], route["points_max"])
+        reward_policy = normalize_signin_policy(route)
+        route["signin_time"], route["reward_events"] = reward_policy["signin_time"], reward_policy["reward_events"]
+        policy = (route["timezone"], route["points_min"], route["points_max"],
+                  json.dumps(route["signin_time"], sort_keys=True),
+                  json.dumps(sorted(route["reward_events"], key=lambda event: event["id"]), sort_keys=True))
         if route["scope"] in scopes and scopes[route["scope"]] != policy:
-            raise ValueError("共用点数作用域的路由必须使用相同时区和签到奖励范围")
+            raise ValueError("共用点数作用域的路由必须使用相同时区、签到时段、奖励范围和活动策略")
         scopes[route["scope"]] = policy
         _number(route["max_forward_nodes"], 1, 100, "合并消息节点上限", integer=True)
         if not isinstance(route["admins"], list) or not all(isinstance(a, str) and a.isdigit() for a in route["admins"]):

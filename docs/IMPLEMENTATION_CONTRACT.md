@@ -1,13 +1,14 @@
 # 模块接口约定
 
-版本：1.2.0，2026-10-31。以 [完整拓扑](ARCHITECTURE.md)、[业务规则](BUSINESS.md) 和当前实现为准。旧插件仅为迁移输入，不决定新插件行为。
+版本：1.4.0，2026-10-31。以 [完整拓扑](ARCHITECTURE.md)、[业务规则](BUSINESS.md) 和当前实现为准。旧插件仅为迁移输入，不决定新插件行为。
 
 | 模块 | 主要接口 | 职责 |
 | --- | --- | --- |
 | core.config.Settings | save / public / server / route | 校验、原子保存、token掩码、共享scope策略一致性 |
 | core.text | clean_text / parse_rules / parse_signin / render_command / render_template | 清洗、限时完整匹配、简单变量模板 |
+| core.signin_policy | normalize_signin_policy / preview_signin_policy / reward_from_draw | 每日时段、日期活动、十进制奖励和纯预览 |
 | core.store.Store | bind_name / begin_binding / complete_binding / unbind / binding / snapshot / preview_legacy / import_legacy / connection及业务事务 | 名称与真实UUID唯一身份、冷却、账本、订单与显式迁移 |
-| services.domain.Domain | execute / on_game_event / admin / preview_signin / recover / close | 绑定、签到、纯预览、点数商店 |
+| services.domain.Domain | execute / on_game_event / admin / preview_signin / preview_signin_policy / recover / close | 绑定、签到、纯预览、点数商店 |
 | services.gateway.Gateway | start / reload / request / rcon / broadcast / status / close | 正向连接、反向鉴权接入、关联、重连与错误语义 |
 | services.media.MediaService | start / reload / public_source_url / publish / publish_record / status / close | 公开源链接校验、只读限时媒体与缓存 |
 | services.relay.Relay | from_qq / from_game / close | 富消息、组件渲染、引用、UMO |
@@ -20,7 +21,7 @@
 
 ## 配置 v3
 
-本节保留“配置 v3”标题以兼容已有链接，1.2.0 的当前配置为 `schema_version=4`。`Settings.data` 是校验后的当前配置，`save(patch)` 原子保存，`public()` 遮蔽服务器 token。配置 schema 与仍为 2 的业务数据库身份 schema 分开管理。全局字段默认：`binding_verification_enabled=false`、`points_name="点数"`、`command_prefix=""`。同一 `scope` 的路由必须使用相同签到时区及奖励范围。
+本节保留“配置 v3”标题以兼容已有链接，1.4.0 的当前配置为 `schema_version=4`。`Settings.data` 是校验后的当前配置，`save(patch)` 原子保存，`public()` 遮蔽服务器 token。配置 schema 与仍为 2 的业务数据库身份 schema 分开管理。全局字段默认：`binding_verification_enabled=false`、`points_name="点数"`、`command_prefix=""`。同一 `scope` 的路由必须使用相同签到时区、基础奖励范围、每日时段和奖励活动。
 
 启动加载现有配置时，缺少版本字段按 v1 处理，先沿用 v1 → v2 的表情类型迁移；随后对配置 v2 执行一次 v3 迁移：每台服务器中，只有精确等于 `spark tps` 的 `tps_command` 改为 `tps`、精确等于 `spark ping` 的 `ping_command` 改为 `ping`，其他自定义命令不改。完成这一步后主动设置回 Spark，后续加载不再替换。新配置及监控缺省查询统一为 `tps` / `mspt` / `ping`。
 
@@ -29,6 +30,17 @@ v3 → v4 只调整精确匹配的历史官方默认值：路由 `prefix` 从 `[
 服务器沿用稳定 `id` 和 QueQiao 鉴权 `name`，新增 `display_name=""`、`connection_mode="forward"`、`reverse_host="0.0.0.0"`、`reverse_port=8081`、`reverse_path="/queqiao"`。正向使用 `url` 主动连接；反向监听并接受 QueQiao 连接，要求非空 token，按路径、`x-self-name` 与 `Authorization: Bearer ...` 校验。`display_name` 只用于显示，空值回退到 `name`。
 
 路由 `types` 为 QQ → MC 的消息组成白名单，`events` 为 MC → QQ 的事件白名单；GUI 将它们表现为复选框，底层仍是字符串数组，消息类型含表情 `face`。`signin_prefixes` 仅用于规则识别前清洗，`templates.signin` 与 `templates.signin_already` 分别覆盖首次群成功及群当日重复回复。未覆盖均使用 `玩家: {player}\n{group_result}\n{game_result}`。
+
+1.4.0 路由新增 `signin_time` 和 `reward_events`，默认如下；旧配置缺项自动补充，不变更 schema 或历史数据：
+
+```json
+{
+  "signin_time": {"enabled": false, "start": "00:00", "end": "23:59"},
+  "reward_events": []
+}
+```
+
+活动字段为 `{id,name,enabled,start_date,end_date,mode,priority,multiplier,points_min,points_max}`。日期为 `YYYY-MM-DD`，`mode` 为 `multiplier` 或 `range`；倍率规范化为十进制字符串。活动 ID 唯一，最多 200 项；启用活动同优先级且日期重叠时拒绝。时段为严格 `HH:MM`，起止分钟均包含，支持跨午夜。日历按路由时区，同日只取最高优先级活动；同作用域校验比较规范化策略，活动数组顺序不影响等价判断。具体数值边界与运算示例见 [1.4 使用说明](UPGRADE_1_4.md#签到时段与活动)。
 
 路由 `prefix` 默认 `[{group}] {sender}{reply}：`，`{reply}` 放置具有悬浮内容的引用组件，无引用时为空；不含此变量的自定义前缀继续在正文展示引用。`templates.reply_hover` 默认 `{sender}\n{message}\nDate: {time}`，仅接受这三个变量。`message_colors` 包含 `link/image/record/video/file/forward/reply/face/at` 九类，前六类默认 `blue`，其余依次为 `gray/green/yellow`。颜色接受 Minecraft 的 16 个标准名称或 `#RRGGBB`；缺项补默认，未知类别或非法颜色被拒绝。名称清单及示例见 [转发配置](COMMANDS.md#转发类型与游戏事件)。
 
@@ -52,6 +64,8 @@ v3 → v4 只调整精确匹配的历史官方默认值：路由 `prefix` 从 `[
 
 `rcon` 经通用颜色/控制码清洗但保留插件前缀；解析专用前缀不影响这个展示字段。当前操作的游戏状态、回包、天数及货币名随已确认操作保存；同消息重放和恢复使用该操作的数据，恢复本地结算不再次执行游戏命令。未知或失败的游戏回包不结算群奖励，也不伪装为群或游戏已签到。
 
+新操作在绑定检查、抽样和 RCON 前验证每日时段。`Store.begin_signin(..., reward_policy=...)` 将日期活动、基础/实际抽样范围、倍率、抽样值和最终点数保存到 `result_json.reward_policy`，状态更新和结算保留该快照。待发送操作重试检查当前时段但不重新抽样；完成结果和 `game_confirmed` 的本地恢复沿用原操作，不重新发游戏命令。旧操作没有此字段也可按原保存点数恢复，无需数据库迁移。
+
 ## 命令与查询边界
 
 内置稳定动作共 23 个。`status` 只返回连接在线/离线；`tps/mspt/ping` 执行当前服务器配置的对应查询，默认分别为 `tps` / `mspt` / `ping`，返回清洗后的实际回包文本，不接收时间范围；`performance` 返回历史 PNG，默认触发名“性能图”。后台采样继续独立运行。Paper TPS 的三个窗口可解析；普通 `ping` 若只返回 `Pong!`、错误提示或不含可识别的毫秒值，监控保存 `null` 与不可用原因，不伪造数值或拿 SLP RTT 替代，QQ 文本查询仍回显清洗原文。
@@ -70,11 +84,15 @@ GUI 使用 AstrBot Plugin Views SDK 调用 GET state、POST settings、POST acti
 
 同步纯函数 `Domain.preview_signin(raw, player, route, group_signed=False, points_delta=1, balance=1)` 返回 `{status, fields, cleaned, preview, data}`；`status` 为识别的游戏状态，`preview` 为两阶段回复，`data` 为模拟结果和模板变量。群重复把模拟奖励置零，识别失败时群状态为 `NOT_SETTLED`。两个预览均不读取真实账户、不写数据库、不执行 RCON；`rcon` 动作才会调用真实服务器。前端应明确显示此区别。状态快照不包含兑换码、私聊奖励或明文 token。
 
+策略预览动作 `preview_signin_policy` 接受 `{route_umo,at?,base_points?}`，必须选择已保存路由。`at` 为 ISO8601 字符串，省略使用路由当前时间；无偏移的日期时间按路由时区解释，有偏移则转换，夏令时不存在的当地时间拒绝。`base_points` 为可选模拟整数，须处于实际抽样范围；省略时只给范围，不抽随机数。返回 `{allowed,day,local_time,timezone,window,event,base_range,draw_range,effective_range,multiplier,base_points,final_points}`。`allowed=false` 时仍展示候选奖励，前端明确其不可领取。该动作不访问账本、不写审计、不发 RCON；GUI 的时段和活动保存同步同 `scope` 路由的策略字段。
+
 分页动作 `dashboard_page` 接受 `{table, page, page_size, scope?}`，只允许 bindings/balances/ledger/signins/runs/audit 六类。每页 10/20/50/100；返回 `{rows,total,page,page_size,pages}`，空表保持第 1/1 页，越界钳位。余额、流水、签到先按 scope 过滤；全局绑定、运行及审计不伪造作用域归属。
 
 服务器 ID 动作 `server_rename` 接受 `{server_id,new_server_id,revision}`，与主入口配置保存锁串行，关联数据同步迁移。维护门禁阻止新的业务，`state.maintenance` 供 GUI 提示。数据目录内 `server-rename.json` 记录 ID、配置摘要和操作 ID，不保存 token；逐库完成标记支持失败重试/启动恢复。禁止用普通配置增删绕过有关联数据的 ID 修改。
 
 `state.help_commands` 为 GUI 提供完整可编辑帮助元数据，包含稳定 action_id、当前名称/别名、默认及实际说明、显隐/排序和权限提示。配置 `help` 与命令执行启停独立；引用标签配置为 `route.templates.reply_label`，仅支持 `{sender}`。
+
+`render_help_image(document, directory, *, width=None, font_path=None)` 返回一条 PNG 路径。图片使用文档全局顺序，每列从上到下最多 15 条命令，再向右新建一列；分类标题不计数，列数为 `max(1, ceil(commands / 15))`，保持普通字号。连续分类段画矩形，同类跨列或被其他分类打断后标“续”，全局编号与实际位置一致。`DEFAULT_ORDER` 中帮助的默认排序为 0，显式 `help.entries` 排序覆盖仍优先。主入口只发送一张图片到原 UMO；渲染超限、缺字体、生成失败或图片发送失败时回退完整文字。规范化帮助内容与实际渲染内容保存到 PNG 元数据，合成规模预览可用 `python tests/render_help_previews.py` 复现。
 
 ## 显式旧数据迁移
 

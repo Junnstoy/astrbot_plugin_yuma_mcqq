@@ -48,6 +48,25 @@ class ServerRenameTests(unittest.IsolatedAsyncioTestCase):
     def payload(self, **extra):
         return {"server_id": "paper", "new_server_id": "survival", "revision": self.app.revision(), **extra}
 
+    def write_legacy_policy_journal(self, *, at_target=False):
+        """A real old-format settings file, before the new route defaults existed."""
+        source = copy.deepcopy(self.app.settings.data)
+        for route in source["routes"]:
+            route.pop("signin_time", None)
+            route.pop("reward_events", None)
+        target = copy.deepcopy(source)
+        target["servers"][0]["id"] = "survival"
+        for collection in (target["routes"], target["commands"]):
+            for item in collection:
+                if item.get("server_id") == "paper":
+                    item["server_id"] = "survival"
+        journal = {"old_id": "paper", "new_id": "survival", "operation_id": "legacy-policy-upgrade",
+                   "actor": "dashboard:fixture", "source_revision": self.app._configuration_revision(source),
+                   "target_revision": self.app._configuration_revision(target)}
+        self.app.settings.path.write_text(json.dumps(target if at_target else source), encoding="utf-8")
+        self.app._write_rename_journal(journal)
+        return source, target, journal
+
     def seed(self):
         store = self.app.store
         store.bind_name("1", "Player", "paper", 604800)
@@ -175,6 +194,82 @@ class ServerRenameTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.app._rename_path.exists())
         self.assertEqual(self.app.store.signin_operation("signin")["state"], "game_confirmed")
         self.app.gateway.rcon.assert_not_awaited()
+
+    async def test_old_source_digest_recovers_with_only_additive_policy_defaults(self):
+        self.seed()
+        self.write_legacy_policy_journal()
+        await self.app.close()
+        self.app = Application(self.temp.name)
+        self.mock_transport()
+        self.assertEqual(self.app.store.binding("1")["server_id"], "survival")
+        route = self.app.settings.route(self.ctx["umo"])
+        self.assertEqual(route["signin_time"], {"enabled": False, "start": "00:00", "end": "23:59"})
+        self.assertEqual(route["reward_events"], [])
+        self.assertFalse(self.app._rename_path.exists())
+        self.app.gateway.rcon.assert_not_awaited()
+
+    async def test_old_target_digest_recovers_after_old_config_was_already_saved(self):
+        self.seed()
+        self.write_legacy_policy_journal(at_target=True)
+        await self.app.close()
+        self.app = Application(self.temp.name)
+        self.mock_transport()
+        self.assertEqual(self.app.settings.route(self.ctx["umo"])["server_id"], "survival")
+        self.assertEqual(self.app.store.binding("1")["server_id"], "survival")
+        self.assertEqual(self.app.monitor.history("survival")[0]["server_id"], "survival")
+        self.assertFalse(self.app._rename_path.exists())
+
+    async def test_upgraded_journal_is_durable_before_later_failure_and_restart(self):
+        self.seed()
+        _, _, legacy = self.write_legacy_policy_journal()
+        payload = self.payload()
+        with patch.object(self.app.monitor, "rename_server", side_effect=OSError("synthetic after journal upgrade")):
+            with self.assertRaises(OSError):
+                await self.app.web("server_rename", payload, "admin")
+        journal = json.loads(self.app._rename_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(journal["source_revision"], legacy["source_revision"])
+        self.assertEqual(journal["source_revision"], self.app.revision())
+        await self.app.close()
+        self.app = Application(self.temp.name)
+        self.mock_transport()
+        self.assertEqual(self.app.store.binding("1")["server_id"], "survival")
+        self.assertEqual(self.app._ops.execute("SELECT COUNT(*) FROM audit WHERE action='server_rename'").fetchone()[0], 1)
+        self.assertFalse(self.app._rename_path.exists())
+
+    async def test_legacy_digest_does_not_ignore_actual_policy_or_other_config_edits(self):
+        source, _, _ = self.write_legacy_policy_journal()
+        self.app._maintenance = True
+        changed_configs = []
+        currency = copy.deepcopy(source)
+        currency["points_name"] = "changed"
+        changed_configs.append(currency)
+        window = copy.deepcopy(source)
+        window["routes"][0]["signin_time"] = {"enabled": True, "start": "08:00", "end": "09:00"}
+        changed_configs.append(window)
+        events = copy.deepcopy(source)
+        events["routes"][0]["reward_events"] = [{"id": "unexpected", "start_date": "2026-10-31",
+            "end_date": "2026-10-31", "mode": "multiplier", "multiplier": "2"}]
+        changed_configs.append(events)
+        collision = copy.deepcopy(source)
+        collision["servers"].append({**collision["servers"][1], "id": "survival", "name": "third-auth"})
+        changed_configs.append(collision)
+        for changed in changed_configs:
+            with self.subTest(changed=changed):
+                self.app.settings.path.write_text(json.dumps(changed), encoding="utf-8")
+                self.app.settings.data = module.Settings(self.app.settings.path).data
+                with self.assertRaisesRegex(ValueError, "配置被其他方式修改"):
+                    await self.app.web("server_rename", self.payload(), "admin")
+                self.assertTrue(self.app._rename_path.exists())
+                self.assertTrue(self.app._maintenance)
+
+    async def test_legacy_compatibility_verifies_both_recorded_endpoints(self):
+        _, _, journal = self.write_legacy_policy_journal()
+        journal["target_revision"] = "unrelated-target"
+        self.app._write_rename_journal(journal)
+        with self.assertRaisesRegex(ValueError, "配置被其他方式修改"):
+            await self.app.web("server_rename", self.payload(), "admin")
+        self.assertEqual(json.loads(self.app._rename_path.read_text())["target_revision"], "unrelated-target")
+        self.assertEqual(self.app._ops.execute("SELECT COUNT(*) FROM audit WHERE action='server_rename'").fetchone()[0], 0)
 
     async def test_inflight_raw_command_cancelled_unknown_and_replay_never_resends(self):
         started = asyncio.Event()

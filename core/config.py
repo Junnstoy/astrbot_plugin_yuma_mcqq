@@ -15,7 +15,7 @@ from .text import template_fields
 MASK = "********"
 IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
 DEFAULTS = {
-    "schema_version": 2, "binding_verification_enabled": False,
+    "schema_version": 3, "binding_verification_enabled": False,
     "points_name": "点数", "command_prefix": "",
     "enabled": True, "timezone": "Asia/Shanghai", "binding_cooldown_seconds": 604800,
     "servers": [], "routes": [], "commands": [],
@@ -28,7 +28,7 @@ SERVER_DEFAULTS = {"name": "", "url": "ws://127.0.0.1:8080", "token": "", "enabl
                    "display_name": "", "connection_mode": "forward", "reverse_host": "0.0.0.0",
                    "reverse_port": 8081, "reverse_path": "/queqiao",
                    "timeout": 10, "game_host": "127.0.0.1", "game_port": 25565,
-                   "tps_command": "spark tps", "mspt_command": "mspt", "ping_command": "spark ping",
+                   "tps_command": "tps", "mspt_command": "mspt", "ping_command": "ping",
                    "component_version": "legacy"}
 ROUTE_DEFAULTS = {"enabled": True, "qq_to_mc": True, "mc_to_qq": True, "admins": [],
                   "display_name": "",
@@ -67,7 +67,7 @@ def validate(data: dict) -> dict:
         raise ValueError("配置必须是对象")
     data = copy.deepcopy(data)
     _booleans(data, "enabled", "binding_verification_enabled")
-    if data.get("schema_version") != 2:
+    if data.get("schema_version") != 3:
         raise ValueError("不支持的配置版本")
     if not isinstance(data["points_name"], str) or not data["points_name"].strip() or len(data["points_name"]) > 20 or any(ord(c) < 32 or c in "{}" for c in data["points_name"]):
         raise ValueError("点数名称须为 1–20 个字符，不能包含控制字符或花括号")
@@ -251,6 +251,15 @@ class Settings:
                     if isinstance(route.get("types"), list) and "text" in route["types"] and "face" not in route["types"]:
                         route["types"].append("face")
                 saved["schema_version"] = 2
+            if saved.get("schema_version") == 2:
+                # Migrate only the former shipped defaults, once. Custom query
+                # commands and later explicit Spark choices remain untouched.
+                for server in saved.get("servers", []):
+                    for field, old, new in (("tps_command", "spark tps", "tps"),
+                                            ("ping_command", "spark ping", "ping")):
+                        if server.get(field) == old:
+                            server[field] = new
+                saved["schema_version"] = 3
             self.data.update(saved)
         elif bootstrap:
             self.data.update({k: v for k, v in bootstrap.items() if k in DEFAULTS})

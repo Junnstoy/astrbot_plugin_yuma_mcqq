@@ -102,5 +102,27 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.settings.save({'command_prefix':'mc command'})
         with self.assertRaises(ValueError): self.settings.save({'points_name':'{balance}'})
 
+    def test_performance_defaults_migrate_once_and_keep_custom_commands(self):
+        self.settings.save({'servers':[{'id':'new'}]})
+        self.assertEqual(self.settings.server('new')['tps_command'], 'tps')
+        self.assertEqual(self.settings.server('new')['ping_command'], 'ping')
+        old = {'schema_version':2, 'servers':[
+            {'id':'old','tps_command':'spark tps','ping_command':'spark ping'},
+            {'id':'custom','tps_command':'paper:tps','ping_command':'latency all'},
+        ]}
+        self.settings.path.write_text(json.dumps(old),encoding='utf-8')
+        upgraded = Settings(self.settings.path)
+        self.assertEqual(upgraded.data['schema_version'],3)
+        self.assertEqual(upgraded.server('old')['tps_command'],'tps')
+        self.assertEqual(upgraded.server('old')['ping_command'],'ping')
+        self.assertEqual(upgraded.server('custom')['tps_command'],'paper:tps')
+        self.assertEqual(upgraded.server('custom')['ping_command'],'latency all')
+        upgraded.server('old')['tps_command']='spark tps'
+        upgraded.server('old')['ping_command']='spark ping'
+        upgraded.save({})
+        reloaded = Settings(self.settings.path)
+        self.assertEqual(reloaded.server('old')['tps_command'],'spark tps')
+        self.assertEqual(reloaded.server('old')['ping_command'],'spark ping')
+
 
 if __name__ == '__main__': unittest.main()

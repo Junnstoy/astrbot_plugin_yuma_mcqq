@@ -1,6 +1,6 @@
 # 传输、富消息与性能采样
 
-本文对应 1.1 版本。模块按新设计独立实现，旧插件仅用于显式数据迁移。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；已经使用模拟协议与真实 AstrBot 消息类测试，**尚未连接真实 QQ/Paper 服务进行联调**。
+本文对应 1.1.1 版本。模块按新设计独立实现，旧插件仅用于显式数据迁移。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；已经使用模拟协议与真实 AstrBot 消息类测试，**尚未连接真实 QQ/Paper 服务进行联调**。
 
 ## QueQiao 连接与命令结果
 
@@ -111,19 +111,23 @@ URL 的持有人在有效期内可以访问对应内容，链接可能被收件�
 
 `服务器状态` 仅返回当前路由的“在线”或“离线”，依据 QueQiao 连接状态，不等同于完整游戏健康检查。`tps`、`mspt`、`ping` 指令直接执行对应 RCON 查询，并清洗后返回完整文字，不再返回曲线图。`性能图` 是独立动作，读取历史并生成 PNG，可传小时数，默认 24 小时。实际触发名都以 AstrBot 管理行为为准。
 
-定时器启动后自动采样；同一服务器不重叠探测。每服可配置 `tps_command`、`mspt_command`、`ping_command`，默认分别为 `spark tps`、`mspt`、`spark ping`。Spark 需在服务端可用；也可按实际 Paper 命令修改。解析识别 Spark 的 `[⚡]` 前缀、多行/连续回包、窗口标签和颜色代码。无法解析或命令不存在时写入缺失值，不伪造正常数值。[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)、[Spark 指标输出定义](https://github.com/lucko/spark/blob/master/spark-common/src/main/java/me/lucko/spark/common/command/modules/HealthModule.java)
+定时器启动后自动采样；同一服务器不重叠探测。每服可配置 `tps_command`、`mspt_command`、`ping_command`，默认分别为 `tps`、`mspt`、`ping`。Paper 的 `tps` 返回最近 1、5、15 分钟三个窗口，采样选取第一个窗口并保存其余窗口；颜色码不会影响识别。[Paper TPS 命令实现](https://github.com/PaperMC/Paper/blob/main/paper-server/src/main/java/org/spigotmc/TicksPerSecondCommand.java)
+
+普通 `ping` 的实现取决于服务端安装的插件，不能保证存在毫秒数，例如 EssentialsX 无参数时只发送 `pong` 文案。采样识别带 `ms` 的已支持数值格式；`Pong!`、仅玩家可用、未知命令或其他无法解析的回包记为 `null` 和不可用原因，不写成 0，也不使用 SLP RTT 代替玩家延迟。QQ 的 `ping` 文本查询仍返回实际回包经通用清洗后的原文，不受图表能否解析数值影响。[EssentialsX ping 实现](https://github.com/EssentialsX/Essentials/blob/2.x/Essentials/src/main/java/com/earth2me/essentials/commands/Commandping.java)
+
+管理员仍可显式配置 Spark 等查询命令；解析器保留对 `[⚡]` 前缀、多行/连续回包和统计窗口的支持。启动读取旧配置 `schema_version=2` 时，仅把精确的旧默认值 `spark tps` / `spark ping` 一次性迁移为 `tps` / `ping`，其他自定义命令不变。保存为配置 v3 后再次主动选择 Spark，后续启动不会替换。[配置迁移约定](IMPLEMENTATION_CONTRACT.md#配置-v3)、[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)、[Spark 指标输出定义](https://github.com/lucko/spark/blob/master/spark-common/src/main/java/me/lucko/spark/common/command/modules/HealthModule.java)
 
 | 字段 | 含义 |
 | --- | --- |
 | `timestamp` | 采样开始时刻的 Unix 秒数 |
 | `tps` | 第一个已报告窗口的 TPS；窗口保存在 `values.tps` |
 | `mspt` | Paper 的平均 tick 时长或 Spark 的中位数，统计口径和窗口保存在 `values.mspt` |
-| `player_ping_ms` | 服务端报告的玩家延迟；Spark 默认使用当前在线玩家中位数，并保存当前/15 分钟统计 |
+| `player_ping_ms` | 服务端报告的玩家延迟；没有可识别数值则为空。显式配置 Spark 时使用当前在线玩家中位数，并保存当前/15 分钟统计 |
 | `slp_rtt_ms` | 机器人到 `game_host:game_port` 的 Minecraft 状态协议 ping/pong 往返耗时 |
 | `errors`、`status` | 每项不可用原因以及完整/部分/缺失状态 |
 
 玩家延迟与机器人到服务器 RTT 是两条不同网络路径，GUI 和 PNG 分别标注；未设置 `game_host` 时 SLP 一项留空。采样持久化在 `metrics.sqlite3`，按 `monitor.retention_days` 清理，历史查询升序返回且保留 `null`。PNG 使用四个独立面板，缺失点断线，时区使用插件配置。进程停机期间没有探测，不补造历史样本。
 
-绑定默认 `binding_verification_enabled: false`：QQ 直接提交玩家名完成唯一绑定，存储不会伪造一个“已验证 UUID”。开启此选项后才要求游戏内一次性验证码，通过经鉴权的玩家事件取得真实 UUID。两种方式都保留 QQ/玩家名唯一性和变更冷却，已验证 UUID 继续保持唯一约束。此配置不会绕过传输鉴权，详情见 [业务说明](BUSINESS.md)。
+绑定默认 `binding_verification_enabled: false`：普通 QQ 用户直接提交玩家名完成唯一绑定，存储不会伪造一个“已验证 UUID”。开启此选项后，普通用户才需要游戏内一次性验证码，通过经鉴权的玩家事件取得真实 UUID。管理员替他人或自己绑定、修改绑定、解绑均直接办理，免本次冷却检查且无需验证码；操作会作废目标 QQ 的旧验证码，唯一约束仍保留，也不清除该用户后续普通操作的冷却。GUI 管理员解绑使用同一业务路径。此配置不会绕过传输鉴权，详情见 [业务说明](BUSINESS.md)。
 
 离线测试覆盖请求/回包关联、正反向连接、事件中嵌套请求、断连/错误/超时的不确定结果、原链接与缓存边界、Base64 上限、私网跳转/DNS 拒绝、过期、HTML 转义、跨会话引用拒绝、真实 AstrBot 消息对象、表情和颜色、空 ID 死亡事件、监控缺失值及 PNG 输出。**真实 QQ 群、Paper 服务、客户端点击行为与实服 RCON 文案尚未联调**；离线协议测试不替代实际部署验收。

@@ -11,15 +11,16 @@ import asyncio
 import copy
 import functools
 import hashlib
+import re
 from types import SimpleNamespace
 
 
 BUILTINS = (
     ("signin", "签到", "先完成游戏签到，再结算本群点数签到。"),
-    ("binding", "绑定", "绑定 MC 账号：绑定 玩家名。"),
+    ("binding", "绑定", "绑定 MC 账号：绑定 玩家名；管理员可用：绑定 QQ号 MC名称（免冷却）。"),
     ("binding_status", "我的绑定", "查看当前绑定和换绑冷却。"),
-    ("rebind", "修改绑定", "验证并修改绑定：修改绑定 新玩家名。"),
-    ("unbind", "解绑", "解除绑定，保留绑定历史和冷却。"),
+    ("rebind", "修改绑定", "验证并修改绑定：修改绑定 新玩家名；管理员可用：修改绑定 QQ号 MC名称（免冷却）。"),
+    ("unbind", "解绑", "解除绑定，保留绑定历史和冷却；管理员可用：解绑 QQ号（免冷却）。"),
     ("balance", "点数", "查看本群可用点数与冻结点数。"),
     ("rank", "点数排行", "查看本群点数排行榜。"),
     ("shop", "点数商店", "浏览本群点数商店。"),
@@ -32,6 +33,7 @@ BUILTINS = (
     ("mspt", "mspt", "执行 MSPT 查询并返回清洗后的 RCON 文字。"),
     ("ping", "ping", "执行玩家延迟查询并返回清洗后的 RCON 文字。"),
     ("performance", "性能图", "查看 TPS、MSPT 与延迟的历史 PNG 图片。"),
+    ("rcon", "cmd", "管理员直接执行服务器命令：cmd 游戏命令。"),
     ("help", "mc帮助", "查看本插件帮助；触发名称可在管理行为中修改。"),
     ("points_add", "添加点数", "管理员添加点数：添加点数 QQ号 数量 [原因]。"),
     ("points_sub", "扣除点数", "管理员扣除点数：扣除点数 QQ号 数量 [原因]。"),
@@ -39,7 +41,7 @@ BUILTINS = (
     ("order_reconcile", "订单核对", "管理员核对订单：订单核对 订单ID success或failed 核对依据。"),
 )
 
-ADMIN_ACTIONS = frozenset({"points_add", "points_sub", "points_set", "order_reconcile"})
+ADMIN_ACTIONS = frozenset({"points_add", "points_sub", "points_set", "order_reconcile", "rcon"})
 _PREFIX_FILTER_TYPE = None
 
 
@@ -55,10 +57,27 @@ def with_plugin_prefix(original, prefix_getter):
         base = _framework().CommandFilter
 
         class PluginCommandFilter(base):
+            def _match(self, event, cfg):
+                matched = super().filter(event, cfg)
+                if matched and self.handler_md.handler_name == "cmd_rcon":
+                    # Framework GreedyStr first collapses every whitespace run,
+                    # including whitespace inside JSON strings. Only the raw
+                    # console action must retain the original argument body.
+                    # Keep framework matching and permissions; replace only its
+                    # parsed args after a successful match against a live name.
+                    text = event.get_message_str().lstrip()
+                    for name in sorted(self.get_complete_command_names(), key=len, reverse=True):
+                        pattern = r"\s+".join(re.escape(part) for part in name.split())
+                        match = re.match(pattern + r"(?:\s+|$)", text)
+                        if match:
+                            event.set_extra("parsed_params", {"args": text[match.end():]})
+                            break
+                return matched
+
             def filter(self, event, cfg):
                 prefix = str(self.prefix_getter() or "").strip()
                 if not prefix:
-                    return super().filter(event, cfg)
+                    return self._match(event, cfg)
                 text = event.get_message_str().strip()
                 if not text.startswith(prefix):
                     # The framework may already have stripped a global wake
@@ -73,7 +92,7 @@ def with_plugin_prefix(original, prefix_getter):
                 try:
                     event.message_str = text
                     event.is_at_or_wake_command = True
-                    return super().filter(event, cfg)
+                    return self._match(event, cfg)
                 finally:
                     event.message_str = previous_text
                     event.is_at_or_wake_command = previous_wake

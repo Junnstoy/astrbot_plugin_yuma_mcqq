@@ -279,6 +279,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("签到", names)
         self.assertIn("点数商店", names)
         self.assertIn("确认兑换", names)
+        self.assertIn("cmd", names)
+        self.assertEqual(len(registered), 23)
         self.assertNotIn("打卡", names)
 
     async def test_relay_runs_only_after_commands_and_ai_signals_are_excluded(self):
@@ -344,6 +346,20 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         allowed = FakeEvent(user="10001")
         await self.plugin._execute_action("points_add", allowed, "10001 10")
         self.plugin.app.execute.assert_awaited_once()
+
+    async def test_raw_rcon_is_admin_only_in_main_and_retains_literal_arguments(self):
+        command = 'tellraw @a {"text":"hello  {player}"}'
+        denied = FakeEvent(user="20002")
+        await self.plugin._execute_action("rcon", denied, command)
+        self.plugin.app.execute.assert_not_awaited()
+        self.assertTrue(denied.is_stopped())
+        allowed = FakeEvent(user="10001")
+        await self.plugin._execute_action("rcon", allowed, command)
+        self.plugin.app.execute.assert_awaited_once()
+        action, ctx, args = self.plugin.app.execute.await_args.args
+        self.assertEqual(action, "rcon")
+        self.assertTrue(ctx["is_admin"])
+        self.assertEqual(args, command)
 
     async def test_gui_refuses_missing_dashboard_identity(self):
         with patch.object(self.main, "request", types.SimpleNamespace(username=None)):

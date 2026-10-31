@@ -10,7 +10,7 @@
 - **游戏签到 → 群签到**：先执行 `signin click 玩家`，识别“成功”或“今天已经签到”后才检查群签到，一日只发一次点数。
 - 一种群积分货币，显示名称可自定义；点数商店、私聊文本/唯一码/游戏命令商品、确认兑换、补领和未知交付核对。
 - 每条自定义 RCON 指令独立参数、清洗前缀、解析规则及回复模板；共用颜色/控制码清洗器。
-- 22 个内置指令和自定义指令均注册到 AstrBot **管理行为**，可改触发名、别名和启停；可使用 AstrBot 唤醒方式或设置本插件独立前缀。
+- 23 个内置指令和自定义指令均注册到 AstrBot **管理行为**，可改触发名、别名和启停；可使用 AstrBot 唤醒方式或设置本插件独立前缀。
 - 按原始 **UMO** 回复和路由；明确指令先处理，AI 唤醒消息交回 AstrBot，普通消息最后转发。
 - 文本、@、QQ 表情、图片、链接、合并消息、语音、视频、文件、引用；原版客户端使用点击链接和文字悬浮，支持颜色组件，无需 ChatImage。
 - QueQiao 正向/反向连接、独立服务器显示名称；游戏聊天、加入、退出、死亡、成就事件分别开关。
@@ -21,7 +21,7 @@
 
 要求 Python 3.11+、AstrBot **4.29+ / <5**、NapCat/OneBot、Paper 和官方 [QueQiao](https://github.com/17TheWord/QueQiao)。已在真实 AstrBot 4.29.0 框架中进行隔离集成测试。动态命令桥接使用 AstrBot 内部注册接口，升级框架应重新跑集成测试。
 
-在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.1.0。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。已有 1.0 配置和数据库的用户先看 [1.1 升级说明](docs/UPGRADE_1_1.md)。
+在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.1.1。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。已有 1.0 配置和数据库的用户先看 [1.1 升级说明](docs/UPGRADE_1_1.md)，本次修订见 [1.1.1 更新说明](docs/UPGRADE_1_1_1.md)。
 
 1. 在 Paper 安装 QueQiao 与 LiteSignIn，启用 QueQiao WebSocket 和其 RCON 支持；先在服务器确认 `signin click 玩家名` 可用。
 2. 打开 AstrBot → 插件详情 → 插件视图 → `dashboard`。添加服务器，填写与 QueQiao 一致的鉴权名称 `name`；可另设 `display_name` 用于 QQ 展示。正向模式填写 QueQiao 的 WebSocket 地址；反向模式由 QueQiao 连接机器人监听地址，必须设置非空 token。
@@ -44,6 +44,8 @@
 | `tps` / `mspt` / `ping` | 执行服务器配置的查询，返回清洗后的实际 RCON 文本，不需要参数 |
 | `性能图 [小时数]` | 历史 PNG，默认 24 小时，范围 1–168 |
 | `添加点数` / `扣除点数` / `设置点数` | 管理员：QQ或绑定名、数量、可选原因 |
+| `绑定 QQ号 MC名` / `修改绑定 QQ号 MC名` / `解绑 QQ号` | 管理员代操作，直接完成且不受 CD 限制；仍保持绑定唯一性 |
+| `cmd 游戏命令` | 管理员向当前群对应服务器发送原样 RCON，例如 `cmd cmi ping rincho` |
 | `订单核对 订单ID success或failed 依据` | 管理员核实交付后结算 |
 
 ## 文档
@@ -54,6 +56,7 @@
 - [媒体、QueQiao、监控部署和边界](docs/TRANSPORT.md)
 - [旧数据迁移、作用域映射和回滚](docs/MIGRATION.md)
 - [1.1 升级与八项反馈修复](docs/UPGRADE_1_1.md)
+- [1.1.1 管理员绑定与查询命令修订](docs/UPGRADE_1_1_1.md)
 - [测试记录与实服验收步骤](docs/VALIDATION.md)
 - [设计决策和开发记录](docs/DEVELOPMENT.md)、[变更记录](CHANGELOG.md)
 

@@ -57,6 +57,10 @@ window.AstrBotPluginView={
   if(body.action==='metrics')return {samples:[{timestamp:1793390400,tps:20,mspt:8,player_ping_ms:35,slp_rtt_ms:4},{timestamp:1793390460,tps:null,mspt:null,player_ping_ms:null,slp_rtt_ms:null},{timestamp:1793390520,tps:19.8,mspt:12,player_ping_ms:42,slp_rtt_ms:5}]};
   if(body.action==='preview')return {status:'SIGNED',fields:{player:'rincho',days:'1'},cleaned:'测试回包',preview:'游戏签到成功'};
   if(body.action==='import_preview')return {digest:'synthetic-digest',balances:1};
+  if(body.action==='binding_unbind'){
+    window.fixture.domain.bindings=window.fixture.domain.bindings.filter(x=>x.qq_id!==body.payload.user_id);
+    return {status:'success',text:'已解绑 TestPlayer，本次管理员操作不受 CD 限制。'};
+  }
   return {status:'success'};
  }
 };'''
@@ -97,6 +101,8 @@ window.AstrBotPluginView={
         await page.get_by_label('连接方式',exact=True).select_option('reverse')
         assert await page.get_by_label('反向监听端口',exact=True).is_visible()
         assert not await page.get_by_label('QueQiao WebSocket 地址',exact=True).is_visible()
+        assert await page.get_by_label('TPS 指令',exact=True).input_value()=='tps'
+        assert await page.get_by_label('玩家延迟指令',exact=True).input_value()=='ping'
         await page.screenshot(path=str(screenshots/'reverse-editor.png'),full_page=True)
         await page.get_by_role('button',name='保存',exact=True).click()
         await page.wait_for_selector('#editor:not([open])',state='attached')
@@ -111,6 +117,14 @@ window.AstrBotPluginView={
         assert await page.evaluate('window.fixture.settings.points_name')=='星币'
         await page.locator('nav button[data-page="bindings"]').click()
         assert await page.locator('#title').inner_text()=='绑定与星币'
+        page.once('dialog',lambda dialog:dialog.accept())
+        await page.get_by_role('button',name='管理员解绑',exact=True).click()
+        await page.wait_for_selector('#output[open]')
+        assert '已解绑 TestPlayer' in await page.locator('#output-text').inner_text()
+        assert await page.evaluate('window.fixture.domain.bindings.length')==0
+        unbind_call=await page.evaluate("window.calls.find(x=>x.body?.action==='binding_unbind')")
+        assert unbind_call['body']['payload']=={'user_id':'100001'}
+        await page.locator('#output-close').click()
         await page.locator('nav button[data-page="shop"]').click()
         await page.locator('footer').evaluate("el=>el.textContent='本地 GUI 验证 · 仅合成数据'")
         await page.screenshot(path=str(screenshots/'shop.png'), full_page=True)
@@ -119,7 +133,7 @@ window.AstrBotPluginView={
         await page.screenshot(path=str(screenshots/'mobile.png'), full_page=True)
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1')
         assert not errors, errors
-        print(json.dumps({'pages':7,'forms':['command_save','parser_preview','route_event_switches','reverse_connection','binding_prefix_currency'],'responsive':True,'console_errors':errors},ensure_ascii=False))
+        print(json.dumps({'pages':7,'forms':['command_save','parser_preview','route_event_switches','reverse_connection','binding_prefix_currency','admin_unbind'],'responsive':True,'console_errors':errors},ensure_ascii=False))
         await browser.close()
 
 

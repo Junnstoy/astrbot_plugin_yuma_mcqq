@@ -15,6 +15,8 @@ from .text import template_fields
 MASK = "********"
 IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
 DEFAULTS = {
+    "schema_version": 2, "binding_verification_enabled": False,
+    "points_name": "点数", "command_prefix": "",
     "enabled": True, "timezone": "Asia/Shanghai", "binding_cooldown_seconds": 604800,
     "servers": [], "routes": [], "commands": [],
     "media": {"enabled": False, "host": "127.0.0.1", "port": 8766,
@@ -23,15 +25,18 @@ DEFAULTS = {
     "monitor": {"enabled": True, "interval_seconds": 60, "retention_days": 7},
 }
 SERVER_DEFAULTS = {"name": "", "url": "ws://127.0.0.1:8080", "token": "", "enabled": True,
+                   "display_name": "", "connection_mode": "forward", "reverse_host": "0.0.0.0",
+                   "reverse_port": 8081, "reverse_path": "/queqiao",
                    "timeout": 10, "game_host": "127.0.0.1", "game_port": 25565,
                    "tps_command": "spark tps", "mspt_command": "mspt", "ping_command": "spark ping",
                    "component_version": "legacy"}
 ROUTE_DEFAULTS = {"enabled": True, "qq_to_mc": True, "mc_to_qq": True, "admins": [],
+                  "display_name": "",
                   "points_min": 10, "points_max": 10, "timezone": "Asia/Shanghai",
                   "signin_command": "signin click {player}", "templates": {},
                   "signin_prefixes": ["[手记人偶]"], "signin_rules": [],
                   "events": ["PlayerChatEvent", "PlayerJoinEvent", "PlayerQuitEvent", "PlayerDeathEvent", "PlayerAchievementEvent"],
-                  "types": ["text", "image", "link", "record", "video", "file", "forward", "reply", "at"],
+                  "types": ["text", "face", "image", "link", "record", "video", "file", "forward", "reply", "at"],
                   "prefix": "[{group}] {sender}：", "max_forward_nodes": 30}
 COMMAND_DEFAULTS = {"aliases": [], "description": "自定义服务器命令", "enabled": True,
                     "require_binding": True, "admin_only": True, "cooldown_seconds": 3,
@@ -61,7 +66,14 @@ def validate(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("配置必须是对象")
     data = copy.deepcopy(data)
-    _booleans(data, "enabled")
+    _booleans(data, "enabled", "binding_verification_enabled")
+    if data.get("schema_version") != 2:
+        raise ValueError("不支持的配置版本")
+    if not isinstance(data["points_name"], str) or not data["points_name"].strip() or len(data["points_name"]) > 20 or any(ord(c) < 32 or c in "{}" for c in data["points_name"]):
+        raise ValueError("点数名称须为 1–20 个字符，不能包含控制字符或花括号")
+    data["points_name"] = data["points_name"].strip()
+    if not isinstance(data["command_prefix"], str) or len(data["command_prefix"]) > 20 or any(c.isspace() or ord(c) < 32 for c in data["command_prefix"]):
+        raise ValueError("插件唤醒前缀应不超过 20 字符，不能含空格或控制字符；留空沿用 AstrBot")
     _timezone(data["timezone"])
     for key in ("servers", "routes", "commands"):
         if not isinstance(data.get(key), list) or not all(isinstance(x, dict) for x in data[key]):
@@ -81,16 +93,27 @@ def validate(data: dict) -> dict:
             raise ValueError("服务器 ID 无效或重复")
         ids.add(sid)
         server["name"] = server["name"] or sid
+        if not isinstance(server["display_name"], str) or len(server["display_name"]) > 100 or any(ord(c) < 32 for c in server["display_name"]):
+            raise ValueError("服务器显示名称应为不超过100字符的单行文字")
         if server["name"] in names:
             raise ValueError("QueQiao server_name 不能重复")
         names.add(server["name"])
         url = urlsplit(server["url"])
-        if url.scheme not in {"ws", "wss"} or not url.hostname or url.username or url.password:
+        if server["connection_mode"] == "forward" and (url.scheme not in {"ws", "wss"} or not url.hostname or url.username or url.password):
             raise ValueError("QueQiao URL 必须是 ws/wss 地址，凭据请使用 token 字段")
         if any(c in server["token"] + server["name"] for c in "\r\n"):
             raise ValueError("连接字段不能包含换行")
         _number(server["timeout"], 1, 120, "请求超时")
         _number(server["game_port"], 1, 65535, "游戏端口", integer=True)
+        if server["connection_mode"] not in {"forward", "reverse"}:
+            raise ValueError("连接方式应为 forward / reverse")
+        _number(server["reverse_port"], 1, 65535, "反向监听端口", integer=True)
+        if not isinstance(server["reverse_host"], str) or not server["reverse_host"].strip() or any(c.isspace() for c in server["reverse_host"]):
+            raise ValueError("反向监听地址不能为空或包含空白")
+        if not isinstance(server["reverse_path"], str) or not re.fullmatch(r"/[A-Za-z0-9/_-]*", server["reverse_path"]):
+            raise ValueError("反向连接路径应以 / 开头，只包含字母、数字、斜杠、下划线或横杠")
+        if server["connection_mode"] == "reverse" and not server["token"].strip():
+            raise ValueError("反向连接必须设置 Access Token")
         if server["component_version"] not in {"legacy", "modern"}:
             raise ValueError("聊天组件版本应为 legacy / modern")
     umos = set()
@@ -99,6 +122,15 @@ def validate(data: dict) -> dict:
         for key, value in ROUTE_DEFAULTS.items():
             route.setdefault(key, copy.deepcopy(value))
         _booleans(route, "enabled", "qq_to_mc", "mc_to_qq")
+        if not isinstance(route["display_name"], str) or len(route["display_name"]) > 100:
+            raise ValueError("群显示名称不超过100字符")
+        for key in ("events", "types"):
+            if not isinstance(route[key], list) or not all(isinstance(v, str) for v in route[key]):
+                raise ValueError(f"{key} 必须为字符串列表")
+        if set(route["events"]) - set(ROUTE_DEFAULTS["events"]):
+            raise ValueError("游戏事件类型无效")
+        if set(route["types"]) - set(ROUTE_DEFAULTS["types"]):
+            raise ValueError("转发消息类型无效")
         umo = route.get("umo", "")
         if not isinstance(umo, str) or umo.count(":") < 2 or len(umo) > 512 or umo in umos:
             raise ValueError("请填写 AstrBot /sid 给出的完整且不重复的 UMO")
@@ -213,7 +245,13 @@ class Settings:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data = copy.deepcopy(DEFAULTS)
         if self.path.exists():
-            self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            if saved.get("schema_version", 1) < 2:
+                for route in saved.get("routes", []):
+                    if isinstance(route.get("types"), list) and "text" in route["types"] and "face" not in route["types"]:
+                        route["types"].append("face")
+                saved["schema_version"] = 2
+            self.data.update(saved)
         elif bootstrap:
             self.data.update({k: v for k, v in bootstrap.items() if k in DEFAULTS})
         self.data = validate(self.data)

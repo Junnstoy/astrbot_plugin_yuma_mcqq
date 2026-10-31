@@ -24,7 +24,7 @@ ALREADY = "Rcon:§f[§3手记人偶§f] §c玩家 §6rincho §c今天已经签�
 
 class FakeSettings:
     def __init__(self):
-        self.data = {"timezone": "Asia/Shanghai", "binding_cooldown_seconds": 0}
+        self.data = {"timezone": "Asia/Shanghai", "binding_cooldown_seconds": 0, "binding_verification_enabled": True}
         self.route_data = {"umo": "bot:GroupMessage:1", "scope": "group1", "server_id": "paper", "enabled": True,
                            "points_min": 10, "points_max": 10, "signin_command": "signin click {player}"}
 

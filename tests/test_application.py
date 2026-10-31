@@ -8,7 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "mcqq_application_tests"
@@ -100,6 +100,32 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             "raw": "Rcon:§f[§3手记人偶§f] §c玩家 §6rincho §c今天已经签到了，请不要重复签到。"}, "tester")
         self.assertEqual(result["status"], "ALREADY_SIGNED")
         self.app.gateway.rcon.assert_not_awaited()
+
+    async def test_metric_commands_return_rcon_text_and_status_only_connectivity(self):
+        self.app.gateway.rcon = AsyncMock(return_value='Rcon:§a[性能] TPS: 19.8, 20, 20')
+        for action in ('tps', 'mspt', 'ping'):
+            result = await self.app.execute(action, self.ctx)
+            self.assertEqual(result['text'], '[性能] TPS: 19.8, 20, 20')
+            self.assertNotIn('image_path', result)
+            self.app.gateway.rcon.assert_awaited_with('paper', self.app.settings.server('paper')[action+'_command'])
+        count = self.app.gateway.rcon.await_count
+        with patch.object(self.app.gateway, 'status', return_value=[{'id':'paper','connected':True}]):
+            self.assertEqual((await self.app.execute('status', self.ctx))['text'], '在线')
+        with patch.object(self.app.gateway, 'status', return_value=[]):
+            self.assertEqual((await self.app.execute('status', self.ctx))['text'], '离线')
+        self.assertEqual(self.app.gateway.rcon.await_count, count)
+
+    async def test_metric_timeout_does_not_fabricate_a_measurement(self):
+        self.app.gateway.rcon = AsyncMock(side_effect=module.OutcomeUnknown('no response'))
+        result = await self.app.execute('ping', self.ctx)
+        self.assertEqual(result['status'], 'UNKNOWN')
+        self.assertNotIn('image_path', result)
+        self.assertNotIn('0ms', result['text'])
+
+    async def test_preview_explains_actual_text_and_currency_variables(self):
+        self.app.settings.save({'points_name':'星币'})
+        result = await self.app.web('preview', {'command':{'parser':'text','templates':{'SUCCESS':'{points_name}: {rcon}'}},'raw':'Rcon:§a[测试] OK'}, 'tester')
+        self.assertEqual(result['preview'], '星币: [测试] OK')
 
 
 if __name__ == "__main__":

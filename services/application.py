@@ -130,7 +130,24 @@ class Application:
         ctx = {**ctx, "scope": route.get("scope", ctx["umo"]), "server_id": ctx.get("server_id") or route["server_id"]}
         if action.startswith("custom:"):
             return await self._custom(action[7:], ctx, args)
-        if action in {"status", "tps", "mspt", "ping"}:
+        if action == "status":
+            if args.strip():
+                raise ValueError("服务器状态不需要参数")
+            status = next((item for item in self.gateway.status() if item.get("id", item.get("server_id")) == ctx["server_id"]), {})
+            return {"status": "SUCCESS", "text": "在线" if status.get("connected") else "离线"}
+        if action in {"tps", "mspt", "ping"}:
+            if args.strip():
+                raise ValueError("此命令不需要参数；历史图片请使用性能图指令")
+            server = self.settings.server(ctx["server_id"])
+            command = render_command(server[action + "_command"], {})
+            try:
+                raw = await self.gateway.rcon(ctx["server_id"], command)
+            except GatewayUnavailable:
+                return {"status": "FAILED", "text": "服务器离线或 RCON 不可用。"}
+            except OutcomeUnknown:
+                return {"status": "UNKNOWN", "text": "查询已发送，但未收到确定的 RCON 回包，请稍后再试。"}
+            return {"status": "SUCCESS", "text": clean_text(raw) or "服务器返回了空内容。"}
+        if action == "performance":
             parts = shlex.split(args)
             server_id = ctx["server_id"]
             hours = 24
@@ -146,7 +163,8 @@ class Application:
             if not history:
                 await self.monitor.sample(server_id)
             image_path = await self.monitor.render(server_id, hours)
-            return {"status": "SUCCESS", "text": f"{server['name']} · 最近 {hours} 小时性能记录（玩家延迟与机器人连接延迟分别标注）", "image_path": str(image_path)}
+            name = server.get("display_name") or server["name"]
+            return {"status": "SUCCESS", "text": f"{name} · 最近 {hours} 小时性能记录（玩家延迟与机器人连接延迟分别标注）", "image_path": str(image_path)}
         if action == "order_reconcile":
             if not ctx.get("is_admin"):
                 return {"status": "DENIED", "text": "需要管理员权限。"}
@@ -171,6 +189,7 @@ class Application:
             return {"status": "DENIED", "text": "此命令的目标服务器与绑定服务器不同，请检查配置。"}
         player = (binding or {}).get("player_name", (binding or {}).get("name", (binding or {}).get("player", "")))
         values = {"user_id": ctx["user_id"], "player": player, "player_name": player,
+                  "points_name": self.settings.data.get("points_name", "点数"),
                   "date": datetime.now(ZoneInfo(self.settings.data["timezone"])).date().isoformat()}
         supplied = shlex.split(args)
         params = command.get("parameters", [])
@@ -220,7 +239,7 @@ class Application:
                 else:
                     result = parse_rules(raw, command.get("rules", []), player or None, command.get("cleanup_prefixes", []))
                 status = result["status"]
-                fields = {**values, **result.get("fields", {}), "cleaned": result["cleaned"], "status": status}
+                fields = {**values, **result.get("fields", {}), "cleaned": result["cleaned"], "rcon": clean_text(raw), "status": status}
                 template = command.get("templates", {}).get(status, "服务器结果未识别，请管理员检查解析规则。")
                 text = render_template(template, fields)
             except GatewayUnavailable:
@@ -277,7 +296,9 @@ class Application:
                 result = parse_signin(payload.get("raw", ""), payload.get("player", ""))
             elif command.get("parser") == "text":
                 result = {"status": "SUCCESS", "fields": {}, "cleaned": clean_text(payload.get("raw", ""), command.get("cleanup_prefixes", []))}
-            values = {**payload.get("values", {}), **result.get("fields", {}), "cleaned": result["cleaned"], "status": result["status"]}
+            values = {"points_name": self.settings.data.get("points_name", "点数"), "player": payload.get("player", ""),
+                      **payload.get("values", {}), **result.get("fields", {}),
+                      "rcon": clean_text(payload.get("raw", "")), "cleaned": result["cleaned"], "status": result["status"]}
             result["preview"] = render_template(command.get("templates", {}).get(result["status"], "{cleaned}"), values)
             return result
         if action == "metrics":

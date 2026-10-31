@@ -70,8 +70,8 @@ window.AstrBotPluginView={
             await page.locator(f'nav button[data-page="{name}"]').click()
             await page.wait_for_timeout(80)
             assert not await page.locator('#banner').is_visible(), name
-        await page.get_by_role('button', name='LiteSignIn 样本预览').click()
-        await page.get_by_role('button', name='运行预览', exact=True).click()
+        await page.get_by_role('button', name='签到回包解析示例').click()
+        await page.get_by_role('button', name='只模拟回复', exact=True).click()
         await page.wait_for_selector('#output[open]')
         assert 'SIGNED' in await page.locator('#output-text').inner_text()
         await page.locator('#output-close').click()
@@ -82,6 +82,35 @@ window.AstrBotPluginView={
         await page.get_by_role('button', name='保存', exact=True).click()
         await page.wait_for_selector('#editor:not([open])', state='attached')
         assert await page.get_by_text('测试查询', exact=True).count() >= 1
+        await page.locator('nav button[data-page="routes"]').click()
+        await page.get_by_role('button',name='编辑与开关',exact=True).click()
+        await page.screenshot(path=str(screenshots/'route-editor.png'),full_page=True)
+        await page.get_by_label('玩家死亡',exact=True).uncheck()
+        await page.get_by_label('QQ 表情',exact=True).check()
+        await page.get_by_label('QQ群显示名称',exact=True).fill('测试交流群')
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        route_value=await page.evaluate('window.fixture.settings.routes[0]')
+        assert 'PlayerDeathEvent' not in route_value['events'] and 'face' in route_value['types']
+        await page.get_by_role('button',name='编辑',exact=True).first.click()
+        await page.get_by_label('服务器显示名称',exact=True).fill('生存测试服')
+        await page.get_by_label('连接方式',exact=True).select_option('reverse')
+        assert await page.get_by_label('反向监听端口',exact=True).is_visible()
+        assert not await page.get_by_label('QueQiao WebSocket 地址',exact=True).is_visible()
+        await page.screenshot(path=str(screenshots/'reverse-editor.png'),full_page=True)
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        assert await page.evaluate('window.fixture.settings.servers[0].connection_mode')=='reverse'
+        await page.screenshot(path=str(screenshots/'routes.png'),full_page=True)
+        await page.get_by_role('button',name='全局设置',exact=True).click()
+        assert not await page.get_by_label('绑定时要求游戏验证码',exact=True).is_checked()
+        await page.get_by_label('点数显示名称',exact=True).fill('星币')
+        await page.get_by_label('插件唤醒前缀（可选）',exact=True).fill('mc')
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        assert await page.evaluate('window.fixture.settings.points_name')=='星币'
+        await page.locator('nav button[data-page="bindings"]').click()
+        assert await page.locator('#title').inner_text()=='绑定与星币'
         await page.locator('nav button[data-page="shop"]').click()
         await page.locator('footer').evaluate("el=>el.textContent='本地 GUI 验证 · 仅合成数据'")
         await page.screenshot(path=str(screenshots/'shop.png'), full_page=True)
@@ -90,7 +119,7 @@ window.AstrBotPluginView={
         await page.screenshot(path=str(screenshots/'mobile.png'), full_page=True)
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1')
         assert not errors, errors
-        print(json.dumps({'pages':7,'forms':['command_save','parser_preview'],'responsive':True,'console_errors':errors},ensure_ascii=False))
+        print(json.dumps({'pages':7,'forms':['command_save','parser_preview','route_event_switches','reverse_connection','binding_prefix_currency'],'responsive':True,'console_errors':errors},ensure_ascii=False))
         await browser.close()
 
 

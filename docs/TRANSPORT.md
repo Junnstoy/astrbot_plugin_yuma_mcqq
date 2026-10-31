@@ -1,10 +1,30 @@
 # 传输、富消息与性能采样
 
-本模块按新设计独立实现，不读取旧插件配置或运行数据库。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；实际 QQ 客户端、Paper、QueQiao 组合仍需在测试群服验收。下面列出当前实现、部署要求和降级行为。
+本文对应 1.1 版本。模块按新设计独立实现，旧插件仅用于显式数据迁移。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；已经使用模拟协议与真实 AstrBot 消息类测试，**尚未连接真实 QQ/Paper 服务进行联调**。
 
 ## QueQiao 连接与命令结果
 
-插件作为 WebSocket 客户端连接每个 `servers[].url`。握手携带与 QueQiao 配置一致的 `x-self-name`、可选 `Authorization: Bearer ...`，以及插件来源标记。`name` 必须匹配 QueQiao 的 `server_name`。推荐跨机器使用 `wss://` 或可信私网连接；令牌只保存在管理配置中，状态接口不输出令牌。[QueQiao 官方连接说明](https://github.com/17TheWord/QueQiao#快速开始)
+每台服务器独立选择 `servers[].connection_mode`。`name` 是协议身份，必须匹配 QueQiao 的 `server_name`；`display_name` 仅用于 QQ 消息和性能图说明，留空回退到 `name`。群显示名称由 `routes[].display_name` 控制，不改变 UMO、服务器身份或点数作用域。
+
+| 模式 | 发起连接的一侧 | 插件配置 |
+| --- | --- | --- |
+| `forward` 正向 | AstrBot 插件连接 QueQiao WebSocket Server | `url`、`name`、与 QueQiao 一致的 `token` |
+| `reverse` 反向 | QueQiao WebSocket Client 连接 AstrBot 插件 | `reverse_host`、`reverse_port`、`reverse_path`、`name`、必填 `token` |
+
+正向握手携带 `x-self-name`、配置了令牌时的 `Authorization: Bearer ...`，以及插件来源标记。反向模式由插件监听，例如 `0.0.0.0:8081/queqiao`，QueQiao 的 `websocket_client.url_list` 指向这个地址。多台反向服务器可以共用同一监听地址、端口与路径，按唯一的 `x-self-name` 和各自 token 区分；不同路径也可复用同一端口。重复连接、路径不符、缺身份、token 不符及插件自连会被拒绝。正向模式兼容 QueQiao 关闭鉴权的配置，反向模式不允许空 token。[QueQiao 官方连接说明](https://github.com/17TheWord/QueQiao#快速开始)、[官方 Server/Client 配置](https://queqiao-docs.pages.dev/config/)
+
+协议身份 `name` 在配置中保持原文；正向发送 `x-self-name` 时做一次 UTF-8 URL 表单编码，反向收到该头时解码一次，与 QueQiao 的 `URLEncoder` / `URLDecoder` 行为一致。中文、空格、字面量 `+` 和 `%` 因此不会在握手时改变身份。`Authorization` 头里的 token 保持原样，不做 URL 编码或解码。[官方握手校验源码](https://github.com/17TheWord/queqiao-core/blob/main/src/main/java/io/github/theword/queqiao/core/websocket/WsServer.java)、[官方反向客户端源码](https://github.com/17TheWord/queqiao-core/blob/main/src/main/java/io/github/theword/queqiao/core/websocket/WsClient.java)
+
+反向接收示例只需将以下服务器字段加入 GUI 中的服务器记录，其余字段使用默认值。QueQiao 的 `server_name` 设置为 `PaperMain`，`access_token` 与插件相同，并启用 `websocket_client`。真实公网部署可在前面加 TLS 反向代理，令牌不写进 URL。
+
+```json
+{
+  "id": "paper-main", "name": "PaperMain", "display_name": "幻域生存服",
+  "connection_mode": "reverse", "reverse_host": "0.0.0.0",
+  "reverse_port": 8081, "reverse_path": "/queqiao",
+  "token": "替换为你自己的随机令牌"
+}
+```
 
 请求使用 `{api, data, echo}`。`send_rcon_command` 的 `data` 是 `{command: "..."}`；成功回包的顶层 `data` 是 RCON 原始文本。`broadcast` 的 `data.message` 是 Minecraft 文本组件数组。请求回包按每条连接的唯一 `echo` 关联，服务端事件由单独队列消费，事件处理期间再次发起 RCON 不会阻塞回包读取。[V2 总览](https://queqiao-docs.pages.dev/api/v2/)、[RCON 接口](https://queqiao-docs.pages.dev/api/v2/rcon-command)、[广播接口](https://queqiao-docs.pages.dev/api/v2/broadcast)
 
@@ -21,26 +41,34 @@ API 的 `code: 200, status: SUCCESS` 仅说明收到了接口结果。签到成�
 
 这里对 RCON 错误采用保守语义：当前官方实现把发送后的读取/执行异常映射为 `500`，旧版本也可能没有细分失败阶段。收到错误包不能证明游戏内副作用没有发生。[官方 RCON API 源码](https://github.com/17TheWord/queqiao-core/blob/0ee1b4c69f2d152a61c697b77d05fcb4ac7c5e7d/src/main/java/io/github/theword/queqiao/core/api/SendRconCommandApi.java)、[官方 RCON 客户端](https://github.com/17TheWord/queqiao-core/blob/0ee1b4c69f2d152a61c697b77d05fcb4ac7c5e7d/src/main/java/io/github/theword/queqiao/core/rcon/RconClient.java)
 
-连接会以 1–60 秒退避重连，但不保存待重放命令。每服最多 128 个等待回包的请求、256 条待消费事件，WebSocket 单包限制 2 MiB。命令禁止换行和 NUL，UTF-8 长度限制 1446 字节。未确认的旧回包不会匹配重连后的新请求。
+正向连接会以 1–60 秒退避重连，反向连接等待 QueQiao 客户端按其配置重新连接；两种模式均不保存待重放命令。每服最多 128 个等待回包的请求、256 条待消费事件，WebSocket 单包限制 2 MiB。命令禁止换行和 NUL，UTF-8 长度限制 1446 字节。未确认的旧回包不会匹配重连后的新请求。
 
 ## QQ ↔ Minecraft 富消息
 
-普通消息转发由主插件放在明确指令与 AI 唤醒判定之后。传输层使用完整 OneBot 消息链，按原顺序渲染；游戏侧仅向配置中启用的精确 UMO 回发。机器人自己的 QQ 消息会忽略，双方消息有去重和短期限流。
+普通消息转发由主插件放在明确指令与 AI 唤醒判定之后。传输层支持原始 OneBot 字典、对象、CQ 字符串以及 AstrBot 完整消息链，按消息段顺序合并适配层已解析的字段。游戏侧仅向配置中启用的精确 UMO 回发。机器人自己的 QQ 消息会忽略，双方消息有去重和短期限流。
 
 | OneBot 内容 | 原版 Minecraft 表现 |
 | --- | --- |
-| 文字、@ | 文字或黄色提及 |
-| HTTP(S) 链接、可识别分享卡片 | 可点击 `[链接]` / 卡片标题，悬浮显示地址 |
-| 图片 | `[图片]` 点击打开限时链接 |
-| 语音 | `[语音]` 点击打开浏览器播放器/下载页 |
-| 视频 | `[视频]` 点击打开浏览器播放器/下载页 |
+| 文字、@ | 文字或黄色提及；支持 Minecraft 颜色和样式 |
+| QQ `face` / `emoji` / `mface` | `[表情]`，悬浮显示名称或表情 ID；大表情有公开 URL 时可点击 |
+| `dice` / `rps` | `[骰子：结果]` / `[猜拳：结果]`，同样由 `face` 类型开关控制 |
+| HTTP(S)、裸 `www.` 链接、可识别分享卡片 | 可点击 `[链接]` / 卡片标题，悬浮显示地址；`www.` 补为 HTTPS |
+| 图片 | `[图片]` 点击 QQ 资源原链接，或已发布的缓存链接 |
+| 语音 | `[语音]` 点击资源链接；转码缓存可打开浏览器播放器/下载页 |
+| 视频 | `[视频]` 点击 QQ 资源原链接，或缓存播放器/下载页 |
 | 文件 | `[文件：名称]` 点击下载 |
 | 引用 | `[回复 某人]`，悬浮显示文字和附件类型摘要 |
 | 合并消息 | 数量标签、前几条悬浮摘要、完整记录限时页面 |
 
-引用按需调用 `get_msg`，校验返回消息属于当前群或当前私聊；无法确认归属时仅显示占位。合并消息按需调用 `get_forward_msg`，按当前消息实际携带的转发 ID 展开；限制嵌套深度、节点总量和单层节点数量。语音按需调用 `get_record(out_format="mp3")`；缺少来源的图片/文件分别查询 `get_image` / `get_file`。NapCat 无法返回可读来源时显示占位，普通文字仍然转发。
+引用按需调用 `get_msg`，从 AstrBot 的 `get_group_id` / `message_obj.group_id` 取得当前会话，校验返回消息属于当前群或私聊；无法确认归属时仅显示占位。适配时优先保留 `model_dump()` / pydantic.v1 `.dict()` 的字段，避免 `Reply.toDict()` 仅保留 ID 而丢失引用链；通过会话校验后可用这条已解析链补全悬浮内容。不会因为存在一段引用文本就跳过归属校验。[AstrBot 官方消息组件实现](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/message/components.py)
 
-MC 的聊天、加入、离开、死亡和成就事件可按路由开关。兼容 QueQiao 的死亡 `text`，以及成就 `translate` / `translation`、旧 `text` 和 `display.title` 字段。游戏命令事件不作为普通消息转发。[官方死亡事件](https://queqiao-docs.pages.dev/events/v2/notice/player-death-event)、[官方成就事件](https://queqiao-docs.pages.dev/events/v2/notice/player-achievement-event)
+语音、视频、图片、文件有公开 HTTP(S) 原地址时直接提供点击链接，不要求先启用媒体服务，也不在转发时抓取该地址。没有公开地址才按需查询 NapCat：语音使用 `get_record(out_format="mp3")`，图片使用 `get_image`，视频使用 `get_file`，文件优先 `get_group_file_url` / `get_private_file_url`，再尝试 `get_file`。NapCat 的 `get_record` 可能把 `url` 返回为转码后的本地路径；若同时有 `base64`，插件可通过有大小限制的媒体缓存发布它，不因此开放任意本地路径。[NapCat GetMsg](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/msg/GetMsg.ts)、[GetRecord](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/file/GetRecord.ts)、[GetFile](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/file/GetFile.ts)
+
+合并消息按需调用 `get_forward_msg`，只展开当前消息实际携带的转发 ID，限制嵌套深度和节点数量；完整页面需要可选媒体服务，未开启时仍有文字悬浮摘要。无法获取附件时保留“暂不可用”标签，普通文字继续转发。实现参考用户指定项目的标签与引用交互，但不引入 NoneBot 依赖，不生成 ChatImage 的 CICode。[参考项目的消息解析](https://github.com/17TheWord/nonebot-plugin-mcqq/blob/main/nonebot_plugin_mcqq/utils/parse_qq_msg.py)
+
+QQ→MC 支持 `§a` / `&a` 等传统色码、`§l` / `&l` 等样式、`&#12abef` / `§#12abef` 与 `&x&1&2&3&4&5&6` / `§x§1§2§3§4§5§6` 十六进制色码；它们转换为 JSON 的 `color`、`bold` 等属性，`r` 重置样式。引用悬浮中的色码同样转换为样式，悬浮正文里的 URL 保留原文。MC→QQ 清理这些控制码。URL 先单独识别，`?a=1&b=2` 中的 `&b` 保持原样，不当作色码。
+
+MC 的聊天、加入、离开、死亡和成就事件可按路由开关。死亡采用官方 `notice` / `PlayerDeathEvent` / `death.text` 模型，同时支持由 `sub_type: player_death` 识别事件；成就兼容 `translate` / `translation`、旧 `text` 和 `display.title`。空或 `null` 消息 ID 不参与去重，有 ID 时按服务器、事件类型和 ID 区分，聊天不会把同 ID 的死亡事件误去重。通知限流也与聊天分开。若实服仍不转发死亡，请核对 QueQiao 的 `subscribe_event.player_death` 与该路由的事件开关；插件不能恢复服务端从未发送的事件。游戏命令不作为普通消息转发。[官方死亡事件](https://queqiao-docs.pages.dev/events/v2/notice/player-death-event)、[死亡事件源码](https://github.com/17TheWord/queqiao-core/blob/main/src/main/java/io/github/theword/queqiao/core/event/PlayerDeathEvent.java)、[Paper 事件订阅实现](https://github.com/17TheWord/QueQiao/blob/main/paper/origin/src/main/java/com/github/theword/queqiao/EventProcessor.java)、[官方成就事件](https://queqiao-docs.pages.dev/events/v2/notice/player-achievement-event)
 
 `servers[].component_version` 控制发送给 QueQiao 的 JSON 组件格式：
 
@@ -69,15 +97,19 @@ MC 的聊天、加入、离开、死亡和成就事件可按路由开关。兼�
 }
 ```
 
-域名需要由部署者实际配置，并将 `/m/` 和 `/v/` 反向代理到 `host:port`；若使用基础路径，则反向代理应剥离该基础路径后转发。浏览器播放地址需要玩家可访问。未开启或没有 `public_base` 时，不生成假链接：媒体显示“暂不可用”，合并消息保留悬浮摘要。
+这个服务是可选功能：QQ 已提供的公开资源原链接始终可以直接点击；需要发布 Base64/可信本地素材或完整合并页面时才需要它。域名由部署者实际配置，并将 `/m/` 和 `/v/` 反向代理到 `host:port`；使用基础路径时反向代理应剥离该路径后转发。未开启或没有 `public_base` 时，不伪造缓存地址：只有缺少公开原链接的附件显示“暂不可用”，合并消息保留悬浮摘要。原 QQ 地址的有效期由 QQ 决定，插件不能延长它。
 
 URL 的持有人在有效期内可以访问对应内容，链接可能被收件人转发，因此仅把已授权转发的当前会话素材发布到这里。服务不包含管理员页面、奖励码、订单详情、目录列表或上传接口。
 
-网络下载只允许无凭据 HTTP(S)。每次跳转重新校验，DNS 解析的所有地址都必须是公网地址，连接使用已校验的解析结果；拒绝环回、私网、链路本地及云元数据地址。`allowed_hosts` 非空时额外限制精确域名。未配置可信目录时，任何本地路径都不可发布；需要 NapCat 转码文件时，只把专用媒体缓存目录共享挂载并加入 `trusted_local_roots`，不要加入整个 AstrBot 数据目录。符号链接按解析后的真实路径检查，UNC/网络共享路径被拒绝。
+直链只接受无凭据 HTTP(S)，拒绝私网/环回/链路本地 IP 字面地址和本地网络主机名；`allowed_hosts` 非空时额外限制精确域名。直链不做服务器端 HTTP 读取。缓存服务下载时进一步校验每次跳转和实际 DNS 解析结果，所有地址都必须是公网地址，连接使用已校验的解析结果。
+
+未配置可信目录时，任何本地路径都不可发布；需要共享 NapCat 转码文件时，只挂载专用媒体缓存目录并加入 `trusted_local_roots`，不要加入整个 AstrBot 数据目录。符号链接按真实路径检查，UNC/网络共享路径被拒绝。API 返回的 Base64 内容经过编码验证及解码前后大小检查，支持辨认常见图片、MP3、WAV、Ogg 和 MP4 文件头。
 
 下载有总超时、跳转次数、单文件和总缓存限制。内容使用随机文件名，索引位于插件数据目录的 `media/index.sqlite3`，每分钟清理过期文件；过期请求立即返回 404。合并记录对文字做 HTML 转义，只生成安全链接。响应包含 CSP、`nosniff` 和不缓存头；未知类型及普通文件强制下载。配置重载保留索引和未过期缓存。
 
 ## 性能数据与图表
+
+`服务器状态` 仅返回当前路由的“在线”或“离线”，依据 QueQiao 连接状态，不等同于完整游戏健康检查。`tps`、`mspt`、`ping` 指令直接执行对应 RCON 查询，并清洗后返回完整文字，不再返回曲线图。`性能图` 是独立动作，读取历史并生成 PNG，可传小时数，默认 24 小时。实际触发名都以 AstrBot 管理行为为准。
 
 定时器启动后自动采样；同一服务器不重叠探测。每服可配置 `tps_command`、`mspt_command`、`ping_command`，默认分别为 `spark tps`、`mspt`、`spark ping`。Spark 需在服务端可用；也可按实际 Paper 命令修改。解析识别 Spark 的 `[⚡]` 前缀、多行/连续回包、窗口标签和颜色代码。无法解析或命令不存在时写入缺失值，不伪造正常数值。[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)、[Spark 指标输出定义](https://github.com/lucko/spark/blob/master/spark-common/src/main/java/me/lucko/spark/common/command/modules/HealthModule.java)
 
@@ -92,4 +124,6 @@ URL 的持有人在有效期内可以访问对应内容，链接可能被收件�
 
 玩家延迟与机器人到服务器 RTT 是两条不同网络路径，GUI 和 PNG 分别标注；未设置 `game_host` 时 SLP 一项留空。采样持久化在 `metrics.sqlite3`，按 `monitor.retention_days` 清理，历史查询升序返回且保留 `null`。PNG 使用四个独立面板，缺失点断线，时区使用插件配置。进程停机期间没有探测，不补造历史样本。
 
-离线测试覆盖实际请求/回包相关性、事件中嵌套请求、断连/错误/超时的不确定结果、本地媒体目录边界、重定向与私网 DNS 拒绝、token 过期、HTML 转义、跨会话引用拒绝、富消息次序、监控缺失值和 PNG 输出。尚未以真实生产群或游戏服验证网络连通性、客户端点击行为和具体版本的 RCON 文案。
+绑定默认 `binding_verification_enabled: false`：QQ 直接提交玩家名完成唯一绑定，存储不会伪造一个“已验证 UUID”。开启此选项后才要求游戏内一次性验证码，通过经鉴权的玩家事件取得真实 UUID。两种方式都保留 QQ/玩家名唯一性和变更冷却，已验证 UUID 继续保持唯一约束。此配置不会绕过传输鉴权，详情见 [业务说明](BUSINESS.md)。
+
+离线测试覆盖请求/回包关联、正反向连接、事件中嵌套请求、断连/错误/超时的不确定结果、原链接与缓存边界、Base64 上限、私网跳转/DNS 拒绝、过期、HTML 转义、跨会话引用拒绝、真实 AstrBot 消息对象、表情和颜色、空 ID 死亡事件、监控缺失值及 PNG 输出。**真实 QQ 群、Paper 服务、客户端点击行为与实服 RCON 文案尚未联调**；离线协议测试不替代实际部署验收。

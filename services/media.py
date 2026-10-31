@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import html
 import ipaddress
 import json
@@ -133,6 +135,8 @@ class MediaService:
             raise MediaUnavailable(self.last_error or "媒体链接服务未开启")
 
     def _check_url(self, source: str) -> str:
+        if any(ord(char) < 32 for char in source):
+            raise MediaRejected("媒体地址包含控制字符")
         parsed = urlsplit(source)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
             raise MediaRejected("只允许无凭据的 HTTP(S) 媒体地址")
@@ -140,7 +144,7 @@ class MediaService:
         allowed = {str(value).lower().rstrip(".") for value in self.config.get("allowed_hosts", [])}
         if allowed and host not in allowed:
             raise MediaRejected("媒体域名不在允许列表中")
-        if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        if host in ("localhost", "localhost.localdomain") or host.endswith((".localhost", ".local", ".internal", ".lan")):
             raise MediaRejected("不允许本地网络媒体地址")
         try:
             address = ipaddress.ip_address(host)
@@ -150,6 +154,40 @@ class MediaService:
             if not address.is_global:
                 raise MediaRejected("不允许非公网媒体地址")
         return source
+
+    def public_source_url(self, source: str) -> str:
+        """A QQ-provided public URL can be clicked without running a proxy/cache.
+
+        This performs no HTTP request or file read. Proxy downloads still validate
+        every DNS result and redirect separately through _PublicResolver.
+        """
+        source = str(source).strip()
+        if source.startswith("//"):
+            source = "https:" + source
+        elif source.lower().startswith("www."):
+            source = "https://" + source
+        return self._check_url(source)
+
+    @staticmethod
+    def _mime(content: bytes, suggested: str, name: str = "") -> str:
+        # NapCat and QQ sometimes label image/video bodies as octet-stream.
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        if content.startswith(b"RIFF") and content[8:12] == b"WAVE":
+            return "audio/wav"
+        if content.startswith(b"OggS"):
+            return "audio/ogg"
+        if content.startswith(b"ID3") or (len(content) > 1 and content[0] == 0xFF and content[1] & 0xE0 == 0xE0):
+            return "audio/mpeg"
+        if len(content) > 12 and content[4:8] == b"ftyp":
+            return "audio/mp4" if content[8:12] in (b"M4A ", b"M4B ") else "video/mp4"
+        return suggested or mimetypes.guess_type(name)[0] or "application/octet-stream"
 
     async def _download(self, source: str) -> tuple[bytes, str]:
         if not self._session:
@@ -200,7 +238,17 @@ class MediaService:
         self._ready()
         if kind not in ("image", "record", "audio", "video", "file"):
             raise MediaRejected("不支持的媒体类型")
-        if source.startswith(("http://", "https://")):
+        if source.startswith("base64://"):
+            encoded = source[9:]
+            maximum = int(self.config.get("max_bytes", 20 * 1024 * 1024))
+            if len(encoded) > ((maximum + 2) // 3) * 4:
+                raise MediaRejected("媒体超过大小限制")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise MediaRejected("无效的媒体 Base64") from exc
+            mime = ""
+        elif source.startswith(("http://", "https://")):
             content, mime = await self._download(source)
             name = name or Path(unquote(urlsplit(source).path)).name
         else:
@@ -210,6 +258,7 @@ class MediaService:
             name = name or path.name
         if len(content) > int(self.config.get("max_bytes", 20 * 1024 * 1024)):
             raise MediaRejected("文件超过大小限制")
+        mime = self._mime(content, mime, name)
         token = await self._store(content, kind, name or kind, mime)
         endpoint = "v" if kind in ("record", "audio", "video") else "m"
         return f"{self.base}/{endpoint}/{token}"
@@ -277,7 +326,7 @@ class MediaService:
         if row["kind"] == "record_page":
             raise web.HTTPNotFound()
         headers = self._headers()
-        safe_inline = {"image/png", "image/jpeg", "image/gif", "image/webp", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "video/mp4", "video/webm"}
+        safe_inline = {"image/png", "image/jpeg", "image/gif", "image/webp", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/ogg", "video/mp4", "video/webm"}
         mime = row["mime"] if row["mime"] in safe_inline else "application/octet-stream"
         headers["Content-Type"] = mime
         if row["kind"] == "file" or mime == "application/octet-stream":

@@ -14,9 +14,11 @@ from zoneinfo import ZoneInfo
 try:
     from ..core.store import DomainError, Store
     from ..core.text import SIGNIN_RULES, clean_text, parse_rules, render_command, render_template, validate_player
+    from ..core.signin_policy import preview_signin_policy, reward_from_draw
 except ImportError:  # Standalone offline tests.
     from core.store import DomainError, Store
     from core.text import SIGNIN_RULES, clean_text, parse_rules, render_command, render_template, validate_player
+    from core.signin_policy import preview_signin_policy, reward_from_draw
 
 
 DEFAULT_SIGNIN = "玩家: {player}\n{group_result}\n{game_result}"
@@ -45,9 +47,19 @@ class Domain:
     def _result(text, status="success", **fields):
         return dict(text=str(text), status=status, **fields)
 
-    def _day(self, route):
+    def _now(self, route):
         zone = ZoneInfo(route.get("timezone") or self.settings.data.get("timezone", "Asia/Shanghai"))
-        return datetime.now(zone).date().isoformat()
+        return datetime.now(zone)
+
+    def _day(self, route, at=None):
+        return (at if at is not None else self._now(route)).date().isoformat()
+
+    def preview_signin_policy(self, route, at=None, base_points=None):
+        """Pure eligibility/reward preview; supplied draws never use RNG or accounts."""
+        if not isinstance(route, dict):
+            raise ValueError("签到策略必须是对象")
+        route = {**route, "timezone": route.get("timezone") or self.settings.data.get("timezone", "Asia/Shanghai")}
+        return preview_signin_policy(route, at if at is not None else self._now(route), base_points)
 
     def _points_name(self):
         return str(self.settings.data.get("points_name") or "点数")
@@ -206,7 +218,6 @@ class Domain:
         # Across scopes: one player cannot race two remote sign-in calls.
         lock = self._locks.setdefault("signin:" + user, asyncio.Lock())
         async with lock:
-            bound = self._binding(ctx)
             operation_id = self._key("signin", ctx)
             previous = self.store.signin_operation(operation_id)
             if previous:
@@ -219,18 +230,29 @@ class Domain:
                     if previous.get("result", {}) and previous["result"].get("reply"):
                         return self._result(previous["result"]["reply"], previous["state"])
                     return self._result("本次请求已处理或游戏结果待核对；未重复发送游戏命令。", previous["state"])
+            now = self._now(route)
+            day = self._day(route, now)
+            policy = self.preview_signin_policy(route, now)
+            if not policy["allowed"]:
+                window = policy["window"]
+                return self._result(f"签到失败❌️ 当前不在签到时段内。每日 {window['start']}–{window['end']}（{policy['timezone']}）可签到。", "time_closed",
+                                    data={"allowed": False, "day": day, "window": window, "timezone": policy["timezone"]})
+            bound = self._binding(ctx)
+            if previous:
                 if not self._same_binding(previous["binding"], bound):
                     self.store.set_signin_state(operation_id, "failed", detail="发送前绑定已变化，未执行旧请求")
                     return self._result("绑定已变更，本次旧签到请求未发送，请重新签到。", "error")
-                if previous["day"] != self._day(route):
+                if previous["day"] != day:
                     self.store.set_signin_state(operation_id, "failed", detail="未发送请求已跨日，不能替新一天执行签到")
                     return self._result("旧签到请求已跨日且未发送，请发起新的签到请求。", "error")
-            day = self._day(route)
-            minimum, maximum = int(route.get("points_min", 10)), int(route.get("points_max", 10))
-            if not 0 <= minimum <= maximum <= 10**9:
-                raise DomainError("签到点数范围配置不合法")
-            amount = minimum + secrets.randbelow(maximum - minimum + 1)
-            op = self.store.begin_signin(operation_id, ctx["scope"], user, day, amount, bound, ctx["umo"])
+                # A pending request already chose its reward before interruption.
+                op = previous
+            else:
+                bounds = policy["draw_range"]
+                draw = bounds["min"] + secrets.randbelow(bounds["max"] - bounds["min"] + 1)
+                amount = reward_from_draw(policy, draw)
+                policy.update(base_points=draw, final_points=amount)
+                op = self.store.begin_signin(operation_id, ctx["scope"], user, day, amount, bound, ctx["umo"], reward_policy=policy)
             command = render_command(route.get("signin_command", "signin click {player}"),
                                      {"player": bound["player"], "player_name": bound["player"], "user_id": user, "date": day})
             self.store.set_signin_state(operation_id, "sending")

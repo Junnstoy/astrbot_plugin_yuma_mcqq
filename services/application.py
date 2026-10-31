@@ -20,6 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..core.config import Settings, validate
+from ..core.signin_policy import DEFAULT_SIGNIN_TIME
 from ..core.store import Store, remap_server_references
 from ..core.text import clean_text, parse_rules, parse_signin, render_command, render_template, validate_player
 from .domain import Domain
@@ -409,6 +410,18 @@ class Application:
             return self.domain.preview_signin(payload.get("raw", ""), str(payload.get("player", "")), route,
                 group_signed=payload.get("group_signed", False), points_delta=payload.get("points_delta", 1),
                 balance=payload.get("balance", 1))
+        if action == "preview_signin_policy":
+            route_umo = payload.get("route_umo")
+            if not isinstance(route_umo, str) or not route_umo:
+                raise ValueError("请选择已保存的群服路由")
+            route = self.settings.route(route_umo)
+            if route is None:
+                raise ValueError("请选择已保存的群服路由")
+            if "at" in payload and not isinstance(payload["at"], str):
+                raise ValueError("模拟时间必须为 ISO8601 日期时间文字")
+            if "base_points" in payload and (isinstance(payload["base_points"], bool) or not isinstance(payload["base_points"], int)):
+                raise ValueError("模拟抽样点数必须为整数")
+            return self.domain.preview_signin_policy(route, payload.get("at"), payload.get("base_points"))
         if action == "metrics":
             sid = payload.get("server_id", "")
             self.settings.server(sid)
@@ -475,7 +488,7 @@ class Application:
         journal = json.loads(self._rename_path.read_text(encoding="utf-8"))
         old_id, new_id, operation_id = journal["old_id"], journal["new_id"], journal["operation_id"]
         if self.revision() not in (journal["source_revision"], journal["target_revision"]):
-            raise ValueError("迁移期间配置被其他方式修改，请恢复迁移前或迁移后的配置备份再重载")
+            journal = self._upgrade_rename_policy_defaults(journal)
         candidate = self._renamed_settings(old_id, new_id)
         counts = {"domain": self.store.rename_server(old_id, new_id, journal["actor"], operation_id)}
         with self._ops:
@@ -503,6 +516,53 @@ class Application:
         counts["samples"] = self.monitor.rename_server(old_id, new_id, operation_id)
         self.settings.save(candidate)
         return {"from": old_id, "to": new_id, "counts": counts}
+
+    def _upgrade_rename_policy_defaults(self, journal):
+        """Recognize only the two additive route defaults introduced with policies."""
+        message = "迁移期间配置被其他方式修改，请恢复迁移前或迁移后的配置备份再重载"
+        raw = json.loads(self.settings.path.read_text(encoding="utf-8"))
+        revision = self._configuration_revision(raw)
+        if revision not in (journal["source_revision"], journal["target_revision"]):
+            raise ValueError(message)
+
+        def with_defaults(data):
+            value = copy.deepcopy(data)
+            for route in value.get("routes", []):
+                route.setdefault("signin_time", copy.deepcopy(DEFAULT_SIGNIN_TIME))
+                route.setdefault("reward_events", [])
+            return value
+
+        # Existing explicit values are never removed or relaxed. Any other
+        # normalization, manual edit or newly enabled policy must still fail.
+        if with_defaults(raw) != self.settings.data:
+            raise ValueError(message)
+
+        def counterpart(data, source_id, target_id):
+            value = copy.deepcopy(data)
+            source = [server for server in value.get("servers", []) if server.get("id") == source_id]
+            if len(source) != 1 or any(server.get("id") == target_id for server in value.get("servers", [])):
+                raise ValueError(message)
+            source[0]["id"] = target_id
+            for collection in (value.get("routes", []), value.get("commands", [])):
+                for item in collection:
+                    if item.get("server_id") == source_id:
+                        item["server_id"] = target_id
+            return value
+
+        if revision == journal["source_revision"]:
+            source, target = raw, counterpart(raw, journal["old_id"], journal["new_id"])
+        else:
+            source, target = counterpart(raw, journal["new_id"], journal["old_id"]), raw
+        if (self._configuration_revision(source) != journal["source_revision"]
+                or self._configuration_revision(target) != journal["target_revision"]):
+            raise ValueError(message)
+        updated = {**journal,
+                   "source_revision": self._configuration_revision(with_defaults(source)),
+                   "target_revision": self._configuration_revision(with_defaults(target))}
+        # Persist the new hashes first: retrying after any later interruption is
+        # then governed by the normal exact configuration checks.
+        self._write_rename_journal(updated)
+        return updated
 
     async def _rename_server(self, payload, actor):
         old_id, new_id = payload.get("server_id"), payload.get("new_server_id")

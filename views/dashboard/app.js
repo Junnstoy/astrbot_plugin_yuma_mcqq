@@ -192,7 +192,7 @@ function edit(title, specs, initial, onSave, saveLabel = '保存') {
   const read = (spec, control) => spec.type==='checks' ? control.filter(x=>x.checked).map(x=>x.value) : spec.type==='checkbox' ? control.checked : spec.type==='number' ? Number(control.value) : spec.type==='json' ? JSON.parse(control.value||(spec.object?'{}':'[]')) : spec.type==='lines' ? control.value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean) : control.value;
   const visibility=()=>{
     const values={};controls.forEach(([spec,control])=>{if(!['checks','json'].includes(spec.type))values[spec.key]=read(spec,control);});
-    controls.forEach(([spec,control,label])=>{if(spec.showWhen){label.hidden=!spec.showWhen(values);control.required=!!spec.required&&!label.hidden;}});
+    controls.forEach(([spec,control,label])=>{if(spec.showWhen){label.hidden=!spec.showWhen(values);control.disabled=label.hidden;control.required=!!spec.required&&!label.hidden;}});
   };
   controls.forEach(([,control])=>{if(!Array.isArray(control))control.addEventListener('change',visibility);});visibility();
   $('#edit-form').onsubmit = async event => {
@@ -299,7 +299,7 @@ function routeEditor(existing) {
     field('{reply} 标签模板（留空用默认）','reply_label_template','text',{wide:true,placeholder:'[回复 {sender}]',hint:'{sender} 为原作者。例：(回复 @{sender})。此项控制引用标签文字；颜色使用上方“引用标签颜色”，悬浮内容在下方设置。'}),
     field('引用悬浮内容（留空用默认）','reply_hover_template','textarea',{wide:true,placeholder:'{sender}\n{message}\nDate: {time}',hint:'默认三行：原作者、原消息内容、原消息时间。{sender} 是被引用消息作者，{message} 为原文，{time} 按本路由时区显示 HH:MM:SS；没有原时间则显示未知。'}),
     field('MC → QQ 消息格式','mc_to_qq_template','textarea',{wide:true,placeholder:'[{server}] {message}',hint:'留空使用默认。{server} 是服务器显示名称，{player} 是玩家名，{message} 是已含玩家名的聊天或事件内容。'}),
-    field('签到与账户','section_signin','section'),field('点数作用域','scope','text',{hint:'留空使用 UMO。填写相同值可共享余额；共享时区和签到奖励必须一致。'}),
+    field('签到与账户','section_signin','section',{hint:'每日签到时段与日期奖励活动，在路由列表的“签到时段与活动”中设置。'}),field('点数作用域','scope','text',{hint:'留空使用 UMO。填写相同值可共享余额；共享时区和签到奖励必须一致。加入已有作用域时沿用该作用域的时段与活动。'}),
     field('签到时区','timezone'),field('签到奖励下限','points_min','number',{min:0}),field('签到奖励上限','points_max','number',{min:0}),
     field('游戏签到命令','signin_command','text',{wide:true,hint:'先执行此命令，确认游戏已签到，再结算本群奖励。{player} 会替换成绑定的玩家名。'}),
     field('群管理员 QQ（每行一个）','admins','lines',{wide:true}),
@@ -308,7 +308,98 @@ function routeEditor(existing) {
     field('识别时忽略的回包前缀（每行一个）','signin_prefixes','lines',{wide:true,advanced:true,hint:'只影响规则识别。例如 [手记人偶] 会从匹配文本开头移除；QQ群中 {rcon} 仍保留它。颜色代码自动清除，无需填入。'}),
     field('自定义签到结果规则','signin_rules','json',{advanced:true,hint:'默认 [] 直接识别已提供的 LiteSignIn 回包。仅当服务端返回文字变化时修改。每项包含 status 和 pattern；SIGNED / ALREADY_SIGNED 必须用 (?P<player>...) 捕获玩家名。'}),
     field('合并消息展开上限','max_forward_nodes','number',{advanced:true,min:1,max:100})
-  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq'],['reply_label_template','reply_label'],['reply_hover_template','reply_hover']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;v.message_colors={...v.message_colors};for(const [key] of tagColors){v.message_colors[key]=v['color_'+key];delete v['color_'+key];}const list=state.settings.routes.filter(x=>x.umo!==v.umo);list.push(v);await saveSettings({routes:list});});
+  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq'],['reply_label_template','reply_label'],['reply_hover_template','reply_hover']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;v.message_colors={...v.message_colors};for(const [key] of tagColors){v.message_colors[key]=v['color_'+key];delete v['color_'+key];}
+    const list=state.settings.routes.filter(x=>x.umo!==v.umo);
+    const shared=list.find(x=>(x.scope||x.umo)===v.scope);
+    if(shared&&(!existing||(existing.scope||existing.umo)!==v.scope)){
+      v.signin_time=structuredClone(shared.signin_time||{enabled:false,start:'00:00',end:'23:59'});
+      v.reward_events=structuredClone(shared.reward_events||[]);
+    }
+    list.push(v);await saveSettings({routes:list});});
+}
+const signinWindowLabel = route => route.signin_time?.enabled ? `${route.signin_time.start}–${route.signin_time.end}${route.signin_time.start>route.signin_time.end?'（跨午夜）':''}` : '全天';
+async function saveSigninPolicy(umo, patch) {
+  const route=state.settings.routes.find(r=>r.umo===umo);
+  if(!route)throw Error('此路由已不存在，请刷新后重试。');
+  const scope=route.scope||route.umo;
+  const routes=state.settings.routes.map(r=>(r.scope||r.umo)===scope?{...r,...structuredClone(patch)}:r);
+  await saveSettings({routes});
+}
+function signinPolicyPreview(route) {
+  edit('签到时段与奖励 · 预览',[
+    field('只检查已保存的策略','section_policy_preview','section',{hint:`使用 ${route.display_name||route.umo} 的已保存配置；日期时间按 ${route.timezone||state.settings.timezone} 解释。不执行游戏命令，不记录签到或发放奖励。`}),
+    field('预览日期时间（留空使用当前时间）','at','datetime-local',{wide:true}),
+    field('模拟抽样点数（可选）','base_points','text',{hint:'留空只展示奖励范围。倍率活动填写基础抽样值；范围活动填写活动范围内的值。'})
+  ],{at:'',base_points:''},async value=>{
+    const payload={route_umo:route.umo};
+    if(value.at)payload.at=value.at;
+    if(value.base_points.trim()){
+      if(!/^\d+$/.test(value.base_points.trim()))throw Error('模拟抽样点数必须是非负整数。');
+      payload.base_points=Number(value.base_points);
+      if(!Number.isSafeInteger(payload.base_points))throw Error('模拟抽样点数过大。');
+    }
+    const r=await action('preview_signin_policy',payload);
+    const range=b=>`${b.min}–${b.max} ${pointsName()}`;
+    const lines=[r.allowed?'允许执行签到指令':'当前时间不允许签到；不会执行游戏签到',`当地时间：${r.local_time}（${r.timezone}）`,
+      `每日时段：${signinWindowLabel({signin_time:r.window})}`,`匹配活动：${r.event?`${r.event.name}（优先级 ${r.event.priority}）`:'无，使用基础奖励'}`,
+      `基础范围：${range(r.base_range)}`,`抽样范围：${range(r.draw_range)}`,`倍率：${r.multiplier}（小数向下取整）`,
+      `${r.allowed?'本次奖励范围':'该日期候选奖励范围'}：${range(r.effective_range)}`];
+    if(r.final_points!==null)lines.push(`模拟计算：${r.base_points} × ${r.multiplier} → ${r.final_points} ${pointsName()}`);
+    lines.push(r.allowed?'这里只预览时段与奖励规则，实际签到仍需绑定并判断当日签到记录。':'时段外展示的候选奖励仅供核对配置，不代表可领取。');
+    output('签到策略预览 · 未执行签到',lines.join('\n'));
+  },'预览策略');
+}
+function signinPolicyDialog(umo) {
+  const dialog=element('dialog');dialog.className='policy-dialog';dialog.setAttribute('aria-label','签到时段与奖励活动');
+  const getRoute=()=>state.settings.routes.find(r=>r.umo===umo);
+  const save=async patch=>{
+    try{await saveSigninPolicy(umo,patch);draw();}
+    catch(error){const alert=$('.policy-error',dialog);if(alert){alert.hidden=false;alert.textContent=String(error.message||error);}throw error;}
+  };
+  const editWindow=()=>{
+    const route=getRoute();
+    edit('每日签到时段',[
+      field('限制整条签到指令','enabled','checkbox',{hint:'关闭时全天可签到；开启后，时段外不会发送游戏签到命令，也不会结算群签到。'}),
+      field('每日开始时间','start','time',{required:true,showWhen:v=>v.enabled}),field('每日结束时间','end','time',{required:true,showWhen:v=>v.enabled}),
+      field('时间规则','section_window','section',{hint:`按 ${route.timezone||state.settings.timezone} 时区判断，包含起止分钟。开始晚于结束时跨午夜；相同时只开放该一分钟。跨午夜仍按实际日历日期判断每日签到。保存会同步到同一点数作用域的所有路由。`})
+    ],route.signin_time||{enabled:false,start:'00:00',end:'23:59'},value=>save({signin_time:value.enabled?value:{...(route.signin_time||{start:'00:00',end:'23:59'}),enabled:false}}));
+  };
+  const editEvent=existing=>{
+    const route=getRoute();
+    const value={id:randomId().slice(0,12),name:'',enabled:true,start_date:'',end_date:'',mode:'multiplier',priority:0,multiplier:'2',points_min:route.points_min,points_max:route.points_max,...existing};
+    edit(existing?'编辑签到奖励活动':'新增签到奖励活动',[
+      field('活动名称','name','text',{required:true,wide:true}),field('启用活动','enabled','checkbox'),field('优先级','priority','number',{min:-1000000,max:1000000,required:true,hint:'数字越大越优先。同一天只应用一个活动，不叠加；同优先级的已启用活动日期不能重叠。'}),
+      field('开始日期','start_date','date',{required:true}),field('结束日期','end_date','date',{required:true}),
+      field('奖励方式','mode','select',{options:[['multiplier','基础奖励乘以倍率'],['range','替换奖励点数范围']],wide:true}),
+      field('奖励倍率','multiplier','text',{required:true,showWhen:v=>v.mode==='multiplier',hint:'1–1000，最多 6 位小数。先从基础范围抽取整数，再乘倍率并向下取整。'}),
+      field('活动奖励下限','points_min','number',{required:true,min:0,max:1000000,showWhen:v=>v.mode==='range'}),
+      field('活动奖励上限','points_max','number',{required:true,min:0,max:1000000,showWhen:v=>v.mode==='range'}),
+      field('生效范围','section_event','section',{hint:`包含开始和结束当天，按 ${route.timezone||state.settings.timezone} 时区判断；仍受每日签到时段限制。活动同步到同一点数作用域的全部路由。`})
+    ],value,async updated=>{
+      // Hidden controls must not leave invalid values in an otherwise valid event.
+      if(updated.mode==='range')updated.multiplier=existing?.multiplier||'1';
+      else {updated.points_min=existing?.points_min??route.points_min;updated.points_max=existing?.points_max??route.points_max;}
+      const events=[...(getRoute().reward_events||[])];const index=events.findIndex(e=>e.id===updated.id);
+      if(index<0)events.push(updated);else events[index]=updated;
+      await save({reward_events:events});
+    });
+  };
+  const draw=()=>{
+    const route=getRoute();if(!route){dialog.close();return;}
+    dialog.replaceChildren();const head=element('div',null,'dialog-head');head.append(element('h2','签到时段与奖励活动'),button('关闭',()=>dialog.close()));dialog.append(head);
+    const alert=element('p',null,'policy-error status-failed');alert.hidden=true;alert.setAttribute('role','alert');dialog.append(alert);
+    const scope=route.scope||route.umo,shared=state.settings.routes.filter(r=>(r.scope||r.umo)===scope).length;
+    dialog.append(element('p',`${route.display_name||route.umo} · 时区 ${route.timezone||state.settings.timezone}`,'muted'));
+    dialog.append(element('p',`每日开放：${signinWindowLabel(route)} · 基础奖励：${route.points_min}–${route.points_max} ${pointsName()}`));
+    dialog.append(element('div',`作用域 ${scope} 共 ${shared} 条路由共享以下策略。修改时段或活动会同步到这些路由。`, 'note'));
+    const actions=element('div',null,'toolbar');actions.append(button('编辑每日时段',editWindow),button('新增奖励活动',()=>editEvent()),button('预览签到策略',()=>signinPolicyPreview(getRoute())));dialog.append(actions);
+    const events=[...(route.reward_events||[])].sort((a,b)=>b.priority-a.priority||a.start_date.localeCompare(b.start_date)||a.id.localeCompare(b.id));
+    pagedTable(dialog,[['名称','name'],['日期',e=>`${e.start_date} 至 ${e.end_date}`],['奖励',e=>e.mode==='range'?`${e.points_min}–${e.points_max} ${pointsName()}`:`基础奖励 × ${e.multiplier}`],['优先级','priority'],['状态',e=>e.enabled?'启用':'关闭']],events,e=>[
+      button('编辑',()=>editEvent(e)),button(e.enabled?'关闭活动':'启用活动',()=>save({reward_events:getRoute().reward_events.map(item=>item.id===e.id?{...item,enabled:!item.enabled}:item)})),
+      button('删除',async()=>{if(await confirmAction(`删除奖励活动“${e.name}”？已结算的签到奖励不会改变。`))await save({reward_events:getRoute().reward_events.filter(item=>item.id!==e.id)});},'danger small')
+    ],'reward-events:'+scope);
+  };
+  document.body.append(dialog);dialog.addEventListener('close',()=>dialog.remove(),{once:true});draw();dialog.showModal();
 }
 function renameServer(existing) {
   const revision=state.revision;
@@ -326,7 +417,7 @@ function routes() {
   const connections=new Map((state.connections||[]).map(x=>[x.id||x.server_id,x]));
   table(p,[['ID','id'],['显示名称',serverLabel],['鉴权名称','name'],['方式',x=>x.connection_mode==='reverse'?'反向':'正向'],['连接地址',x=>x.connection_mode==='reverse'?`${x.reverse_host}:${x.reverse_port}${x.reverse_path}`:x.url],['状态',x=>!x.enabled?'已关闭':connections.get(x.id)?.connected?'在线':x.connection_mode==='reverse'?'等待连接':'离线']],state.settings.servers,s=>[button('编辑',()=>serverEditor(s)),button('修改 ID',()=>renameServer(s)),button('删除',async()=>{if(await confirmAction('删除服务器前请移除引用它的群路由和指令。有历史数据的服务器请使用修改 ID。继续？'))await saveSettings({servers:state.settings.servers.filter(x=>x.id!==s.id)});},'danger small')]);
   const q=panel('消息转发与群服路由','每个群分别设置转发方向、消息类型和游戏事件开关。',[button('添加路由',()=>routeEditor(),'')]);
-  table(q,[['群显示名称',x=>x.display_name||'QQ群'],['UMO','umo'],['目标服务器',x=>serverLabel(state.settings.servers.find(s=>s.id===x.server_id)||{id:x.server_id})],['方向',x=>[x.qq_to_mc?'QQ → MC':'',x.mc_to_qq?'MC → QQ':''].filter(Boolean).join(' / ')||'已关闭'],['游戏事件',x=>gameEvents.filter(([key])=>x.events?.includes(key)).map(([,name])=>name).join('、')]],state.settings.routes,r=>[button('编辑与开关',()=>routeEditor(r)),button('删除',async()=>{if(await confirmAction('仅移除路由，历史数据保留。继续？'))await saveSettings({routes:state.settings.routes.filter(x=>x.umo!==r.umo)});},'danger small')]);
+  table(q,[['群显示名称',x=>x.display_name||'QQ群'],['UMO','umo'],['目标服务器',x=>serverLabel(state.settings.servers.find(s=>s.id===x.server_id)||{id:x.server_id})],['方向',x=>[x.qq_to_mc?'QQ → MC':'',x.mc_to_qq?'MC → QQ':''].filter(Boolean).join(' / ')||'已关闭'],['签到时段',signinWindowLabel],['游戏事件',x=>gameEvents.filter(([key])=>x.events?.includes(key)).map(([,name])=>name).join('、')]],state.settings.routes,r=>[button('编辑与开关',()=>routeEditor(r)),button('签到时段与活动',()=>signinPolicyDialog(r.umo)),button('删除',async()=>{if(await confirmAction('仅移除路由，历史数据保留。继续？'))await saveSettings({routes:state.settings.routes.filter(x=>x.umo!==r.umo)});},'danger small')]);
 }
 function commandEditor(existing) {
   const value = existing || { id:randomId().slice(0,8),name:'',aliases:[],description:'',enabled:true,require_binding:true,admin_only:true,cooldown_seconds:3,server_id:'',rcon:'',parser:'text',cleanup_prefixes:[],parameters:[],rules:[],templates:{SUCCESS:'{cleaned}',UNKNOWN:'服务器结果未识别，请管理员检查。'} };
@@ -338,7 +429,7 @@ async function saveHelpEntry(actionId, changes) {
 }
 function helpSettings() {
   edit('帮助回复设置',[
-    field('帮助使用图片回复','image_enabled','checkbox',{hint:'开启时 mc帮助 返回图片，内容较长时分页；关闭时返回文字。两种方式使用相同的说明、显示开关和顺序。图片生成失败会回退文字。'})
+    field('帮助使用图片回复','image_enabled','checkbox',{hint:'开启时 mc帮助 返回一张图片，按帮助顺序每列最多 15 条命令，超出自动增加列数；关闭时返回文字。分类标题不占条数。两种方式使用相同的说明、显示开关和顺序；图片生成失败会回退文字。'})
   ],{image_enabled:state.settings.help?.image_enabled!==false},async value=>saveSettings({help:{...(state.settings.help||{}),...value}}));
 }
 function helpEntryEditor(row) {

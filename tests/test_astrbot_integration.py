@@ -349,7 +349,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for image_enabled in (False, True):
             with self.subTest(image_enabled=image_enabled):
                 self.plugin.app.settings.data["help"] = {"image_enabled": image_enabled}
-                with patch.object(self.main, "render_help_pages", side_effect=RuntimeError("没有中文字体")) as render:
+                with patch.object(self.main, "render_help_image", side_effect=RuntimeError("没有中文字体")) as render:
                     await self.plugin._execute_action("help", FakeEvent(user="20002"), "")
                     self.assertEqual(render.call_count, int(image_enabled))
                 message = self.plugin.context.send_message.await_args.args[1].chain[0].text
@@ -357,24 +357,44 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("/领奖", message)
                 self.assertIn("完整命令说明", message)
 
-    async def test_help_sends_every_page_to_captured_umo(self):
+    async def test_help_sends_one_complete_image_to_captured_umo(self):
         from PIL import Image as PillowImage
-        paths = []
-        for index in range(3):
-            path = self.plugin.data_dir / f"page-{index}.png"
-            with PillowImage.new("RGB", (8, 8), "white") as image:
-                image.save(path)
-            paths.append(str(path))
-        event = FakeEvent(user="20002")
-        def render(*args):
+        self.plugin.commands.effective_commands.return_value = [
+            {"handler_name": "cmd_" + action, "effective_command": name, "description": description}
+            for action, name, description in integration.BUILTINS
+        ]
+        event = FakeEvent(user="10001")
+        original_renderer = self.main.render_help_image
+        def render(*args, **kwargs):
             event.unified_msg_origin = "different:GroupMessage:999"
-            return paths
-        with patch.object(self.main, "render_help_pages", side_effect=render):
+            return original_renderer(*args, **kwargs)
+        with patch.object(self.main, "render_help_image", side_effect=render):
             await self.plugin._execute_action("help", event, "")
-        self.assertEqual(self.plugin.context.send_message.await_count, 3)
-        for call in self.plugin.context.send_message.await_args_list:
-            self.assertEqual(call.args[0], "bot:GroupMessage:12345")
-            self.assertIsInstance(call.args[1].chain[0], self.main.Image)
+        self.plugin.context.send_message.assert_awaited_once()
+        call = self.plugin.context.send_message.await_args
+        self.assertEqual(call.args[0], "bot:GroupMessage:12345")
+        self.assertEqual(len(call.args[1].chain), 1)
+        self.assertIsInstance(call.args[1].chain[0], self.main.Image)
+        paths = list((self.plugin.data_dir / "help").glob("*.png"))
+        self.assertEqual(len(paths), 1)
+        with PillowImage.open(paths[0]) as image:
+            for _, name, _ in integration.BUILTINS:
+                self.assertIn("/" + name, image.info["help_text"])
+            self.assertGreater(image.height, 500)
+
+    async def test_help_image_delivery_failure_falls_back_without_resending_image(self):
+        from PIL import Image as PillowImage
+        path = self.plugin.data_dir / "single-help.png"
+        with PillowImage.new("RGB", (8, 8), "white") as image:
+            image.save(path)
+        self.plugin.context.send_message.side_effect = [False, True]
+        with patch.object(self.main, "render_help_image", return_value=str(path)):
+            await self.plugin._execute_action("help", FakeEvent(user="20002"), "")
+        calls = self.plugin.context.send_message.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertIsInstance(calls[0].args[1].chain[0], self.main.Image)
+        self.assertIsInstance(calls[1].args[1].chain[0], self.main.Plain)
+        self.assertTrue(all(call.args[0] == "bot:GroupMessage:12345" for call in calls))
 
     async def test_admin_actions_are_rechecked_in_business_entry(self):
         event = FakeEvent(user="20002")

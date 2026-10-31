@@ -22,3 +22,4 @@
 .pagination label{display:flex;align-items:center;gap:8px}.pagination select{width:auto;padding:7px 10px}.page-count{margin-right:auto}
 .paged-table[aria-busy="true"]{opacity:.65;pointer-events:none;min-height:80px}
 .panel>.chart~small{display:block;line-height:1.8;color:var(--muted)}
+.policy-dialog{width:min(1000px,94vw)}.policy-dialog>.toolbar{margin-top:20px}

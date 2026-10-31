@@ -203,7 +203,7 @@ function globalSettings() {
 }
 function serverEditor(existing) {
   const value={id:randomId().slice(0,8),name:'',display_name:'',connection_mode:'forward',url:'ws://127.0.0.1:8080',token:'',enabled:true,timeout:10,
-    reverse_host:'0.0.0.0',reverse_port:8081,reverse_path:'/queqiao',game_host:'127.0.0.1',game_port:25565,tps_command:'spark tps',mspt_command:'mspt',ping_command:'spark ping',component_version:'legacy',...existing};
+    reverse_host:'0.0.0.0',reverse_port:8081,reverse_path:'/queqiao',game_host:'127.0.0.1',game_port:25565,tps_command:'tps',mspt_command:'mspt',ping_command:'ping',component_version:'legacy',...existing};
   edit(existing?'编辑服务器':'添加服务器',[
     field('服务器身份与显示','section_server','section'),field('服务器 ID','id','text',{readonly:!!existing,required:true}),
     field('QueQiao server_name','name','text',{required:true,hint:'连接鉴权标识，必须与 QueQiao 配置一致。'}),
@@ -279,7 +279,7 @@ function preview(command={name:'LiteSignIn 游戏签到',rcon:'signin click {pla
 }
 function bindings() {
   const p=panel('账号绑定',state.settings.binding_verification_enabled?'验证码已开启：需到游戏验证。解绑保留冷却和历史。':'验证码已关闭：直接按玩家名绑定；未验证身份会明确标记。');
-  table(p,[['QQ','qq_id'],['玩家','player'],['验证状态',x=>x.verified?'已验证':'未验证（玩家名）'],['真实 UUID',x=>x.mc_uuid||'—'],['服务器','server_id'],['变更时间',x=>nowText(x.updated)]],state.domain?.bindings,b=>[button('管理员解绑',async()=>{if(confirm(`解绑 ${b.qq_id} ↔ ${b.player}？冷却仍会保留。`)){await action('binding_unbind',{user_id:b.qq_id});await refresh();}},'danger small')]);
+  table(p,[['QQ','qq_id'],['玩家','player'],['验证状态',x=>x.verified?'已验证':'未验证（玩家名）'],['真实 UUID',x=>x.mc_uuid||'—'],['服务器','server_id'],['变更时间',x=>nowText(x.updated)]],state.domain?.bindings,b=>[button('管理员解绑',async()=>{if(confirm(`解绑 ${b.qq_id} ↔ ${b.player}？本次管理员操作不受 CD 限制，普通用户后续操作仍遵守冷却。`)){const result=await action('binding_unbind',{user_id:b.qq_id});await refresh();output('管理员解绑结果',result.text||'解绑成功。');}},'danger small')]);
   const q=panel('点数账户','余额和冻结额分开显示。管理员调整也写入流水。',[button(currencyLabel('调整点数'),()=>edit(currencyLabel('管理员调整点数'),[field('QQ ID','user_id','text',{required:true}),field('操作','mode','select',{options:[['add','增加'],['sub','扣除'],['set','设置余额']]}),field('数量','amount','number',{min:0,required:true}),field('原因','reason','text',{required:true,wide:true})],{user_id:'',mode:'add',amount:0,reason:'',operation_id:randomId()},async v=>{output('调整结果',await action('points_adjust',{...v,scope:selectedScope}));await refresh();}),'')]);
   scopeSelect(q);table(q,[['QQ','qq_id'],['总点数',x=>x.total??x.balance],['冻结','frozen'],['可用',x=>(x.total??x.balance??0)-(x.frozen||0)]],filtered('balances'));
   const l=panel('最近流水','点数变更均保存来源与操作人。');table(l,[['QQ','qq_id'],['变动','delta'],['变更后','total_after'],['原因','reason'],['操作人','actor'],['时间',x=>nowText(x.created)]],filtered('ledger').slice(0,100));

@@ -1,6 +1,6 @@
 # 完整流程拓扑
 
-本文对应 1.1 版本。运行主体是一个 AstrBot 插件。QQ 消息由现有 NapCat/OneBot 接入，游戏侧使用 Paper 和官方 QueQiao；插件独立管理身份、点数、交付和配置。以下流程已通过离线协议和框架测试，真实 QQ/Paper 服务尚未联调。
+本文对应 1.1.1 版本。运行主体是一个 AstrBot 插件。QQ 消息由现有 NapCat/OneBot 接入，游戏侧使用 Paper 和官方 QueQiao；插件独立管理身份、点数、交付和配置。以下流程已通过离线协议和框架测试，真实 QQ/Paper 服务尚未联调。
 
 [打开完整 SVG 拓扑，可独立查看和放大](architecture.svg)。下方 Mermaid 是可编辑源图；SVG 使用 Mermaid 11.12.0 生成，并通过浏览器验证。
 
@@ -19,19 +19,27 @@ flowchart TB
   AUTH --> ACT[稳定 action ID / Application 调度]
 
   subgraph DOMAIN[统一业务服务]
-    ACT --> BIND[绑定 / 修改 / 解绑 / 查询]
+    ACT --> BIND[绑定 / 修改 / 解绑]
+    ACT --> BINDREAD[绑定查询]
     ACT --> SIGN[签到操作：保存日期与绑定快照]
     ACT --> POINT[点数 / 排行 / 管理调整]
     ACT --> SHOP[点数商店 / 订单 / 确认 / 补领]
     ACT --> CUSTOM[自定义命令：类型化参数 → RCON模板]
+    ACT --> RAWCMD[管理员cmd：无需绑定 / 当前群服务器 / 字面命令]
     ACT --> MONREAD[性能图：历史PNG查询]
     ACT --> CONNSTATE[服务器状态：在线或离线]
     ACT --> LIVEQUERY[TPS / MSPT / PING：实时RCON原文]
-    BIND --> BINDMODE{开启游戏内验证}
+    BIND --> BINDROLE{操作者与身份动作}
+    BINDROLE -->|管理员为自己或他人操作| ADMINBIND[直接办理 / 免本次CD / 无需验证码]
+    BINDROLE -->|普通成员绑定或换绑| BINDMODE{开启游戏内验证}
+    BINDROLE -->|普通成员解绑| UNBIND[检查冷却 / 解除绑定]
     BINDMODE -->|默认关闭| DIRECTBIND[按玩家名直接绑定 / 不伪造UUID]
     BINDMODE -->|开启| CODE[一次性验证码 / 认证玩家事件取得UUID]
-    DIRECTBIND --> IDENTITY[QQ与玩家名唯一 / 已验证UUID唯一 / 变更冷却]
+    DIRECTBIND --> IDENTITY[QQ与玩家名唯一 / 已验证UUID唯一 / 普通成员检查CD]
     CODE --> IDENTITY
+    ADMINBIND --> IDENTITY
+    IDENTITY --> BINDSTATE[保存版本历史与后续普通用户冷却 / 作废旧验证码 / 审计]
+    UNBIND --> BINDSTATE
     SIGN --> GAME[先游戏签到]
     GAME --> PARSE[清洗 → 专用规则 → SIGNED或ALREADY_SIGNED]
     PARSE --> CREDIT[再检查群签到 → 唯一日期事务 → 点数账本]
@@ -44,7 +52,8 @@ flowchart TB
     PROOF -->|成功| SETTLE[扣点与完成订单]
     PROOF -->|明确未发送| RELEASE[取消并释放冻结]
     PROOF -->|未知| UNKNOWN[保留冻结 / 管理员核对 / 禁止自动重发]
-    CUSTOM --> CPARSE[通用清洗 + 每条命令专用解析与回复模板]
+    CUSTOM --> RCONOP[持久保存操作ID与发送状态 / 同消息去重]
+    RAWCMD --> RCONOP
   end
 
   subgraph TRANSPORT[传输与展示]
@@ -56,7 +65,11 @@ flowchart TB
     MEDIA --> COMP
     COMP --> GW[QueQiao网关：鉴权 / echo关联 / 重连 / 不重放副作用]
     GAME <--> GW
-    CUSTOM <--> GW
+    RCONOP -->|新请求| GW
+    GW -->|自定义命令回包| CPARSE[通用清洗 + 每条命令专用解析与回复模板]
+    GW -->|cmd文本回包| CMDCLEAN[通用清洗 / 保留完整RCON文字]
+    GW -->|cmd或自定义命令结果不确定| CMDUNKNOWN[UNKNOWN / 保留操作记录 / 禁止自动重放]
+    CPARSE -->|未知| CMDUNKNOWN
     RCONORDER <--> GW
     LIVEQUERY <--> GW
     GW --> CONNSTATE
@@ -88,11 +101,13 @@ flowchart TB
     CONFIG --> REG[管理行为：每条指令独立注册 / 改名 / 别名 / 启停]
     REG --> AUTH
     API --> ACT
+    API -->|GUI管理员解绑| ADMINBIND
     API --> HISTORY
     API --> PREVIEW[回包清洗和规则预览：不执行命令]
     API --> MIGRATE[显式旧备份 → 只读预览 → 摘要核对 → 单事务导入]
     DB[(SQLite：身份 / 冷却 / 签到 / 账本 / 订单 / 审计)]
-    IDENTITY --> DB
+    BINDSTATE --> DB
+    DB --> BINDREAD
     CREDIT --> DB
     POINT --> DB
     HOLD --> DB
@@ -100,14 +115,20 @@ flowchart TB
     RELEASE --> DB
     UNKNOWN --> DB
     MIGRATE --> DB
-    OPS[(自定义操作记录 / 监控历史 / 媒体索引)]
+    OPS[(持久操作记录：自定义与cmd / 监控历史 / 媒体索引)]
+    RCONOP <--> OPS
     CPARSE --> OPS
+    CMDCLEAN --> OPS
+    CMDUNKNOWN --> OPS
     HISTORY --> OPS
     MEDIA --> OPS
   end
 
   CREDIT --> OUT[按状态渲染回复 / 原始UMO发送]
   CPARSE --> OUT
+  CMDCLEAN --> OUT
+  CMDUNKNOWN --> OUT
+  RCONOP -->|重复消息复用已有状态| OUT
   LIVEQUERY --> CLEANQUERY[共用清洗：保留完整查询文字]
   CLEANQUERY --> OUT
   CONNSTATE --> OUT
@@ -115,7 +136,8 @@ flowchart TB
   PLOT --> OUT
   ROUTE --> OUT
   CODE --> OUT
-  DIRECTBIND --> OUT
+  BINDSTATE --> OUT
+  BINDREAD --> OUT
   SETTLE --> OUT
   UNKNOWN --> OUT
   OUT --> AB
@@ -126,13 +148,14 @@ flowchart TB
 
 1. 消息身份和 UMO 在入口固定。显式指令处理后停止继续流转；只有未被指令、AI 或其他处理器接管的普通群消息进入最后的转发处理器。
 2. 游戏签到是每个新签到请求的第一项外部动作。重复的同一消息投递由操作 ID 去重；新的消息仍先询问游戏，再检查本群签到日期。
-3. RCON 完整回包先经过共用清洗器，再由对应动作规则生成状态和字段，最后由该动作回复模板渲染。未知状态不会被当成成功。
+3. RCON 完整回包先经过共用清洗器。签到与自定义模板动作再用对应规则生成状态和字段、渲染回复；实时查询和管理员 `cmd` 返回完整清洗文本。收到文本不等于已确认游戏内副作用成功，未知状态不会被当成成功。
 4. 订单先冻结可用点数和库存，再交付。外部交付无法与 SQLite 原子提交，因此明确保存 sending/unknown 并要求核对，不承诺网络级“恰好一次”。
 5. 插件重载先拒收并处理在途操作，保存未知结果，最后关闭后台任务和数据库；启动仅恢复可确定的本地事务，不自动重放外部命令。
-6. `binding_verification_enabled` 默认 `false`，用户提交玩家名即直接绑定；开启后才走游戏内验证码。两种模式使用同一套唯一约束、历史、版本和冷却。未验证记录不伪造 UUID。
+6. 普通成员的绑定与换绑按 `binding_verification_enabled` 选择验证模式，默认 `false` 直接按玩家名办理；普通解绑检查冷却。管理员为他人或自己绑定、换绑、解绑均直接办理，免本次 CD 且无需验证码，GUI 管理员解绑使用同一路径。唯一约束继续生效，成功后作废旧验证码，保留历史、版本及后续普通用户操作的冷却；未验证记录不伪造 UUID。
 7. 正向由插件发起连接；反向由 QueQiao 发起，多服可以共用监听端口和路径，按 `server_name` 分流且必须使用 token。两种方向共用请求关联、事件分发与不确定结果策略。
-8. `状态` 读取连接状态，仅回复在线/离线；`tps`、`mspt`、`ping` 清洗后回复 RCON 原文；`性能图` 单独返回历史 PNG，后台自动采样与 GUI 曲线继续保留。
+8. `服务器状态` 读取连接状态，仅回复在线/离线；`tps`、`mspt`、`ping` 默认调用同名 RCON 命令并清洗后回复原文；`性能图` 单独返回历史 PNG，后台自动采样与 GUI 曲线继续保留。普通 `ping` 没有可解析毫秒数时保留缺失点，不伪造数值，QQ 仍能看到实际回包。
 9. QQ 原公开附件地址直接转为点击链接；媒体缓存是可选项。引用从当前会话取得完整链并验证归属，支持颜色悬浮。原版客户端使用链接访问图片/语音/视频，不生成 ChatImage CICode。
+10. 管理员 `cmd cmi ping rincho` 将字面命令发往当前群路由服务器，无需绑定；JSON 中的花括号不做模板插值。它与自定义命令共用持久操作记录，同一 UMO/消息 ID/action 不重复发送，UNKNOWN 不自动重放。`cmd` 是手工控制台操作，不创建商店订单或冻结点数，回复回到原 UMO。
 
 ## 代码布局
 
@@ -142,7 +165,7 @@ adapters/astrbot_commands.py   4.29 指令注册兼容层
 core/config.py                配置模型和原子持久化
 core/text.py                  清洗、解析和模板
 core/store.py                 事务账本、身份、订单和迁移
-services/application.py       组合入口和自定义动作
+services/application.py       组合入口、自定义动作和管理员cmd
 services/domain.py            绑定、签到和商店
 services/gateway.py           QueQiao V2
 services/media.py             只读限时媒体服务

@@ -200,9 +200,9 @@ class Monitor:
             server = self.settings.server(server_id)
             result = {"server_id": server_id, "timestamp": time.time(), "tps": None, "mspt": None, "player_ping_ms": None, "slp_rtt_ms": None, "values": {}, "errors": []}
             for key, command_key, parser, default in (
-                ("tps", "tps_command", parse_tps, "spark tps"),
+                ("tps", "tps_command", parse_tps, "tps"),
                 ("mspt", "mspt_command", parse_mspt, "mspt"),
-                ("player_ping_ms", "ping_command", parse_ping, "spark ping"),
+                ("player_ping_ms", "ping_command", parse_ping, "ping"),
             ):
                 command = str(server.get(command_key, default)).strip()
                 if not command:

@@ -266,20 +266,26 @@ class Store:
             db.execute("INSERT INTO binding_challenges VALUES(?,?,?,?,?,?)", (digest, str(qq_id), player, server_id, umo, now + ttl))
             return dict(code=code, expires=now + ttl, already=False)
 
-    def bind_name(self, qq_id, player, server_id, cooldown_seconds, *, rebind=False, now=None):
+    def bind_name(self, qq_id, player, server_id, cooldown_seconds, *, rebind=False, actor=None, force=False, now=None):
         """Bind a declared player name without claiming a verified Minecraft UUID."""
         player = self._player_name(player)
         now = time.time() if now is None else now
         with self.connection(True) as db:
             old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
             if old and old["player"].casefold() == player.casefold() and old["server_id"] == server_id:
+                if force:
+                    cancelled = db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (str(qq_id),)).rowcount
+                    self._audit(db, "binding_admin_confirm", str(actor or qq_id), {
+                        "target": str(qq_id), "identity": old["identity"], "version": old["version"],
+                        "cancelled_challenges": cancelled, "admin_override": True})
                 return dict(already=True, binding=self._binding_value(old))
             if old and not rebind:
                 raise DomainError("已经绑定其他游戏账号，请使用修改绑定")
-            value = self._save_binding(db, str(qq_id), player, server_id, None, cooldown_seconds, now)
+            value = self._save_binding(db, str(qq_id), player, server_id, None, cooldown_seconds, now,
+                                       actor=actor, force=force)
             return dict(already=False, binding=value)
 
-    def _save_binding(self, db, qq_id, player, server_id, mc_uuid, cooldown_seconds, now):
+    def _save_binding(self, db, qq_id, player, server_id, mc_uuid, cooldown_seconds, now, *, actor=None, force=False):
         old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (qq_id,)).fetchone()
         identity = "uuid:" + mc_uuid if mc_uuid else "name:" + player.casefold()
         owner = db.execute("SELECT qq_id FROM bindings WHERE identity=? OR lower(player)=lower(?)", (identity, player)).fetchall()
@@ -294,7 +300,8 @@ class Store:
         # Proving ownership of the same declared name is not a rebind. Preserve
         # its remaining cooldown, but never bypass a UUID's own existing cooldown.
         check_keys = {"mc:" + mc_uuid} if upgrade else identities
-        self._check_cooldowns(db, check_keys, now)
+        if not force:
+            self._check_cooldowns(db, check_keys, now)
         history_count = db.execute("SELECT COUNT(*) FROM binding_history WHERE qq_id=?", (qq_id,)).fetchone()[0]
         value["version"] = max(int(old["version"]) if old else 0, history_count) + 1
         db.execute("""INSERT INTO bindings(qq_id,identity,mc_uuid,player,server_id,version,updated,verified)
@@ -306,8 +313,12 @@ class Store:
         for key in identities:
             db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)", (key, until))
         db.execute("INSERT INTO binding_history(qq_id,old_binding,new_binding,actor,created) VALUES(?,?,?,?,?)",
-                   (qq_id, encode(dict(old)) if old else None, encode(value), qq_id, now))
-        db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (qq_id,))
+                   (qq_id, encode(dict(old)) if old else None, encode(value), str(actor or qq_id), now))
+        cancelled = db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (qq_id,)).rowcount
+        self._audit(db, "binding_rebind" if old else "binding_bind", str(actor or qq_id), {
+            "target": qq_id, "old_identity": old["identity"] if old else None,
+            "identity": identity, "version": value["version"], "admin_override": bool(force),
+            "cancelled_challenges": cancelled})
         return value
 
     def complete_binding(self, code, mc_uuid, player, server_id, cooldown_seconds, *, now=None):
@@ -330,17 +341,30 @@ class Store:
         with self.connection(True) as db:
             old = db.execute("SELECT * FROM bindings WHERE qq_id=?", (str(qq_id),)).fetchone()
             if not old:
+                pending = db.execute("SELECT * FROM binding_challenges WHERE qq_id=?", (str(qq_id),)).fetchone() if force else None
+                if pending:
+                    db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (str(qq_id),))
+                    for identity in ("qq:" + str(qq_id), "name:" + pending["player"].casefold()):
+                        db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)",
+                                   (identity, now + max(0, int(cooldown_seconds))))
+                    self._audit(db, "binding_pending_cancel", str(actor or qq_id), {
+                        "target": str(qq_id), "player": pending["player"], "admin_override": True,
+                        "cancelled_challenges": 1})
+                    return {"qq_id": str(qq_id), "player": pending["player"], "cancelled_pending": True}
                 raise DomainError("尚未绑定游戏账号")
             identities = self._binding_identities(old)
             if not force:
                 self._check_cooldowns(db, identities, now)
             db.execute("DELETE FROM bindings WHERE qq_id=?", (str(qq_id),))
-            db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (str(qq_id),))
+            cancelled = db.execute("DELETE FROM binding_challenges WHERE qq_id=?", (str(qq_id),)).rowcount
             for identity in identities:
                 db.execute("INSERT INTO binding_cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until_time=MAX(until_time,excluded.until_time)",
                            (identity, now + max(0, int(cooldown_seconds))))
             db.execute("INSERT INTO binding_history(qq_id,old_binding,new_binding,actor,created) VALUES(?,?,?,?,?)",
                        (str(qq_id), encode(dict(old)), None, str(actor or qq_id), now))
+            self._audit(db, "binding_unbind", str(actor or qq_id), {
+                "target": str(qq_id), "old_identity": old["identity"], "version": old["version"],
+                "admin_override": bool(force), "cancelled_challenges": cancelled})
             return self._binding_value(old)
 
     def begin_signin(self, operation_id, scope, qq_id, day, points, binding, umo):

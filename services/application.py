@@ -128,6 +128,10 @@ class Application:
         if not route or not route.get("enabled", True):
             return {"status": "DISABLED", "text": "当前会话尚未启用，请管理员在插件 GUI 配置群服路由。"}
         ctx = {**ctx, "scope": route.get("scope", ctx["umo"]), "server_id": ctx.get("server_id") or route["server_id"]}
+        if action == "rcon":
+            # The raw administrator action always addresses this conversation's
+            # configured server, never a caller-supplied context override.
+            return await self._raw_rcon({**ctx, "server_id": route["server_id"]}, args)
         if action.startswith("custom:"):
             return await self._custom(action[7:], ctx, args)
         if action == "status":
@@ -175,6 +179,32 @@ class Application:
             return {"status": "SUCCESS", "text": result.get("text", "订单核对已记录。")}
         return await self.domain.execute(action, ctx, args)
 
+    async def _raw_rcon(self, ctx: dict, args: str) -> dict:
+        if not ctx.get("is_admin"):
+            return {"status": "DENIED", "text": "这条命令需要管理员权限。"}
+        message_id = ctx.get("request_id") or ctx.get("message_id")
+        if message_id in (None, "", 0, "0") or not str(message_id).strip():
+            return {"status": "DENIED", "text": "缺少稳定的消息标识，未执行游戏命令。"}
+        # This is intentionally not a template: JSON braces, quotes and literal
+        # escapes belong to the console command and must remain untouched.
+        command = str(args or "").strip().lstrip("/")
+        if not command or any(char in command for char in ("\n", "\r", "\x00")):
+            raise ValueError("每次只能执行一条非空 RCON 指令；用法：cmd 游戏命令")
+        try:
+            byte_count = len(command.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("RCON 指令包含无效的 Unicode 字符") from exc
+        if byte_count > 1446:
+            raise ValueError("RCON 指令超过 1446 字节")
+        action_key = "builtin:rcon"
+        run_id = hashlib.sha256(f"{ctx['umo']}|{message_id}|{action_key}".encode()).hexdigest()
+
+        def received(raw):
+            return "RECEIVED", clean_text(raw) or "服务器返回了空内容；命令执行结果请在游戏内核对。"
+
+        return await self._run_rcon_once(ctx, run_id, action_key, ctx["server_id"], command, received,
+                                         audit_action="rcon")
+
     async def _custom(self, command_id: str, ctx: dict, args: str) -> dict:
         command = next((c for c in self.settings.data["commands"] if c["id"] == command_id), None)
         if not command or not command.get("enabled", True):
@@ -213,46 +243,62 @@ class Application:
                 raise ValueError("参数只能包含文字、数字、下划线及 . : / -")
             values[param["name"]] = value
         rendered = render_command(command["rcon"], values)
+        # Keep the v1 custom-command key exactly: old events must remain deduped
+        # after upgrading to the shared executor.
         message_id = ctx.get("message_id") or uuid.uuid4().hex
         run_id = hashlib.sha256(f"{ctx['umo']}|{message_id}|{command_id}".encode()).hexdigest()
+
+        def render_result(raw):
+            parser = command.get("parser", "rules")
+            if parser == "litesignin":
+                result = parse_signin(raw, player)
+            elif parser == "text":
+                result = {"status": "SUCCESS", "fields": {}, "cleaned": clean_text(raw, command.get("cleanup_prefixes", []))}
+            else:
+                result = parse_rules(raw, command.get("rules", []), player or None, command.get("cleanup_prefixes", []))
+            status = result["status"]
+            fields = {**values, **result.get("fields", {}), "cleaned": result["cleaned"], "rcon": clean_text(raw), "status": status}
+            template = command.get("templates", {}).get(status, "服务器结果未识别，请管理员检查解析规则。")
+            return status, render_template(template, fields)
+
+        return await self._run_rcon_once(ctx, run_id, command_id, server_id, rendered, render_result,
+                                         cooldown_seconds=command.get("cooldown_seconds", 3))
+
+    async def _run_rcon_once(self, ctx: dict, run_id: str, action: str, server_id: str,
+                             command: str, render_result, *, cooldown_seconds=0, audit_action=None) -> dict:
+        """Persist before sending and cache every terminal result, including unknowns."""
         if len(self._cooldowns) > 1024:
             self._cooldowns = {k: v for k, v in self._cooldowns.items() if v > time.monotonic()}
-        async with self._locks.setdefault(run_id, asyncio.Lock()):
+        lock = self._locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
             previous = self._ops.execute("SELECT status,text FROM runs WHERE id=?", (run_id,)).fetchone()
             if previous:
                 return {"status": previous["status"], "text": previous["text"] or "该请求正在处理或等待核对，请勿重复提交。"}
-            key = (command_id, ctx["umo"], ctx["user_id"])
+            key = (action, ctx["umo"], ctx["user_id"])
             remaining = self._cooldowns.get(key, 0) - time.monotonic()
             if remaining > 0:
                 return {"status": "COOLDOWN", "text": f"请等待 {int(remaining) + 1} 秒后再使用。"}
-            self._cooldowns[key] = time.monotonic() + command.get("cooldown_seconds", 3)
+            self._cooldowns[key] = time.monotonic() + cooldown_seconds
             now = time.time()
-            self._ops.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?)", (run_id, ctx["umo"], command_id, server_id, "SENDING", "", now, now))
-            self._ops.commit()
+            with self._ops:
+                self._ops.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?)", (run_id, ctx["umo"], action, server_id, "SENDING", "", now, now))
+                if audit_action:
+                    self._ops.execute("INSERT INTO audit(actor,action,detail,created_at) VALUES (?,?,?,?)",
+                                      (str(ctx["user_id"]), audit_action, json.dumps({"server_id": server_id, "run_id": run_id}), now))
             try:
-                raw = await self.gateway.rcon(server_id, rendered)
-                parser = command.get("parser", "rules")
-                if parser == "litesignin":
-                    result = parse_signin(raw, player)
-                elif parser == "text":
-                    result = {"status": "SUCCESS", "fields": {}, "cleaned": clean_text(raw, command.get("cleanup_prefixes", []))}
-                else:
-                    result = parse_rules(raw, command.get("rules", []), player or None, command.get("cleanup_prefixes", []))
-                status = result["status"]
-                fields = {**values, **result.get("fields", {}), "cleaned": result["cleaned"], "rcon": clean_text(raw), "status": status}
-                template = command.get("templates", {}).get(status, "服务器结果未识别，请管理员检查解析规则。")
-                text = render_template(template, fields)
+                raw = await self.gateway.rcon(server_id, command)
+                status, text = render_result(raw)
             except GatewayUnavailable:
                 status, text = "FAILED", "服务器未连接，命令未发送。"
             except OutcomeUnknown:
                 status, text = "UNKNOWN", "命令已发出但结果未确认，请管理员核对；不会自动重发。"
             except GatewayError:
-                status, text = "FAILED", "服务器接口返回错误，请管理员检查诊断记录。"
+                status, text = "UNKNOWN", "服务器接口返回错误，命令执行结果待核对；不会自动重发。"
             except asyncio.CancelledError:
                 self._finish_run(run_id, "UNKNOWN", "插件重载或停止，命令执行结果待核对。")
                 raise
             except Exception as exc:
-                log.error("[Yuma MCQQ] 自定义命令处理失败，action=%s (%s)", command_id, type(exc).__name__)
+                log.error("[Yuma MCQQ] 命令处理失败，action=%s (%s)", action, type(exc).__name__)
                 status, text = "UNKNOWN", "命令结果处理失败，请管理员核对。"
             self._finish_run(run_id, status, text)
             return {"status": status, "text": text}

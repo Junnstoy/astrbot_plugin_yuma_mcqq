@@ -102,6 +102,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.app.gateway.rcon.assert_not_awaited()
 
     async def test_metric_commands_return_rcon_text_and_status_only_connectivity(self):
+        self.assertEqual(self.app.settings.server('paper')['tps_command'],'tps')
+        self.assertEqual(self.app.settings.server('paper')['ping_command'],'ping')
         self.app.gateway.rcon = AsyncMock(return_value='Rcon:§a[性能] TPS: 19.8, 20, 20')
         for action in ('tps', 'mspt', 'ping'):
             result = await self.app.execute(action, self.ctx)
@@ -114,6 +116,14 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.app.gateway, 'status', return_value=[]):
             self.assertEqual((await self.app.execute('status', self.ctx))['text'], '离线')
         self.assertEqual(self.app.gateway.rcon.await_count, count)
+
+    async def test_dashboard_unbind_during_cooldown_without_force_payload(self):
+        self.app.store.bind_name('100001','TestPlayer','paper',604800)
+        result = await self.app.web('binding_unbind',{'user_id':'100001'},'dashboard:tester')
+        self.assertIsNone(self.app.store.binding('100001'))
+        self.assertIn('TestPlayer',result['text'])
+        record = self.app._ops.execute('SELECT actor,action FROM audit ORDER BY id DESC LIMIT 1').fetchone()
+        self.assertEqual(tuple(record),('dashboard:tester','binding_unbind'))
 
     async def test_metric_timeout_does_not_fabricate_a_measurement(self):
         self.app.gateway.rcon = AsyncMock(side_effect=module.OutcomeUnknown('no response'))

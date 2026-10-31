@@ -59,6 +59,46 @@ class Domain:
     def _same_binding(self, left, right):
         return self._binding_identity(left) == self._binding_identity(right) and left.get("version") == right.get("version")
 
+    @staticmethod
+    def _target_qq(value):
+        value = str(value).strip()
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", value):
+            raise DomainError("目标 QQ 号必须是有效的数字 ID")
+        return value
+
+    def _binding_arguments(self, action, ctx, args):
+        """Resolve admin targets while preserving members' valid numeric MC names."""
+        tokens, user = args.split(), str(ctx["user_id"])
+        if action == "unbind":
+            if not tokens:
+                return user, None
+            self._admin_only(ctx)
+            if len(tokens) != 1:
+                raise DomainError("用法：解绑；管理员可使用：解绑 QQ号")
+            return self._target_qq(tokens[0]), None
+        command = "修改绑定" if action == "rebind" else "绑定"
+        if len(tokens) == 1 and (not tokens[0].isdigit() or not ctx.get("is_admin", False)):
+            return user, validate_player(tokens[0])
+        if len(tokens) == 2:
+            self._admin_only(ctx)
+            return self._target_qq(tokens[0]), validate_player(tokens[1])
+        raise DomainError(f"用法：{command} MC名；管理员代操作：{command} QQ号 MC名（QQ号后必须填写 MC名）")
+
+    def _admin_binding(self, action, target, actor, *, player=None, server_id=None):
+        """Shared trusted path for command admins and authenticated GUI admins."""
+        target = self._target_qq(target)
+        cooldown = self.settings.data.get("binding_cooldown_seconds", 86400)
+        if action == "unbind":
+            return self.store.unbind(target, cooldown, actor=str(actor), force=True)
+        return self.store.bind_name(target, player, server_id, cooldown, rebind=action == "rebind",
+                                    actor=str(actor), force=True)
+
+    def _unbind_message(self, result, *, admin=False):
+        if result.get("cancelled_pending"):
+            return f"已取消 QQ {result['qq_id']} 的待验证绑定（{result['player']}），原验证码已作废。"
+        target = f"QQ {result['qq_id']} 的 " if admin else ""
+        return f"已解绑 {target}{result['player']}，{self._points_name()}和签到记录保留；普通用户再次绑定仍受冷却限制。"
+
     async def execute(self, action, ctx, args=""):
         """Execute a verified AstrBot command without importing AstrBot itself."""
         args = str(args or "").strip()
@@ -70,9 +110,13 @@ class Domain:
             user = str(ctx["user_id"])
             points_name = self._points_name()
             if action in {"binding", "rebind"}:
-                player = validate_player(args)
+                target, player = self._binding_arguments(action, ctx, args)
+                if ctx.get("is_admin", False):
+                    result = self._admin_binding(action, target, user, player=player, server_id=ctx["server_id"])
+                    label = f"QQ {target} " if target != user else ""
+                    return self._result(label + ("当前已经绑定 " if result["already"] else "绑定成功：") + result["binding"]["player"])
                 if not self.settings.data.get("binding_verification_enabled", False):
-                    result = self.store.bind_name(user, player, ctx["server_id"], self.settings.data.get("binding_cooldown_seconds", 86400), rebind=action == "rebind")
+                    result = self.store.bind_name(target, player, ctx["server_id"], self.settings.data.get("binding_cooldown_seconds", 86400), rebind=action == "rebind", actor=user)
                     return self._result(("当前已经绑定 " if result["already"] else "绑定成功：") + result["binding"]["player"])
                 result = self.store.begin_binding(user, player, ctx["server_id"], ctx["umo"], rebind=action == "rebind")
                 if result["already"]:
@@ -86,8 +130,10 @@ class Domain:
                 identity_text = f"UUID：{bound['mc_uuid']}（已验证）" if bound["verified"] else "绑定方式：玩家名（未验证）"
                 return self._result(f"当前绑定：{bound['player']}\n{identity_text}\n变更冷却剩余：{seconds} 秒")
             if action == "unbind":
-                old = self.store.unbind(user, self.settings.data.get("binding_cooldown_seconds", 86400))
-                return self._result(f"已解绑 {old['player']}，{points_name}和签到记录保留；再次绑定仍受冷却限制。")
+                target, _ = self._binding_arguments(action, ctx, args)
+                is_admin = bool(ctx.get("is_admin", False))
+                old = self._admin_binding(action, target, user) if is_admin else self.store.unbind(target, self.settings.data.get("binding_cooldown_seconds", 86400), actor=user)
+                return self._result(self._unbind_message(old, admin=is_admin))
             if action == "signin":
                 return await self._signin(ctx, route, args)
             if action == "balance":
@@ -362,7 +408,8 @@ class Domain:
                 raise DomainError("点数调整需要唯一 operation_id")
             return self.store.adjust_points(scope, str(payload["user_id"]), str(payload["mode"]), payload["amount"], actor, str(payload["operation_id"]), str(payload.get("reason", "")))
         if action == "binding_unbind":
-            return self.store.unbind(str(payload["user_id"]), self.settings.data.get("binding_cooldown_seconds", 86400), actor=actor, force=bool(payload.get("force", False)))
+            result = self._admin_binding("unbind", payload["user_id"], actor)
+            return dict(result, text=self._unbind_message(result, admin=True))
         if action == "import_preview":
             return self.store.preview_legacy(str(payload["path"]))
         if action == "import_apply":

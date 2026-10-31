@@ -6,10 +6,12 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import sqlite3
 import time
+import tempfile
 import uuid
 import weakref
 from datetime import datetime
@@ -17,8 +19,8 @@ from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ..core.config import Settings
-from ..core.store import Store
+from ..core.config import Settings, validate
+from ..core.store import Store, remap_server_references
 from ..core.text import clean_text, parse_rules, parse_signin, render_command, render_template, validate_player
 from .domain import Domain
 from .gateway import Gateway, GatewayError, GatewayUnavailable, OutcomeUnknown
@@ -35,6 +37,9 @@ def tracked(method):
     async def call(self, *args, **kwargs):
         if self._closing:
             raise RuntimeError("插件正在停止，请稍后重试")
+        recovering_rename = method.__name__ == "web" and (args[0] if args else kwargs.get("action")) == "server_rename"
+        if self._maintenance and not recovering_rename:
+            raise RuntimeError("服务器 ID 正在迁移，请稍后重试；未执行新的操作")
         task = asyncio.current_task()
         self._active[task] = self._active.get(task, 0) + 1
         try:
@@ -65,6 +70,8 @@ class Application:
         self._settings_lock = asyncio.Lock()
         self._closed = False
         self._closing = False
+        self._maintenance = False
+        self._rename_drain_seconds = 5
         self._active: dict[asyncio.Task, int] = {}
         self._ops = sqlite3.connect(self.data_dir / "operations.sqlite3")
         self._ops.row_factory = sqlite3.Row
@@ -73,6 +80,23 @@ class Application:
         self._ops.execute("CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, actor TEXT, action TEXT, detail TEXT, created_at REAL)")
         self._ops.execute("UPDATE runs SET status='UNKNOWN',text='进程中断，命令执行结果待核对。' WHERE status='SENDING'")
         self._ops.commit()
+        # Recover before domain recovery, connections or any external delivery.
+        if self._rename_path.exists():
+            self._maintenance = True
+            try:
+                self._finish_server_rename()
+                self._rename_path.unlink()
+            except BaseException:
+                self._ops.close()
+                if self.monitor._db is not None:
+                    self.monitor._db.close()
+                    self.monitor._db = None
+                raise
+            self._maintenance = False
+
+    @property
+    def _rename_path(self):
+        return self.data_dir / "server-rename.json"
 
     async def start(self, on_game_message_callback):
         self._send = on_game_message_callback
@@ -110,11 +134,22 @@ class Application:
             if self._send:
                 await self._send(umo, message)
 
+    @tracked
+    async def relay_from_qq(self, event, route=None):
+        # Resolve again inside the maintenance gate; callers may hold an old dict.
+        route = self.settings.route(str(event.unified_msg_origin))
+        if route and self.settings.data.get("enabled", True) and route.get("enabled", True) and route.get("qq_to_mc", True):
+            await self.relay.from_qq(event, route)
+
     def revision(self) -> str:
-        return hashlib.sha256(json.dumps(self.settings.data, sort_keys=True).encode()).hexdigest()[:16]
+        return self._configuration_revision(self.settings.data)
+
+    @staticmethod
+    def _configuration_revision(data):
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
     def snapshot(self) -> dict:
-        return {"settings": self.settings.public(), "revision": self.revision(),
+        return {"settings": self.settings.public(), "revision": self.revision(), "maintenance": self._maintenance,
                 "connections": self.gateway.status(), "domain": self.store.snapshot(),
                 "monitor": self.monitor.status(), "media": self.media.status(),
                 "runs": [dict(r) for r in self._ops.execute("SELECT id,action,server_id,status,created_at,updated_at FROM runs ORDER BY created_at DESC LIMIT 100")],
@@ -127,7 +162,10 @@ class Application:
         route = self.settings.route(ctx.get("umo", ""))
         if not route or not route.get("enabled", True):
             return {"status": "DISABLED", "text": "当前会话尚未启用，请管理员在插件 GUI 配置群服路由。"}
-        ctx = {**ctx, "scope": route.get("scope", ctx["umo"]), "server_id": ctx.get("server_id") or route["server_id"]}
+        # AstrBot may have awaited command-management lookup after constructing
+        # ctx. A completed rename during that await makes its server ID stale.
+        # Explicit custom/performance targets are resolved by their own handlers.
+        ctx = {**ctx, "scope": route.get("scope", ctx["umo"]), "server_id": route["server_id"]}
         if action == "rcon":
             # The raw administrator action always addresses this conversation's
             # configured server, never a caller-supplied context override.
@@ -312,6 +350,11 @@ class Application:
         if not isinstance(payload, dict):
             raise ValueError("请求数据必须是对象")
         # These endpoints are only exposed through AstrBot's authenticated plugin API.
+        if action == "server_rename":
+            return await self._rename_server(payload, actor)
+        if action == "dashboard_page":
+            from .dashboard import read_page
+            return read_page(self.store, self._ops, payload)
         if action == "settings":
             async with self._settings_lock:
                 expected = payload.get("revision")
@@ -319,6 +362,11 @@ class Application:
                     raise ValueError("配置已由其他页面修改，请刷新后再编辑")
                 patch = payload.get("settings", payload)
                 previous = copy.deepcopy(self.settings.data)
+                if isinstance(patch, dict) and isinstance(patch.get("servers"), list):
+                    remaining = {item.get("id") for item in patch["servers"] if isinstance(item, dict)}
+                    for server in previous["servers"]:
+                        if server["id"] not in remaining and self._server_references(server["id"]):
+                            raise ValueError("服务器仍有关联数据；修改 ID 请使用专门的服务器 ID 重命名操作")
                 result = self.settings.save(patch)
                 try:
                     await self.gateway.reload()
@@ -380,6 +428,143 @@ class Application:
         result = await self.domain.admin(action, payload, actor)
         self._audit(actor, action, "后台操作完成")
         return result
+
+    def _server_references(self, server_id):
+        count = (self.store.server_references(server_id) + self.monitor.server_references(server_id)
+                 + self._ops.execute("SELECT COUNT(*) FROM runs WHERE server_id=?", (server_id,)).fetchone()[0])
+        for row in self._ops.execute("SELECT detail FROM audit"):
+            try:
+                value = json.loads(row[0])
+            except (TypeError, ValueError):
+                count += row[0] == "server=" + server_id
+            else:
+                count += remap_server_references(value, server_id, None) != value
+        return count
+
+    def _renamed_settings(self, old_id, new_id):
+        candidate = copy.deepcopy(self.settings.data)
+        old = next((item for item in candidate["servers"] if item["id"] == old_id), None)
+        new = next((item for item in candidate["servers"] if item["id"] == new_id), None)
+        if old is None:
+            if new is None:
+                raise ValueError("服务器重命名记录与当前配置不一致，请恢复配置备份后重试")
+        else:
+            if new is not None:
+                raise ValueError("目标服务器 ID 已存在，不能合并两个服务器")
+            old["id"] = new_id
+        for collection in (candidate["routes"], candidate["commands"]):
+            for item in collection:
+                if item.get("server_id") == old_id:
+                    item["server_id"] = new_id
+        return validate(candidate)
+
+    def _write_rename_journal(self, value):
+        fd, name = tempfile.mkstemp(prefix=".server-rename-", suffix=".json", dir=self.data_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self._rename_path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def _finish_server_rename(self):
+        """Idempotent forward recovery. The journal contains no tokens/rewards."""
+        journal = json.loads(self._rename_path.read_text(encoding="utf-8"))
+        old_id, new_id, operation_id = journal["old_id"], journal["new_id"], journal["operation_id"]
+        if self.revision() not in (journal["source_revision"], journal["target_revision"]):
+            raise ValueError("迁移期间配置被其他方式修改，请恢复迁移前或迁移后的配置备份再重载")
+        candidate = self._renamed_settings(old_id, new_id)
+        counts = {"domain": self.store.rename_server(old_id, new_id, journal["actor"], operation_id)}
+        with self._ops:
+            self._ops.execute("CREATE TABLE IF NOT EXISTS server_renames(id TEXT PRIMARY KEY,old_id TEXT,new_id TEXT,count INTEGER)")
+            previous = self._ops.execute("SELECT old_id,new_id,count FROM server_renames WHERE id=?", (operation_id,)).fetchone()
+            if previous:
+                if (previous[0], previous[1]) != (old_id, new_id):
+                    raise ValueError("命令记录重命名操作不匹配")
+                counts["runs"] = previous[2]
+            else:
+                counts["runs"] = self._ops.execute("UPDATE runs SET server_id=? WHERE server_id=?", (new_id, old_id)).rowcount
+                for row in self._ops.execute("SELECT id,detail FROM audit").fetchall():
+                    detail = row["detail"]
+                    try:
+                        value = json.loads(detail)
+                    except (TypeError, ValueError):
+                        renamed = "server=" + new_id if detail == "server=" + old_id else detail
+                    else:
+                        renamed = json.dumps(remap_server_references(value, old_id, new_id), ensure_ascii=False)
+                    if renamed != detail:
+                        self._ops.execute("UPDATE audit SET detail=? WHERE id=?", (renamed, row["id"]))
+                self._ops.execute("INSERT INTO server_renames VALUES(?,?,?,?)", (operation_id, old_id, new_id, counts["runs"]))
+                self._ops.execute("INSERT INTO audit(actor,action,detail,created_at) VALUES(?,?,?,?)",
+                                  (journal["actor"], "server_rename", json.dumps({"old_id": old_id, "new_id": new_id, "operation_id": operation_id}), time.time()))
+        counts["samples"] = self.monitor.rename_server(old_id, new_id, operation_id)
+        self.settings.save(candidate)
+        return {"from": old_id, "to": new_id, "counts": counts}
+
+    async def _rename_server(self, payload, actor):
+        old_id, new_id = payload.get("server_id"), payload.get("new_server_id")
+        if not isinstance(old_id, str) or not isinstance(new_id, str) or old_id == new_id:
+            raise ValueError("请填写不同的原服务器 ID 和新服务器 ID")
+        async with self._settings_lock:
+            pending = self._rename_path.exists()
+            if pending:
+                journal = json.loads(self._rename_path.read_text(encoding="utf-8"))
+                if (old_id, new_id) != (journal["old_id"], journal["new_id"]):
+                    raise ValueError("已有服务器 ID 迁移待恢复，请先重试原重命名请求或重载插件")
+            else:
+                if payload.get("revision") != self.revision():
+                    raise ValueError("配置已由其他页面修改或缺少版本，请刷新后再重命名")
+                self.settings.server(old_id)
+                self._renamed_settings(old_id, new_id)  # Validate before pausing or writing.
+                if self._server_references(new_id):
+                    raise ValueError("目标服务器 ID 已有关联历史数据，不能合并；请选择其他 ID")
+            self._maintenance = True
+            try:
+                active = [task for task in self._active if task is not asyncio.current_task()]
+                if active:
+                    _, unfinished = await asyncio.wait(active, timeout=self._rename_drain_seconds)
+                    for task in unfinished:
+                        task.cancel()
+                    if unfinished:
+                        await asyncio.gather(*unfinished, return_exceptions=True)
+                await self.monitor.close()
+                await self.gateway.close()
+                if not pending:
+                    # Persist bootstrap configurations before creating a minimal journal.
+                    self.settings.save(self.settings.data)
+                    self._write_rename_journal({"old_id": old_id, "new_id": new_id,
+                                                "operation_id": uuid.uuid4().hex, "actor": str(actor),
+                                                "source_revision": self.revision(),
+                                                "target_revision": self._configuration_revision(self._renamed_settings(old_id, new_id))})
+                renamed = self._finish_server_rename()
+                # Clear relay caches carrying the previous server ID. No deliveries occur.
+                await self.relay.close()
+                if not self._closing:
+                    await self.gateway.start()
+                    await self.monitor.start()
+                self._rename_path.unlink()
+                self._maintenance = False
+                return {"status": "SUCCESS", "text": f"服务器 ID 已从 {old_id} 修改为 {new_id}，关联记录已迁移。",
+                        "settings": self.settings.public(), "revision": self.revision(), "renamed": renamed}
+            except BaseException:
+                if self._rename_path.exists():
+                    # Mixed-file state is inaccessible until a retry/startup finishes it.
+                    self._maintenance = True
+                    for component in (self.monitor, self.gateway):
+                        try:
+                            await component.close()
+                        except Exception as exc:
+                            log.error("[Yuma MCQQ] 迁移维护组件关闭失败 (%s)", type(exc).__name__)
+                    log.error("[Yuma MCQQ] 服务器 ID 迁移待恢复；请重试相同请求或重载插件")
+                else:
+                    self._maintenance = False
+                    if not self._closing:
+                        await self.gateway.start()
+                        await self.monitor.start()
+                raise
 
     def _audit(self, actor: str, action: str, detail: str):
         self._ops.execute("INSERT INTO audit(actor,action,detail,created_at) VALUES (?,?,?,?)", (actor, action, detail, time.time()))

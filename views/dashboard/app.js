@@ -5,7 +5,7 @@ const randomId = () => [...crypto.getRandomValues(new Uint8Array(16))].map(b => 
 const pages = [
   ['overview', '总览', '01', '连接游戏与群聊，让每个动作都有记录。'],
   ['routes', '连接与群服', '02', '设置 QueQiao 连接与原始 UMO 路由。'],
-  ['commands', '自定义命令', '03', '独立动作、解析规则与回复模板。触发名称在管理行为中修改。'],
+  ['commands', '指令与帮助', '03', '编辑指令、帮助说明、显示顺序；触发名称在管理行为中修改。'],
   ['bindings', '绑定与点数', '04', '双向唯一绑定、变更冷却与完整点数流水。'],
   ['shop', '点数商店', '05', '商品、库存和兑换订单；结果未知时保留现场。'],
   ['monitor', '性能监控', '06', '持续采样 TPS、MSPT 与延迟，缺失样本保留为空。'],
@@ -17,6 +17,7 @@ let selectedScope = '';
 let selectedServer = '';
 let metrics = [];
 let migrationPreview = null;
+const pagination = new Map();
 const messageTypes = [['text','文字'],['face','QQ 表情'],['image','图片'],['link','链接 / 分享卡片'],['record','语音'],['video','视频'],['file','文件'],['forward','合并消息'],['reply','引用消息'],['at','@ 提及']];
 const gameEvents = [['PlayerChatEvent','玩家聊天'],['PlayerJoinEvent','玩家加入'],['PlayerQuitEvent','玩家离开'],['PlayerDeathEvent','玩家死亡'],['PlayerAchievementEvent','玩家成就']];
 const pointsName = () => state?.settings?.points_name || '点数';
@@ -35,7 +36,11 @@ function element(tag, text, cls) {
 function button(text, fn, cls = 'secondary small') {
   const node = element('button', text, cls);
   node.type = 'button';
-  node.addEventListener('click', () => Promise.resolve().then(fn).catch(showError));
+  node.addEventListener('click', async () => {
+    node.disabled = true;
+    try { await fn(); } catch (error) { showError(error); }
+    finally { node.disabled = false; }
+  });
   return node;
 }
 function showError(error) { $('#banner').hidden = false; $('#banner').textContent = String(error.message || error); }
@@ -53,11 +58,30 @@ async function refresh() {
   $('#connection').textContent = `${connected} / ${state.settings.servers.length} 已连接`;
   $('#connection').classList.toggle('off', connected === 0);
   render();
+  if(state.maintenance){$('#banner').hidden=false;$('#banner').textContent='服务器 ID 迁移尚未完成，新的操作已暂停。请重试原 ID 修改请求，或重载插件恢复迁移。';}
 }
 function output(title, value) {
   $('#output-title').textContent = title;
   $('#output-text').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   $('#output').showModal();
+}
+function confirmAction(message) {
+  return new Promise(resolve => {
+    const dialog=element('dialog');dialog.setAttribute('aria-label','确认操作');
+    dialog.append(element('h2','确认操作'),element('p',message));
+    const actions=element('div',null,'dialog-foot');let accepted=false;
+    actions.append(button('取消',()=>dialog.close()),button('确认',()=>{accepted=true;dialog.close();},'danger'));
+    dialog.append(actions);document.body.append(dialog);
+    dialog.addEventListener('close',()=>{dialog.remove();resolve(accepted);},{once:true});dialog.showModal();
+  });
+}
+function unbindEditor(binding) {
+  edit('管理员解绑',[
+    field('QQ ID','user_id','text',{readonly:true}),field('MC 玩家','player','text',{readonly:true}),
+    field('确认解除此绑定','section_confirm','section',{hint:'本次管理员操作不受 CD 限制。余额与历史保留，普通用户后续操作仍遵守冷却。'})
+  ],{user_id:binding.qq_id,player:binding.player},async value=>{
+    const result=await action('binding_unbind',{user_id:value.user_id});await refresh();output('管理员解绑结果',result.text||'解绑成功。');
+  },'确认解绑');
 }
 async function saveSettings(patch) {
   await bridge.apiPost('settings', { settings: patch, revision: state.revision }).then(unwrap);
@@ -87,6 +111,38 @@ function table(parent, columns, rows, actions) {
     if (actions) { const td = element('td'); const div = element('div', null, 'actions'); actions(row).forEach(x => div.append(x)); td.append(div); line.append(td); }
     body.append(line);
   }); t.append(body); wrap.append(t); parent.append(wrap);
+}
+function pagedTable(parent, columns, source, actions, key) {
+  const host=element('div',null,'paged-table');host.dataset.table=key;parent.append(host);
+  const saved=pagination.get(key)||{page:1,page_size:10};pagination.set(key,saved);
+  let serial=0;
+  const load=async()=>{
+    const request=++serial;host.setAttribute('aria-busy','true');
+    try {
+      const result=typeof source==='function'?await source({...saved}):{
+        total:source.length,pages:Math.max(1,Math.ceil(source.length/saved.page_size)),page_size:saved.page_size,
+        page:Math.min(saved.page,Math.max(1,Math.ceil(source.length/saved.page_size)))
+      };
+      if(request!==serial||!host.isConnected)return;
+      saved.page=result.page;saved.page_size=result.page_size;
+      const rows=result.rows??source.slice((saved.page-1)*saved.page_size,saved.page*saved.page_size);
+      host.replaceChildren();table(host,columns,rows,actions);
+      const bar=element('div',null,'pagination');const label=element('label','每页 ');const size=element('select');size.setAttribute('aria-label','每页显示数量');
+      [10,20,50,100].forEach(value=>{const option=element('option',value+' 条');option.value=value;size.append(option);});size.value=saved.page_size;
+      size.onchange=()=>{saved.page_size=Number(size.value);saved.page=1;load();};label.append(size);
+      const previous=button('上一页',()=>{saved.page--;return load();});previous.disabled=saved.page<=1;
+      const next=button('下一页',()=>{saved.page++;return load();});next.disabled=saved.page>=result.pages;
+      const count=element('span',`共 ${result.total} 条 · 第 ${saved.page} / ${result.pages} 页`,'page-count');count.setAttribute('aria-live','polite');
+      bar.append(label,count,previous,next);host.append(bar);
+    } catch(error) {
+      if(request===serial&&host.isConnected){host.replaceChildren(element('div',String(error.message||error),'empty'));host.append(button('重试加载',load));}
+    } finally {if(request===serial)host.setAttribute('aria-busy','false');}
+  };
+  load();
+}
+function remoteTable(parent, columns, name, actions, scope) {
+  const key=name+(scope===undefined?'':':'+scope);
+  pagedTable(parent,columns,parameters=>action('dashboard_page',{table:name,...parameters,...(scope===undefined?{}:{scope})}),actions,key);
 }
 function field(label, key, type = 'text', options = {}) { return { label, key, type, ...options }; }
 function edit(title, specs, initial, onSave, saveLabel = '保存') {
@@ -208,7 +264,7 @@ function serverEditor(existing) {
   const value={id:randomId().slice(0,8),name:'',display_name:'',connection_mode:'forward',url:'ws://127.0.0.1:8080',token:'',enabled:true,timeout:10,
     reverse_host:'0.0.0.0',reverse_port:8081,reverse_path:'/queqiao',game_host:'127.0.0.1',game_port:25565,tps_command:'tps',mspt_command:'mspt',ping_command:'ping',component_version:'legacy',...existing};
   edit(existing?'编辑服务器':'添加服务器',[
-    field('服务器身份与显示','section_server','section'),field('服务器 ID','id','text',{readonly:!!existing,required:true}),
+    field('服务器身份与显示','section_server','section'),field('服务器 ID','id','text',{readonly:!!existing,required:true,hint:existing?'修改 ID 请关闭此表单，点击服务器列表的“修改 ID”，关联数据会一起更新。':'内部唯一标识，可在服务器列表使用“修改 ID”调整。'}),
     field('QueQiao server_name','name','text',{required:true,hint:'连接鉴权标识，必须与 QueQiao 配置一致。'}),
     field('服务器显示名称','display_name','text',{hint:'MC → QQ 的 {server} 使用此名称；留空才使用 server_name。例如生存服、创造服。'}),
     field('启用连接','enabled','checkbox'),
@@ -228,7 +284,7 @@ function serverEditor(existing) {
 function routeEditor(existing) {
   const base={umo:'',scope:'',display_name:'',server_id:state.settings.servers[0]?.id||'',enabled:true,qq_to_mc:true,mc_to_qq:true,admins:[],timezone:'Asia/Shanghai',points_min:10,points_max:10,
     signin_command:'signin click {player}',signin_prefixes:['[手记人偶]'],signin_rules:[],templates:{},events:gameEvents.map(x=>x[0]),types:messageTypes.map(x=>x[0]),prefix:'[{group}] {sender}{reply}：',max_forward_nodes:30,...existing};
-  const value={...base,signin_success:base.templates.signin??'',signin_already:base.templates.signin_already??'',mc_to_qq_template:base.templates.mc_to_qq??'',reply_hover_template:base.templates.reply_hover??''};
+  const value={...base,signin_success:base.templates.signin??'',signin_already:base.templates.signin_already??'',mc_to_qq_template:base.templates.mc_to_qq??'',reply_label_template:base.templates.reply_label??'',reply_hover_template:base.templates.reply_hover??''};
   for(const [key,,fallback] of tagColors){const color=base.message_colors?.[key];value['color_'+key]=mcColors[color]||color||fallback;}
   edit(existing?'编辑群服路由':'添加群服路由',[
     field('群聊与服务器','section_route','section'),field('原始 UMO','umo','text',{required:true,wide:true,readonly:!!existing,hint:'在目标群使用 AstrBot /sid 获取完整会话标识。'}),
@@ -240,6 +296,7 @@ function routeEditor(existing) {
     field('QQ → MC 显示前缀','prefix','text',{wide:true,hint:'变量：{group} 群显示名、{sender} 发言人、{reply} 带悬浮内容的引用标签、{user_id} QQ号。例：&e[{group}]&e{sender}{reply}&8:。无引用时 {reply} 为空；旧模板未填写时仍在正文显示引用。支持 &a、§a、&#RRGGBB 颜色。'}),
     field('消息标签颜色','section_colors','section',{hint:'点击色块选择链接、图片和引用等标签的颜色；点击链接和悬浮内容仍会保留。'}),
     ...tagColors.map(([key,label])=>field(label+'标签颜色','color_'+key,'color')),
+    field('{reply} 标签模板（留空用默认）','reply_label_template','text',{wide:true,placeholder:'[回复 {sender}]',hint:'{sender} 为原作者。例：(回复 @{sender})。此项控制引用标签文字；颜色使用上方“引用标签颜色”，悬浮内容在下方设置。'}),
     field('引用悬浮内容（留空用默认）','reply_hover_template','textarea',{wide:true,placeholder:'{sender}\n{message}\nDate: {time}',hint:'默认三行：原作者、原消息内容、原消息时间。{sender} 是被引用消息作者，{message} 为原文，{time} 按本路由时区显示 HH:MM:SS；没有原时间则显示未知。'}),
     field('MC → QQ 消息格式','mc_to_qq_template','textarea',{wide:true,placeholder:'[{server}] {message}',hint:'留空使用默认。{server} 是服务器显示名称，{player} 是玩家名，{message} 是已含玩家名的聊天或事件内容。'}),
     field('签到与账户','section_signin','section'),field('点数作用域','scope','text',{hint:'留空使用 UMO。填写相同值可共享余额；共享时区和签到奖励必须一致。'}),
@@ -251,24 +308,64 @@ function routeEditor(existing) {
     field('识别时忽略的回包前缀（每行一个）','signin_prefixes','lines',{wide:true,advanced:true,hint:'只影响规则识别。例如 [手记人偶] 会从匹配文本开头移除；QQ群中 {rcon} 仍保留它。颜色代码自动清除，无需填入。'}),
     field('自定义签到结果规则','signin_rules','json',{advanced:true,hint:'默认 [] 直接识别已提供的 LiteSignIn 回包。仅当服务端返回文字变化时修改。每项包含 status 和 pattern；SIGNED / ALREADY_SIGNED 必须用 (?P<player>...) 捕获玩家名。'}),
     field('合并消息展开上限','max_forward_nodes','number',{advanced:true,min:1,max:100})
-  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq'],['reply_hover_template','reply_hover']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;v.message_colors={...v.message_colors};for(const [key] of tagColors){v.message_colors[key]=v['color_'+key];delete v['color_'+key];}const list=state.settings.routes.filter(x=>x.umo!==v.umo);list.push(v);await saveSettings({routes:list});});
+  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq'],['reply_label_template','reply_label'],['reply_hover_template','reply_hover']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;v.message_colors={...v.message_colors};for(const [key] of tagColors){v.message_colors[key]=v['color_'+key];delete v['color_'+key];}const list=state.settings.routes.filter(x=>x.umo!==v.umo);list.push(v);await saveSettings({routes:list});});
+}
+function renameServer(existing) {
+  const revision=state.revision;
+  edit('修改服务器 ID',[
+    field('当前服务器 ID','server_id','text',{readonly:true}),
+    field('新服务器 ID','new_server_id','text',{required:true,hint:'关联路由、绑定、指令、业务记录与性能历史会一起更新。连接会短暂重新建立，QueQiao 鉴权名称不变。'})
+  ],{server_id:existing.id,new_server_id:existing.id},async value=>{
+    const result=await action('server_rename',{...value,revision});
+    if(selectedServer===existing.id)selectedServer=value.new_server_id;
+    migrationPreview=null;await refresh();output('服务器 ID 修改结果',result.text||'服务器 ID 与关联数据已更新。');
+  },'确认修改 ID');
 }
 function routes() {
   const p=panel('服务器连接','鉴权名称与对外显示名称分开设置。支持正向连接及反向监听。',[button('全局设置',globalSettings),button('添加服务器',()=>serverEditor(),'')]);
   const connections=new Map((state.connections||[]).map(x=>[x.id||x.server_id,x]));
-  table(p,[['显示名称',serverLabel],['鉴权名称','name'],['方式',x=>x.connection_mode==='reverse'?'反向':'正向'],['连接地址',x=>x.connection_mode==='reverse'?`${x.reverse_host}:${x.reverse_port}${x.reverse_path}`:x.url],['状态',x=>!x.enabled?'已关闭':connections.get(x.id)?.connected?'在线':x.connection_mode==='reverse'?'等待连接':'离线']],state.settings.servers,s=>[button('编辑',()=>serverEditor(s)),button('删除',async()=>{if(confirm('删除服务器前请移除引用它的群路由和指令。继续？'))await saveSettings({servers:state.settings.servers.filter(x=>x.id!==s.id)});},'danger small')]);
+  table(p,[['ID','id'],['显示名称',serverLabel],['鉴权名称','name'],['方式',x=>x.connection_mode==='reverse'?'反向':'正向'],['连接地址',x=>x.connection_mode==='reverse'?`${x.reverse_host}:${x.reverse_port}${x.reverse_path}`:x.url],['状态',x=>!x.enabled?'已关闭':connections.get(x.id)?.connected?'在线':x.connection_mode==='reverse'?'等待连接':'离线']],state.settings.servers,s=>[button('编辑',()=>serverEditor(s)),button('修改 ID',()=>renameServer(s)),button('删除',async()=>{if(await confirmAction('删除服务器前请移除引用它的群路由和指令。有历史数据的服务器请使用修改 ID。继续？'))await saveSettings({servers:state.settings.servers.filter(x=>x.id!==s.id)});},'danger small')]);
   const q=panel('消息转发与群服路由','每个群分别设置转发方向、消息类型和游戏事件开关。',[button('添加路由',()=>routeEditor(),'')]);
-  table(q,[['群显示名称',x=>x.display_name||'QQ群'],['UMO','umo'],['目标服务器',x=>serverLabel(state.settings.servers.find(s=>s.id===x.server_id)||{id:x.server_id})],['方向',x=>[x.qq_to_mc?'QQ → MC':'',x.mc_to_qq?'MC → QQ':''].filter(Boolean).join(' / ')||'已关闭'],['游戏事件',x=>gameEvents.filter(([key])=>x.events?.includes(key)).map(([,name])=>name).join('、')]],state.settings.routes,r=>[button('编辑与开关',()=>routeEditor(r)),button('删除',async()=>{if(confirm('仅移除路由，历史数据保留。继续？'))await saveSettings({routes:state.settings.routes.filter(x=>x.umo!==r.umo)});},'danger small')]);
+  table(q,[['群显示名称',x=>x.display_name||'QQ群'],['UMO','umo'],['目标服务器',x=>serverLabel(state.settings.servers.find(s=>s.id===x.server_id)||{id:x.server_id})],['方向',x=>[x.qq_to_mc?'QQ → MC':'',x.mc_to_qq?'MC → QQ':''].filter(Boolean).join(' / ')||'已关闭'],['游戏事件',x=>gameEvents.filter(([key])=>x.events?.includes(key)).map(([,name])=>name).join('、')]],state.settings.routes,r=>[button('编辑与开关',()=>routeEditor(r)),button('删除',async()=>{if(await confirmAction('仅移除路由，历史数据保留。继续？'))await saveSettings({routes:state.settings.routes.filter(x=>x.umo!==r.umo)});},'danger small')]);
 }
 function commandEditor(existing) {
   const value = existing || { id:randomId().slice(0,8),name:'',aliases:[],description:'',enabled:true,require_binding:true,admin_only:true,cooldown_seconds:3,server_id:'',rcon:'',parser:'text',cleanup_prefixes:[],parameters:[],rules:[],templates:{SUCCESS:'{cleaned}',UNKNOWN:'服务器结果未识别，请管理员检查。'} };
   edit(existing?'编辑命令动作':'新增命令动作',[field('稳定动作 ID','id','text',{readonly:!!existing,required:true}),field('初始触发名','name','text',{required:true,hint:'已注册后的实际触发名以 AstrBot 管理行为为准。'}),field('说明','description','text',{wide:true}),field('初始别名','aliases','json'),field('目标服务器','server_id','select',{options:[['','跟随群服路由'],...state.settings.servers.map(x=>[x.id,serverLabel(x)])]}),field('调用冷却（秒）','cooldown_seconds','number'),field('动作启用','enabled','checkbox'),field('需要绑定','require_binding','checkbox'),field('仅管理员','admin_only','checkbox'),field('RCON 命令模板','rcon','text',{wide:true,required:true,hint:'可用 {player}、{user_id} 以及下方定义的参数。一条动作执行一条控制台命令。'}),field('参数定义','parameters','json',{hint:'例：[{"name":"amount","type":"integer","min":1,"max":64}]'}),field('解析方式','parser','select',{options:[['rules','完整正则匹配'],['text','直接返回清洗后的 RCON 文本（默认）'],['litesignin','LiteSignIn 签到回包']]}),field('识别时忽略的前缀（每行一个）','cleanup_prefixes','lines',{advanced:true,wide:true,hint:'仅移除明确填写的回包开头文字。颜色代码会自动清除；{rcon} 保留完整文本。'}),field('结果规则','rules','json',{advanced:true,hint:'例：[{"status":"SUCCESS","pattern":"成功给玩家 (?P<player>\\w+) ..."}]'}),field('按状态选择回复模板','templates','json',{object:true,advanced:true,hint:'默认 SUCCESS 使用 {cleaned}；可用 {rcon} 表示仅去颜色和日志包装的完整回包，{points_name} 为货币名称。纯文本查询无需填写结果规则。'})],value,async v=>{const list=state.settings.commands.filter(x=>x.id!==v.id);list.push(v);await saveSettings({commands:list});});
 }
+async function saveHelpEntry(actionId, changes) {
+  const help=structuredClone(state.settings.help||{image_enabled:true,entries:{}});help.entries||={};
+  help.entries[actionId]={...help.entries[actionId],...changes};await saveSettings({help});
+}
+function helpSettings() {
+  edit('帮助回复设置',[
+    field('帮助使用图片回复','image_enabled','checkbox',{hint:'开启时 mc帮助 返回图片，内容较长时分页；关闭时返回文字。两种方式使用相同的说明、显示开关和顺序。图片生成失败会回退文字。'})
+  ],{image_enabled:state.settings.help?.image_enabled!==false},async value=>saveSettings({help:{...(state.settings.help||{}),...value}}));
+}
+function helpEntryEditor(row) {
+  const override=state.settings.help?.entries?.[row.action_id]||{};
+  edit('编辑帮助说明与顺序',[
+    field('指令名称','name','text',{readonly:true,hint:'触发名、别名和指令本身的启停请在 AstrBot 管理行为修改。'}),
+    field('帮助说明','description','textarea',{wide:true,placeholder:row.default_description||'',hint:'留空使用默认说明。只影响帮助展示，不修改指令行为。'}),
+    field('在帮助中显示','visible','checkbox'),field('帮助排序','order','number',{min:-1000000,max:1000000,hint:'数字越小越靠前；也可以在列表中使用上移、下移。'})
+  ],{name:row.name,description:override.description??'',visible:row.visible,order:row.order},async value=>saveHelpEntry(row.action_id,{description:value.description,visible:value.visible,order:value.order}));
+}
+async function moveHelp(row, direction) {
+  const rows=[...(state.help_commands||[])].sort((a,b)=>a.order-b.order||a.default_order-b.default_order);
+  const index=rows.findIndex(x=>x.action_id===row.action_id),target=index+direction;
+  if(index<0||target<0||target>=rows.length)return;
+  [rows[index],rows[target]]=[rows[target],rows[index]];
+  const help=structuredClone(state.settings.help||{image_enabled:true,entries:{}});help.entries||={};
+  rows.forEach((entry,i)=>{help.entries[entry.action_id]={...help.entries[entry.action_id],order:i*10};});await saveSettings({help});
+}
 function commands() {
   const p=panel('自定义命令','命令使用独立处理器；稳定 ID 不随触发词改名。',[button('新增命令',()=>commandEditor(),'')]);
-  table(p,[['动作 ID','id'],['初始触发名','name'],['RCON','rcon'],['解析','parser'],['权限',x=>x.admin_only?'管理员':'成员']],state.settings.commands,c=>[button('编辑',()=>commandEditor(c)),button('模拟回复（不执行）',()=>preview(c)),button('删除',async()=>{if(confirm('删除此命令动作及其注册入口？'))await saveSettings({commands:state.settings.commands.filter(x=>x.id!==c.id)});},'danger small')]);
-  const q=panel('管理行为生效值','在 AstrBot → 插件 → 管理行为中修改名称、别名和入口启停。');
-  const effective=state.effective_commands || []; table(q,[['动作',x=>x.action_id||x.handler_name||x.id],['实际触发名',x=>x.effective_command||x.name||x.command],['别名',x=>x.effective_aliases||x.aliases||[]],['入口启用',x=>x.enabled===false?'否':'是']],Array.isArray(effective)?effective:Object.values(effective));
+  table(p,[['动作 ID','id'],['初始触发名','name'],['RCON','rcon'],['解析','parser'],['权限',x=>x.admin_only?'管理员':'成员']],state.settings.commands,c=>[button('编辑',()=>commandEditor(c)),button('模拟回复（不执行）',()=>preview(c)),button('删除',async()=>{if(await confirmAction('删除此命令动作及其注册入口？'))await saveSettings({commands:state.settings.commands.filter(x=>x.id!==c.id)});},'danger small')]);
+  const q=panel('帮助展示与说明','默认指令与自定义指令统一排列。隐藏只影响帮助；停用或无权限的指令不会出现在群帮助中。',[button('帮助回复设置',helpSettings)]);
+  const entries=[...(state.help_commands||[])].sort((a,b)=>a.order-b.order||a.default_order-b.default_order);
+  pagedTable(q,[['指令','name'],['类型',x=>x.kind==='custom'?'自定义':'默认'],['别名',x=>x.aliases||[]],['说明','description'],['帮助显示',x=>x.visible?'显示':'隐藏'],['排序','order'],['指令启用',x=>x.enabled?'是':'否']],entries,row=>[
+    button('编辑说明与排序',()=>helpEntryEditor(row)),button(row.visible?'从帮助隐藏':'在帮助显示',()=>saveHelpEntry(row.action_id,{visible:!row.visible})),
+    button('上移',()=>moveHelp(row,-1)),button('下移',()=>moveHelp(row,1))
+  ],'help-commands');
 }
 function signinPreview() {
   edit('群签到与游戏签到 · 模拟回复',[
@@ -298,11 +395,11 @@ function preview(command) {
 }
 function bindings() {
   const p=panel('账号绑定',state.settings.binding_verification_enabled?'验证码已开启：需到游戏验证。解绑保留冷却和历史。':'验证码已关闭：直接按玩家名绑定；未验证身份会明确标记。');
-  table(p,[['QQ','qq_id'],['玩家','player'],['验证状态',x=>x.verified?'已验证':'未验证（玩家名）'],['真实 UUID',x=>x.mc_uuid||'—'],['服务器','server_id'],['变更时间',x=>nowText(x.updated)]],state.domain?.bindings,b=>[button('管理员解绑',async()=>{if(confirm(`解绑 ${b.qq_id} ↔ ${b.player}？本次管理员操作不受 CD 限制，普通用户后续操作仍遵守冷却。`)){const result=await action('binding_unbind',{user_id:b.qq_id});await refresh();output('管理员解绑结果',result.text||'解绑成功。');}},'danger small')]);
+  remoteTable(p,[['QQ','qq_id'],['玩家','player'],['验证状态',x=>x.verified?'已验证':'未验证（玩家名）'],['真实 UUID',x=>x.mc_uuid||'—'],['服务器','server_id'],['变更时间',x=>nowText(x.updated)]],'bindings',b=>[button('管理员解绑',()=>unbindEditor(b),'danger small')]);
   const q=panel('点数账户','余额和冻结额分开显示。管理员调整也写入流水。',[button(currencyLabel('调整点数'),()=>edit(currencyLabel('管理员调整点数'),[field('QQ ID','user_id','text',{required:true}),field('操作','mode','select',{options:[['add','增加'],['sub','扣除'],['set','设置余额']]}),field('数量','amount','number',{min:0,required:true}),field('原因','reason','text',{required:true,wide:true})],{user_id:'',mode:'add',amount:0,reason:'',operation_id:randomId()},async v=>{output('调整结果',await action('points_adjust',{...v,scope:selectedScope}));await refresh();}),'')]);
-  scopeSelect(q);table(q,[['QQ','qq_id'],['总点数',x=>x.total??x.balance],['冻结','frozen'],['可用',x=>(x.total??x.balance??0)-(x.frozen||0)]],filtered('balances'));
-  const l=panel('最近流水','点数变更均保存来源与操作人。');table(l,[['QQ','qq_id'],['变动','delta'],['变更后','total_after'],['原因','reason'],['操作人','actor'],['时间',x=>nowText(x.created)]],filtered('ledger').slice(0,100));
-  const s=panel('签到记录','游戏成功或今日已签后，才结算群签到。');table(s,[['QQ','qq_id'],['日期','day'],['点数','points'],['游戏状态','game_status']],filtered('signins').slice(0,100));
+  scopeSelect(q);remoteTable(q,[['QQ','qq_id'],['总点数',x=>x.total??x.balance],['冻结','frozen'],['可用',x=>(x.total??x.balance??0)-(x.frozen||0)]],'balances',null,selectedScope);
+  const l=panel('点数流水','按时间从新到旧分页查看，保留来源与操作人。');remoteTable(l,[['QQ','qq_id'],['变动','delta'],['变更后','total_after'],['原因','reason'],['操作人','actor'],['时间',x=>nowText(x.created)]],'ledger',null,selectedScope);
+  const s=panel('签到记录','游戏成功或今日已签后，才结算群签到。');remoteTable(s,[['QQ','qq_id'],['日期','day'],['点数','points'],['游戏状态','game_status']],'signins',null,selectedScope);
 }
 async function productEditor(existing) {
   let value={id:randomId().slice(0,8),name:'',price:10,kind:'text',reward:'',command:'',rules:[],enabled:true,stock:-1,limit_per_user:0};
@@ -311,25 +408,38 @@ async function productEditor(existing) {
 }
 function shop() {
   const p=panel('商品目录','群点数只在本商店兑换，独立兑换码分配后不会重新入池。',[button('新增商品',()=>{if(!selectedScope)throw Error('请先配置群服路由');return productEditor();},'')]);scopeSelect(p);
-  table(p,[['ID','id'],['名称','name'],['价格','price'],['类型','kind'],['库存',x=>x.stock===-1?'不限':x.stock],['状态',x=>x.enabled?'上架':'下架']],filtered('products'),r=>[button('编辑',()=>productEditor(r)),...(r.kind==='code'?[button('添加兑换码',()=>edit('导入兑换码',[field('兑换码（每行一个）','codes','textarea',{required:true})],{codes:''},async v=>{await action('product_codes',{scope:selectedScope,product_id:r.id,codes:v.codes.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)});await refresh();}))]:[]),button('下架 / 删除',async()=>{if(confirm('删除商品定义？历史订单和已用兑换码会保留。')){await action('product_delete',{scope:selectedScope,product_id:r.id});await refresh();}},'danger small')]);
+  table(p,[['ID','id'],['名称','name'],['价格','price'],['类型','kind'],['库存',x=>x.stock===-1?'不限':x.stock],['状态',x=>x.enabled?'上架':'下架']],filtered('products'),r=>[button('编辑',()=>productEditor(r)),...(r.kind==='code'?[button('添加兑换码',()=>edit('导入兑换码',[field('兑换码（每行一个）','codes','textarea',{required:true})],{codes:''},async v=>{await action('product_codes',{scope:selectedScope,product_id:r.id,codes:v.codes.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)});await refresh();}))]:[]),button('下架 / 删除',async()=>{if(await confirmAction('删除商品定义？历史订单和已用兑换码会保留。')){await action('product_delete',{scope:selectedScope,product_id:r.id});await refresh();}},'danger small')]);
   const q=panel('兑换订单','只有确认交付成功才完成结算；未知结果由管理员核对。');
   table(q,[['订单','id'],['QQ','qq_id'],['商品','product_id'],['状态','status'],['时间',x=>nowText(x.created)]],filtered('orders').slice(0,100),r=>['unknown','reserved'].includes(r.status)?[button('核对',()=>edit('核对交付结果',[field('结论','outcome','select',{options:[['success','已经交付：完成扣款'],['failed','确认未交付：取消并释放冻结']]}),field('核对说明','reason','textarea',{required:true})],{outcome:'success',reason:''},async v=>{await action('order_resolve',{...v,scope:selectedScope,order_id:r.id});await refresh();},'提交核对'))]:[]);
 }
 function metricValue(sample,key){ const value=sample[key]??sample.metrics?.[key];return typeof value==='number'&&Number.isFinite(value)?value:null; }
 function drawChart(parent, samples, key, label, unit) {
-  const box=element('div',null,'panel');const head=element('div',null,'metric-head');const valid=samples.map(x=>metricValue(x,key)).filter(x=>x!==null);head.append(element('span',label),element('strong',valid.length?`${valid.at(-1).toFixed(1)} ${unit}`:'暂无数据'));box.append(head);
-  const ns='http://www.w3.org/2000/svg';const svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox','0 0 600 200');svg.classList.add('chart');svg.setAttribute('role','img');svg.setAttribute('aria-label',label+'历史曲线');
-  const max=Math.max(key==='tps'?20:1,...valid)*1.1;let path='';let active=false;
+  const valueOf=sample=>{const value=metricValue(sample,key);return value===null?null:key==='mspt'?value/50:value;};
+  const box=element('div',null,'panel');const head=element('div',null,'metric-head');const valid=samples.map(valueOf).filter(x=>x!==null);head.append(element('span',label),element('strong',valid.length?`${valid.at(-1).toFixed(key==='mspt'?2:1)} ${unit}`:'暂无数据'));box.append(head);
+  const ns='http://www.w3.org/2000/svg';const svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox','0 0 600 230');svg.classList.add('chart');svg.setAttribute('role','img');svg.setAttribute('aria-label',label+'历史曲线');
+  const maximum=valid.reduce((a,b)=>Math.max(a,b),key==='tps'?20:key==='mspt'?0.02:1)*1.1;
+  const magnitude=10**Math.floor(Math.log10(maximum/4));const step=Math.ceil(maximum/4/magnitude)*magnitude;const max=step*4;let path='';let active=false;
+  const labelText=(text,x,y,anchor='end')=>{const node=document.createElementNS(ns,'text');node.textContent=text;node.setAttribute('x',x);node.setAttribute('y',y);node.setAttribute('text-anchor',anchor);node.setAttribute('fill','#a7bdb2');node.setAttribute('font-size','12');svg.append(node);return node;};
+  labelText(unit,58,16,'start');
+  for(let index=0;index<=4;index++){
+    const value=step*index,y=190-index*40;const l=document.createElementNS(ns,'line');
+    ['x1','x2','y1','y2'].forEach((a,i)=>l.setAttribute(a,String([58,580,y,y][i])));l.setAttribute('stroke','#2b3b36');svg.append(l);
+    const node=labelText(Number(value.toFixed(Math.max(0,2-Math.floor(Math.log10(max))))).toString(),49,y+4);node.classList.add('axis-tick');
+  }
   const start=Number(samples[0]?.timestamp||0),end=Number(samples.at(-1)?.timestamp||start),interval=state.settings.monitor.interval_seconds||60;let previous=null;
-  samples.forEach(s=>{const v=metricValue(s,key),time=Number(s.timestamp);if(v===null){active=false;return;}if(previous!==null&&time-previous>interval*2.5)active=false;const x=20+((time-start)/Math.max(1,end-start))*560,y=175-(v/max)*145;path+=`${active?'L':'M'}${x.toFixed(2)},${y.toFixed(2)} `;active=true;previous=time;});
-  [30,100,175].forEach(y=>{const l=document.createElementNS(ns,'line');['x1','x2','y1','y2'].forEach((a,i)=>l.setAttribute(a,String([20,580,y,y][i])));l.setAttribute('stroke','#2b3b36');svg.append(l);});
-  const line=document.createElementNS(ns,'path');line.setAttribute('d',path);line.setAttribute('fill','none');line.setAttribute('stroke','#a4dfbc');line.setAttribute('stroke-width','2');svg.append(line);box.append(svg);if(samples.length)box.append(element('small',`${nowText(start)} → ${nowText(end)} · 纵轴 0–${max.toFixed(1)} ${unit}`));parent.append(box);
+  samples.forEach(s=>{const v=valueOf(s),time=Number(s.timestamp);if(v===null){active=false;return;}if(previous!==null&&time-previous>interval*2.5)active=false;const x=58+((time-start)/Math.max(1,end-start))*522,y=190-(v/max)*160;path+=`${active?'L':'M'}${x.toFixed(2)},${y.toFixed(2)} `;active=true;previous=time;
+    if(samples.length<=120){const dot=document.createElementNS(ns,'circle');dot.setAttribute('cx',x);dot.setAttribute('cy',y);dot.setAttribute('r','2.5');dot.setAttribute('fill','#a4dfbc');svg.append(dot);}
+  });
+  const line=document.createElementNS(ns,'path');line.setAttribute('d',path);line.setAttribute('fill','none');line.setAttribute('stroke','#a4dfbc');line.setAttribute('stroke-width','2');svg.append(line);
+  if(samples.length){const timeText=value=>new Date(value*1000).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'});labelText(timeText(start),58,212,'start');labelText(timeText(end),580,212);}
+  box.append(svg);if(key==='mspt')box.append(element('small','按 1 tick = 50 ms 换算；显示值 = 原始 MSPT ÷ 50。'));
+  if(samples.length)box.append(element('small',`${nowText(start)} → ${nowText(end)}`));parent.append(box);
 }
 async function loadMetrics(){const target=selectedServer;if(!target)return;const r=await action('metrics',{server_id:target,hours:24});if(target!==selectedServer)return;metrics=r.samples||[];if(current==='monitor')render();}
 function monitor(){
   const p=panel('性能历史','最近 24 小时；图中断线表示样本缺失。',[button('刷新图表',loadMetrics),button('立即采样',async()=>{await action('sample',{server_id:selectedServer});await loadMetrics();}),button('采样设置',globalSettings)]);serverSelect(p,()=>loadMetrics().catch(showError));
   if(!selectedServer){p.append(element('div','请先添加服务器','empty'));return;}
-  const grid=element('div',null,'grid-two');$('#content').append(grid);drawChart(grid,metrics,'tps','TPS','');drawChart(grid,metrics,'mspt','MSPT','ms');drawChart(grid,metrics,'player_ping_ms','玩家延迟','ms');drawChart(grid,metrics,'slp_rtt_ms','机器人 → 服务端 RTT','ms');
+  const grid=element('div',null,'grid-two');$('#content').append(grid);drawChart(grid,metrics,'tps','TPS','ticks/s');drawChart(grid,metrics,'mspt','MSPT（换算 ticks）','ticks');drawChart(grid,metrics,'player_ping_ms','玩家延迟','ms');drawChart(grid,metrics,'slp_rtt_ms','机器人 → 服务端 RTT','ms');
   const note=element('div','采样按配置间隔在后台进行。QQ群的 tps / mspt / ping 返回实际 RCON 文本；“服务器状态”仅返回在线或离线；“性能图”获取历史图片。玩家 ping 与机器人探测链路分别记录，未知值不填 0。','note');$('#content').append(note);
 }
 function rememberMigration(parameters,result) {
@@ -385,16 +495,16 @@ function migrationApply() {
 }
 function diagnostics(){
   const p=panel('回包与连接诊断','解析预览不会执行游戏命令。',[button('签到回包解析示例',signinPreview),button('执行 RCON',()=>edit('实际执行 RCON',[field('目标服务器','server_id','select',{options:state.settings.servers.map(x=>[x.id,serverLabel(x)])}),field('控制台命令','command','text',{required:true,wide:true,hint:'这会实际执行服务器命令，请核对内容。'})],{server_id:state.settings.servers[0]?.id||'',command:''},async v=>output('RCON 返回',await action('rcon',v)),'执行命令'))]);
-  table(p,[['动作','action'],['服务器','server_id'],['状态','status'],['时间',x=>nowText(x.created_at)]],state.runs||[]);
+  remoteTable(p,[['动作','action'],['服务器','server_id'],['状态','status'],['时间',x=>nowText(x.created_at)]],'runs');
   const m=panel('旧数据迁移','先预览绑定计划，处理冲突，再确认导入。已经迁过账本的批次可补迁绑定。',[button('预览迁移',migrationStart),button('选择绑定 / 重新核对',migrationChooseBindings),button('导入备份',migrationApply,'danger small')]);
   m.append(element('div','旧名称绑定可迁为未验证的名称身份，不伪造 UUID。不会重复迁入余额，也不会自动发送奖励或执行旧命令。','note'));
   if(migrationPreview?.result.binding_plan){
     const plan=migrationPreview.result.binding_plan;
     m.append(element('div',`当前计划：${plan.can_apply?'可导入':'需要处理冲突或服务器映射'}；待导入 ${plan.counts?.ready||0} 条。`,'note'));
-    table(m,[['旧账号键','account_key'],['QQ','qq_id'],['MC名','player'],['服务器','server_id'],['状态',r=>migrationStatus(r.status)],['说明','reason']],plan.rows||[]);
+    pagedTable(m,[['旧账号键','account_key'],['QQ','qq_id'],['MC名','player'],['服务器','server_id'],['状态',r=>migrationStatus(r.status)],['说明','reason']],plan.rows||[],null,'migration');
   }
   const mediaPanel=panel('媒体服务状态','可点击资源链接由独立媒体服务提供。');table(mediaPanel,[['项目','name'],['状态','value']],Object.entries(state.media||{}).map(([name,value])=>({name,value})));
-  const a=panel('管理操作记录','不记录 Token、兑换码或奖励正文。');table(a,[['操作者','actor'],['操作','action'],['说明','detail'],['时间',x=>nowText(x.created_at)]],state.audit||[]);
+  const a=panel('管理操作记录','不记录 Token、兑换码或奖励正文。');remoteTable(a,[['操作者','actor'],['操作','action'],['说明','detail'],['时间',x=>nowText(x.created_at)]],'audit');
 }
 pages.forEach(([id,label,number])=>{const b=button('',()=>{current=id;render();if(id==='monitor')return loadMetrics();},'');b.dataset.page=id;b.append(element('span',number),document.createTextNode(label));$('#nav').append(b);});
 $('#refresh').onclick=()=>refresh().catch(showError);$('#dialog-close').onclick=$('#cancel').onclick=()=>$('#editor').close();$('#output-close').onclick=()=>$('#output').close();

@@ -50,10 +50,27 @@ async def main():
 window.calls=[];
 window.AstrBotPluginView={
  ready:async()=>({pluginName:'astrbot_plugin_yuma_mcqq'}),
- apiGet:async()=>structuredClone(window.fixture),
+ apiGet:async()=>{
+  const defaults=[{action_id:'signin',name:'签到',description:'先完成游戏签到',kind:'builtin'},
+    {action_id:'help',name:'mc帮助',description:'查看帮助',kind:'builtin'},
+    ...window.fixture.settings.commands.map(x=>({action_id:'custom:'+x.id,name:x.name,description:x.description,kind:'custom'}))];
+  window.fixture.help_commands=defaults.map((row,index)=>{const override=window.fixture.settings.help?.entries?.[row.action_id]||{};return {...row,default_description:row.description,description:override.description||row.description,visible:override.visible!==false,order:override.order??index*10,default_order:index*10,enabled:true,aliases:[]};});
+  return structuredClone(window.fixture);
+ },
  apiPost:async(path,body)=>{
   window.calls.push({path,body});
   if(path==='settings'){Object.assign(window.fixture.settings,body.settings);return {revision:'test-only'};}
+  if(body.action==='dashboard_page'){
+    const p=body.payload;let rows=window.fixture.domain[p.table]??window.fixture[p.table]??[];
+    if(p.scope)rows=rows.filter(x=>x.scope===p.scope);
+    const pages=Math.max(1,Math.ceil(rows.length/p.page_size)),page=Math.max(1,Math.min(p.page,pages));
+    return {total:rows.length,pages,page,page_size:p.page_size,rows:rows.slice((page-1)*p.page_size,page*p.page_size)};
+  }
+  if(body.action==='server_rename'){
+    const p=body.payload;for(const server of window.fixture.settings.servers)if(server.id===p.server_id)server.id=p.new_server_id;
+    for(const list of [window.fixture.settings.routes,window.fixture.settings.commands,window.fixture.domain.bindings])for(const row of list)if(row.server_id===p.server_id)row.server_id=p.new_server_id;
+    return {status:'SUCCESS',text:'服务器 ID 与关联数据已更新。'};
+  }
   if(body.action==='metrics')return {samples:[{timestamp:1793390400,tps:20,mspt:8,player_ping_ms:35,slp_rtt_ms:4},{timestamp:1793390460,tps:null,mspt:null,player_ping_ms:null,slp_rtt_ms:null},{timestamp:1793390520,tps:19.8,mspt:12,player_ping_ms:42,slp_rtt_ms:5}]};
   if(body.action==='preview')return {status:'SUCCESS',fields:{},cleaned:body.payload.raw,preview:body.payload.raw};
   if(body.action==='preview_signin'){
@@ -113,6 +130,34 @@ window.AstrBotPluginView={
         await page.wait_for_selector('#output[open]')
         assert 'There are 1 players online' in await page.locator('#output-text').inner_text()
         await page.locator('#output-close').click()
+        await page.get_by_role('button',name='帮助回复设置',exact=True).click()
+        assert await page.get_by_label('帮助使用图片回复',exact=True).is_checked()
+        await page.get_by_label('帮助使用图片回复',exact=True).uncheck()
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        assert await page.evaluate('window.fixture.settings.help.image_enabled') is False
+        help_table=page.locator('[data-table="help-commands"]')
+        signin_row=help_table.locator('tbody tr').filter(has=page.get_by_text('签到',exact=True))
+        await signin_row.get_by_role('button',name='编辑说明与排序',exact=True).click()
+        await page.get_by_label('帮助说明',exact=True).fill('领取每日星币，先游戏再群内签到。')
+        await page.get_by_label('在帮助中显示',exact=True).uncheck()
+        await page.get_by_label('帮助排序',exact=True).fill('5')
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        assert await page.evaluate('window.fixture.settings.help.entries.signin')=={'description':'领取每日星币，先游戏再群内签到。','visible':False,'order':5}
+        await signin_row.get_by_role('button',name='在帮助显示',exact=True).click()
+        await signin_row.get_by_role('button',name='从帮助隐藏',exact=True).wait_for()
+        await signin_row.get_by_role('button',name='下移',exact=True).click()
+        await help_table.locator('tbody tr').first.get_by_text('mc帮助',exact=True).wait_for()
+        custom_row=help_table.locator('tbody tr').filter(has=page.get_by_text('测试查询',exact=True))
+        await custom_row.get_by_role('button',name='从帮助隐藏',exact=True).click()
+        await custom_row.get_by_role('button',name='在帮助显示',exact=True).wait_for()
+        await page.get_by_role('button',name='帮助回复设置',exact=True).click()
+        await page.get_by_label('帮助使用图片回复',exact=True).check()
+        await page.get_by_role('button',name='保存',exact=True).click()
+        await page.wait_for_selector('#editor:not([open])',state='attached')
+        assert await page.evaluate('window.fixture.settings.help.image_enabled') is True
+        await page.screenshot(path=str(screenshots/'help-settings.png'),full_page=True)
         await page.locator('nav button[data-page="routes"]').click()
         await page.get_by_role('button',name='编辑与开关',exact=True).click()
         await page.screenshot(path=str(screenshots/'route-editor.png'),full_page=True)
@@ -122,6 +167,7 @@ window.AstrBotPluginView={
         await page.get_by_label('QQ → MC 显示前缀',exact=True).fill('&e[{group}]&e{sender}{reply}&8:')
         await page.get_by_label('链接标签颜色',exact=True).evaluate("el=>el.value='#ffaa00'")
         await page.get_by_label('图片标签颜色',exact=True).evaluate("el=>el.value='#55ffff'")
+        await page.get_by_label('{reply} 标签模板（留空用默认）',exact=True).fill('(回复 @{sender})')
         await page.get_by_label('引用悬浮内容（留空用默认）',exact=True).fill('{sender}\n{message}\nDate: {time}')
         await page.get_by_label('引用悬浮内容（留空用默认）',exact=True).scroll_into_view_if_needed()
         await page.screenshot(path=str(screenshots/'route-style-editor.png'),full_page=True)
@@ -132,6 +178,7 @@ window.AstrBotPluginView={
         assert route_value['prefix']=='&e[{group}]&e{sender}{reply}&8:'
         assert route_value['message_colors']['link']=='#ffaa00' and route_value['message_colors']['image']=='#55ffff'
         assert route_value['templates']['reply_hover']=='{sender}\n{message}\nDate: {time}'
+        assert route_value['templates']['reply_label']=='(回复 @{sender})'
         await page.get_by_role('button',name='编辑',exact=True).first.click()
         await page.get_by_label('服务器显示名称',exact=True).fill('生存测试服')
         await page.get_by_label('连接方式',exact=True).select_option('reverse')
@@ -153,15 +200,52 @@ window.AstrBotPluginView={
         assert await page.evaluate('window.fixture.settings.points_name')=='星币'
         await page.locator('nav button[data-page="bindings"]').click()
         assert await page.locator('#title').inner_text()=='绑定与星币'
-        page.once('dialog',lambda dialog:dialog.accept())
         await page.get_by_role('button',name='管理员解绑',exact=True).click()
+        await page.locator('#cancel').click()
+        assert not await page.evaluate("window.calls.some(x=>x.body?.action==='binding_unbind')")
+        await page.get_by_role('button',name='管理员解绑',exact=True).click()
+        await page.get_by_role('button',name='确认解绑',exact=True).click()
         await page.wait_for_selector('#output[open]')
         assert '已解绑 TestPlayer' in await page.locator('#output-text').inner_text()
         assert await page.evaluate('window.fixture.domain.bindings.length')==0
         unbind_call=await page.evaluate("window.calls.find(x=>x.body?.action==='binding_unbind')")
         assert unbind_call['body']['payload']=={'user_id':'100001'}
         await page.locator('#output-close').click()
+        # More rows than a single page; changing size and refresh preserve the page.
+        await page.evaluate("""()=>{
+          window.fixture.domain.bindings=Array.from({length:23},(_,i)=>({qq_id:String(110000+i),player:'Sample'+i,server_id:'paper-test',updated:1793390400+i}));
+          window.fixture.runs=Array.from({length:125},(_,i)=>({id:'run'+i,action:'list',server_id:'paper-test',status:'SUCCESS',created_at:1793390400+i}));
+          window.fixture.audit=Array.from({length:23},(_,i)=>({actor:'test-admin',action:'sample',detail:'Synthetic '+i,created_at:1793390400+i}));
+        }""")
+        await page.locator('#refresh').click()
+        binding_table=page.locator('[data-table="bindings"]')
+        await binding_table.get_by_text('共 23 条 · 第 1 / 3 页',exact=True).wait_for()
+        assert await binding_table.locator('tbody tr').count()==10
+        await binding_table.get_by_role('button',name='下一页',exact=True).click()
+        await binding_table.get_by_text('共 23 条 · 第 2 / 3 页',exact=True).wait_for()
+        assert 'Sample10' in await binding_table.inner_text()
+        await page.locator('#refresh').click()
+        await binding_table.get_by_text('共 23 条 · 第 2 / 3 页',exact=True).wait_for()
+        await binding_table.get_by_label('每页显示数量',exact=True).select_option('20')
+        await binding_table.get_by_text('共 23 条 · 第 1 / 2 页',exact=True).wait_for()
+        assert await binding_table.locator('tbody tr').count()==20
+        await binding_table.get_by_role('button',name='下一页',exact=True).click()
+        await binding_table.get_by_text('共 23 条 · 第 2 / 2 页',exact=True).wait_for()
+        assert await binding_table.locator('tbody tr').count()==3
+        assert await binding_table.get_by_role('button',name='下一页',exact=True).is_disabled()
+        await binding_table.get_by_label('每页显示数量',exact=True).select_option('10')
+        await binding_table.get_by_text('共 23 条 · 第 1 / 3 页',exact=True).wait_for()
+        await page.screenshot(path=str(screenshots/'bindings-pagination.png'),full_page=True)
         await page.locator('nav button[data-page="diagnostics"]').click()
+        runs_table=page.locator('[data-table="runs"]')
+        await runs_table.get_by_text('共 125 条 · 第 1 / 13 页',exact=True).wait_for()
+        await runs_table.get_by_label('每页显示数量',exact=True).select_option('100')
+        await runs_table.get_by_text('共 125 条 · 第 1 / 2 页',exact=True).wait_for()
+        await runs_table.get_by_role('button',name='下一页',exact=True).click()
+        await runs_table.get_by_text('共 125 条 · 第 2 / 2 页',exact=True).wait_for()
+        assert await runs_table.locator('tbody tr').count()==25
+        await runs_table.get_by_label('每页显示数量',exact=True).select_option('10')
+        await runs_table.get_by_text('共 125 条 · 第 1 / 13 页',exact=True).wait_for()
         await page.get_by_role('button',name='预览迁移',exact=True).click()
         await page.get_by_label('旧 SQLite 文件绝对路径',exact=True).fill('/offline/synthetic.sqlite')
         await page.get_by_role('button',name='只读预览',exact=True).click()
@@ -184,6 +268,20 @@ window.AstrBotPluginView={
         assert applied['binding_choices']==['old-a:User:100001']
         assert applied['plan_digest']=='plan-1' and applied['binding_server_id']=='paper-test'
         await page.locator('#output-close').click()
+        await page.locator('nav button[data-page="monitor"]').click()
+        await page.get_by_text('0.24 ticks',exact=True).wait_for()
+        assert await page.locator('svg .axis-tick').count()==20
+        assert await page.get_by_text('按 1 tick = 50 ms 换算；显示值 = 原始 MSPT ÷ 50。',exact=True).is_visible()
+        await page.screenshot(path=str(screenshots/'monitor-ticks.png'),full_page=True)
+        await page.locator('nav button[data-page="routes"]').click()
+        await page.get_by_role('button',name='修改 ID',exact=True).click()
+        await page.get_by_label('新服务器 ID',exact=True).fill('paper-renamed')
+        await page.get_by_role('button',name='确认修改 ID',exact=True).click()
+        await page.wait_for_selector('#output[open]')
+        assert await page.evaluate('window.fixture.settings.routes[0].server_id')=='paper-renamed'
+        renamed=await page.evaluate("window.calls.find(x=>x.body?.action==='server_rename').body.payload")
+        assert renamed=={'server_id':'paper-test','new_server_id':'paper-renamed','revision':'test-only'}
+        await page.locator('#output-close').click()
         await page.locator('nav button[data-page="shop"]').click()
         await page.locator('footer').evaluate("el=>el.textContent='本地 GUI 验证 · 仅合成数据'")
         await page.screenshot(path=str(screenshots/'shop.png'), full_page=True)
@@ -192,7 +290,7 @@ window.AstrBotPluginView={
         await page.screenshot(path=str(screenshots/'mobile.png'), full_page=True)
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1')
         assert not errors, errors
-        print(json.dumps({'pages':7,'forms':['command_save','parser_preview','signin_combinations','route_event_switches','reply_colors_hover','reverse_connection','binding_prefix_currency','admin_unbind','migration_binding_plan'],'responsive':True,'console_errors':errors},ensure_ascii=False))
+        print(json.dumps({'pages':7,'forms':['command_save','parser_preview','signin_combinations','route_event_switches','reply_colors_hover_label','reverse_connection','binding_prefix_currency','admin_unbind','migration_binding_plan','server_rename','pagination','monitor_ticks_axes','help_settings'],'responsive':True,'console_errors':errors},ensure_ascii=False))
         await browser.close()
 
 

@@ -11,11 +11,12 @@ python -m unittest discover -s tests -v
 python -m compileall -q core services adapters main.py
 node --check views/dashboard/app.js
 python tests/gui_smoke.py
+python tests/gui_sandbox_smoke.py
 ```
 
-1.2.0 本地全量结果：**197 / 197 项通过**，耗时50.118秒，无跳过；覆盖真实 AstrBot 集成及管理 API、绑定迁移与补迁、四种签到组合、引用插槽/配色/原时间、管理员绑定、原样 cmd、组合服务、文本/配置、正反向传输、媒体与监控。Python 编译、JavaScript 语法、Git 空白检查均通过。历史基线：1.0 为 66 项，1.1.0 为 116 项，1.1.1 为 156 项通过。
+1.3.0 本地全量结果：**237 / 237 项通过**，耗时52.066秒，无跳过；包含真实 AstrBot 4.29.1 管理接口、分页、服务器 ID 迁移与中断恢复、旧上下文竞态、配置回退与重命名并发、帮助图片/文字及配置和同序号稳定排序、绑定迁移、签到、消息传输和监控。Python 编译、JavaScript 语法、Git 空白检查均通过。历史基线：1.0 为66项、1.1.0 为116项、1.1.1 为156项、1.2.0 为197项通过。
 
-1.1.1 时在原 AstrBot 4.29.0 环境另行运行 9 项管理 API / cmd 参数兼容测试，全部通过，耗时16.139秒；本次框架入口未修改，1.2.0 全套在 4.29.1 验证。
+1.1.1 时在原 AstrBot 4.29.0 环境另行运行 9 项管理 API / cmd 参数兼容测试，全部通过，耗时16.139秒；1.3.0 的框架入口变更在 4.29.1 验证，未重复声称已在4.29.0覆盖新功能。
 
 框架测试显式设置独立 ASTRBOT_ROOT；不存在 AstrBot 的环境会明确 skip 该组测试，不能据此声称框架集成通过。浏览器脚本需要 Playwright 和 MCQQ_BROWSER，可选，不属于插件运行依赖。
 
@@ -32,10 +33,15 @@ python tests/gui_smoke.py
 | 监控默认命令 | tps/mspt/ping缺省及显式覆盖、Paper三窗口TPS、有毫秒值的ping、无数值Pong保持缺失 |
 | 引用与颜色 | 顶层reply槽位及旧模板位置兼容、重复槽位仅查询一次、禁用/缺失引用、字面转义和昵称不注入；9类标签色彩、legacy/modern、颜色连续、三行原作者/内容/时间、秒/毫秒时间戳、UTC/上海时区、缺时间与跨群拒绝 |
 | 浏览器GUI | 7页切换、命令新增、解析预览和四种签到结果、游戏事件复选框、颜色选择和三行引用模板、反向连接字段、默认免验证/前缀/币名、管理员解绑、迁移冲突阻止/取消选择/重新核对/计划确认；移动端无横向溢出、无JS异常；纯HTTP页面也可使用 |
+| 服务器 ID | 配置/绑定/验证码/历史/订单快照/命令记录/采样一致迁移，目标冲突及旧版本拒绝；部分失败重试/启动恢复；在途请求取消后UNKNOWN不重放；旧ctx按新路由执行；真实HTTP配置回滚锁与重命名串行 |
+| 分页 | 六类白名单、每页上限、scope过滤后总数、稳定排序、空页和越界、拒绝无效参数/SQL注入、运行记录不泄露原始RCON正文 |
+| 帮助 | 实际名称/别名/前缀、稳定action ID、默认/自定义说明与显隐、权限与入口启停、全局排序、图片关闭及缺字体回文字、中文多页不截断、每页发送原UMO |
 
 截图：[桌面总览](screenshots/dashboard.png)、[商店](screenshots/shop.png)、[移动端](screenshots/mobile.png)、[群服路由](screenshots/routes.png)、[转发与事件表单](screenshots/route-editor.png)、[颜色与三行引用](screenshots/route-style-editor.png)、[绑定迁移计划](screenshots/migration-plan.png)、[反向连接表单](screenshots/reverse-editor.png)。截图均为合成数据，页面有对应标记。
 
-浏览器最终结果：7页、9项表单流程通过，移动端无横向溢出，JS异常0。色块已在截图中检查为可见且可选择的颜色控件。Mermaid 11.12.0解析并渲染4/4张图通过；更新后的[完整拓扑SVG](architecture.svg)包含86节点、142连线，使用纯SVG文本，在Edge独立打开验证。
+浏览器最终结果：7页、13项操作流程通过，移动端无横向溢出，JS异常0；新增帮助开关/说明/显隐/排序、23条绑定和125条诊断记录翻页、原值12ms显示0.24ticks及20个纵轴刻度、服务器ID修改。另在官方同样的 iframe sandbox 中独立验证解绑取消不发请求、失败原因留在表单、成功只调用一次；其他删除也可使用页面内确认，原生confirm调用数为0。旧实现已在相同限制下复现“confirm被禁止、请求数0”。
+
+新增合成截图：[帮助设置](screenshots/help-settings.png)、[绑定分页](screenshots/bindings-pagination.png)、[ticks坐标](screenshots/monitor-ticks.png)、[沙箱内解绑](screenshots/admin-unbind-sandbox.png)。帮助图片[第1页](screenshots/help-example-1.png)、[第2页](screenshots/help-example-2.png)的中文排版和分页经过目检；不会将用户数据库内容放入样张。1.2.0 已验证的4张Mermaid和[完整拓扑SVG](architecture.svg)保留（86节点、142连线），1.3行为补充见架构与接口文档。
 
 用户提供的旧库仅做只读结构检查和迁移计划预览：真实源文件哈希不变，未创建WAL/SHM，临时空目标无导入记录并已清理。冲突需要管理员在GUI核对归属，未替用户选择。真实数据库、个人行和奖励内容未写入仓库；自动化导入测试与截图均使用合成数据。
 
@@ -43,7 +49,7 @@ python tests/gui_smoke.py
 
 Windows受限沙箱无法完成Python事件循环的本机socketpair初始化，已用仅涉及临时数据库和模拟服务的允许环境运行异步测试。此限制与插件业务网络连通性无关；没有通过访问生产服务规避测试。
 
-CI 配置在 `.github/workflows/tests.yml`，核心测试覆盖Python 3.11/3.12。远程CI结果以PR检查为准，不把尚未运行的版本写作本地已验证。
+CI 配置在 `.github/workflows/tests.yml`，核心测试覆盖Python 3.11/3.12，并安装Noto CJK字体实际渲染帮助PNG；缺少AstrBot时框架组明确跳过。远程CI结果以PR检查为准，不把尚未运行的版本写作本地已验证。
 
 ## 实服验收步骤（尚未执行）
 

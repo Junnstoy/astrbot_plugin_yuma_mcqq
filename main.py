@@ -14,10 +14,12 @@ from astrbot.api.web import error_response, json_response, request
 
 from .adapters.astrbot_commands import (
     ADMIN_ACTIONS,
+    BUILTINS,
     CommandRegistryBridge,
     install_builtin_commands,
 )
 from .services.application import Application
+from .services.help_renderer import build_help_document, help_catalog, render_help_pages
 
 
 PLUGIN_NAME = "astrbot_plugin_yuma_mcqq"
@@ -30,7 +32,7 @@ AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
     PLUGIN_NAME,
     "Junnstoy",
     "Paper / QueQiao 群服互通、绑定、签到点数商店与性能监控",
-    "1.2.0",
+    "1.3.0",
     "https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq",
 )
 class YumaMCQQPlugin(Star):
@@ -145,7 +147,20 @@ class YumaMCQQPlugin(Star):
                 str((confirmation or {}).get("effective_command") or "确认兑换"), ctx["umo"],
             )
             if action == "help":
-                result = {"text": self._help_text(ctx, effective), "status": "ok"}
+                document = self._help_document(ctx, effective)
+                result = {"text": document.as_text(), "status": "ok"}
+                if self.app.settings.data.get("help", {}).get("image_enabled", True):
+                    try:
+                        pages = await asyncio.to_thread(render_help_pages, document, self.data_dir / "help")
+                    except Exception as exc:
+                        logger.warning("[%s] 帮助图片生成失败，改用完整文字：%s", PLUGIN_NAME, str(exc))
+                    else:
+                        for path in pages:
+                            if not await self._send_result(ctx["umo"], {"image_path": path}):
+                                await self._send_result(ctx["umo"], result)
+                                return
+                        if pages:
+                            return
             else:
                 result = await self.app.execute(action, ctx, str(args or ""))
         except (ValueError, PermissionError) as exc:
@@ -166,31 +181,18 @@ class YumaMCQQPlugin(Star):
         # Without a text wake prefix the group user must mention the bot.
         return "@机器人 " + name
 
+    def _help_entries(self, effective: list[dict]) -> list[dict]:
+        custom_handlers = {self.commands.handler_name(str(item["id"])): item
+                           for item in self.app.settings.data.get("commands", [])}
+        return help_catalog(effective, custom_handlers, self.app.settings.data.get("help", {}),
+                            {action: description for action, _, description in BUILTINS}, ADMIN_ACTIONS)
+
+    def _help_document(self, ctx: dict, effective: list[dict]):
+        return build_help_document(self._help_entries(effective), is_admin=ctx["is_admin"],
+                                   command_hint=lambda name: self._command_hint(name, ctx["umo"]))
+
     def _help_text(self, ctx: dict, effective: list[dict]) -> str:
-        disabled_custom = {
-            self.commands.handler_name(str(item["id"]))
-            for item in self.app.settings.data.get("commands", [])
-            if not item.get("enabled", True) or (item.get("admin_only", True) and not ctx["is_admin"])
-        }
-        lines = ["MCQQ 指令（以当前管理行为配置为准）"]
-        for entry in effective:
-            handler = str(entry.get("handler_name", ""))
-            if not entry.get("enabled", True) or handler in disabled_custom:
-                continue
-            if not ctx["is_admin"] and (
-                handler.removeprefix("cmd_") in ADMIN_ACTIONS
-                or str(entry.get("permission", "")).lower() == "admin"
-            ):
-                continue
-            name = str(entry.get("effective_command") or "")
-            if not name:
-                continue
-            description = str(entry.get("description") or "").strip()
-            original = str(entry.get("original_command") or "")
-            if original:
-                description = description.replace(original, name)
-            lines.append(self._command_hint(name, ctx["umo"]) + (" — " + description if description else ""))
-        return "\n".join(lines)
+        return self._help_document(ctx, effective).as_text()
 
     async def _send_result(self, umo: str, result: dict) -> bool:
         parts = []
@@ -238,7 +240,7 @@ class YumaMCQQPlugin(Star):
         if not route or not route.get("enabled", True) or not route.get("qq_to_mc", True):
             return
         try:
-            await self.app.relay.from_qq(event, route)
+            await self.app.relay_from_qq(event, route)
         except Exception as exc:
             # Relay faults do not manufacture bot replies or consume AI events.
             logger.error("[%s] 普通群消息转发失败。(%s)", PLUGIN_NAME, type(exc).__name__)
@@ -269,6 +271,7 @@ class YumaMCQQPlugin(Star):
             self._web_actor()
             result = self.app.snapshot()
             result["effective_commands"] = await self.commands.effective_commands()
+            result["help_commands"] = self._help_entries(result["effective_commands"])
             return json_response(result)
         except PermissionError as exc:
             return error_response(str(exc), status_code=403)
@@ -325,7 +328,12 @@ class YumaMCQQPlugin(Star):
                 raise ValueError("payload 必须是对象。")
             if body["action"] == "settings":
                 raise ValueError("请通过 settings 接口保存配置。")
-            result = await self.app.web(body["action"], payload, actor)
+            if body["action"] == "server_rename":
+                async with self._settings_lock:
+                    self._web_actor()
+                    result = await self.app.web(body["action"], payload, actor)
+            else:
+                result = await self.app.web(body["action"], payload, actor)
             return json_response(result)
         except PermissionError as exc:
             return error_response(str(exc), status_code=403)

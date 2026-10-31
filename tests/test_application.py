@@ -101,6 +101,20 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ALREADY_SIGNED")
         self.app.gateway.rcon.assert_not_awaited()
 
+    async def test_signin_preview_combines_independent_statuses_without_mutation(self):
+        self.app.gateway.rcon = AsyncMock()
+        before = self.app.store.snapshot()
+        for game_signed in (False, True):
+            raw = '[手记人偶] 玩家 Rincho 今天已经签到了，请不要重复签到。' if game_signed else '[手记人偶] 成功给玩家 Rincho 签到， 当前该玩家已连续签到 8 天。'
+            for group_signed in (False, True):
+                result = await self.app.web('preview_signin',{'route_umo':self.ctx['umo'],'player':'Rincho',
+                    'raw':raw,'group_signed':group_signed,'points_delta':1,'balance':12},'tester')
+                self.assertIn('玩家: Rincho',result['preview'])
+                self.assertIn('群内签到失败❌️' if group_signed else '群内签到成功✅️',result['preview'])
+                self.assertIn('游戏签到失败❌️' if game_signed else '游戏签到成功✅️ 已连续签到 8 天。',result['preview'])
+        self.app.gateway.rcon.assert_not_awaited()
+        self.assertEqual(self.app.store.snapshot(),before)
+
     async def test_metric_commands_return_rcon_text_and_status_only_connectivity(self):
         self.assertEqual(self.app.settings.server('paper')['tps_command'],'tps')
         self.assertEqual(self.app.settings.server('paper')['ping_command'],'ping')
@@ -124,6 +138,37 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('TestPlayer',result['text'])
         record = self.app._ops.execute('SELECT actor,action FROM audit ORDER BY id DESC LIMIT 1').fetchone()
         self.assertEqual(tuple(record),('dashboard:tester','binding_unbind'))
+
+    async def test_web_migration_reviews_binding_target_and_keeps_ledger_idempotent(self):
+        source=Path(self.temp.name)/'legacy-source.sqlite3'
+        connection=sqlite3.connect(source)
+        try:
+            connection.executescript('''CREATE TABLE balances(session TEXT,user_id TEXT,total INTEGER);
+                CREATE TABLE checkins(id INTEGER,session TEXT,user_id TEXT,day TEXT,points INTEGER,credited INTEGER);
+                CREATE TABLE bindings(account_key TEXT PRIMARY KEY,player TEXT);''')
+            connection.execute('INSERT INTO balances VALUES(?,?,?)',('old:GroupMessage:1','100001',42))
+            connection.execute('INSERT INTO bindings VALUES(?,?)',('old:User:100001','TestPlayer'))
+            connection.commit()
+        finally:connection.close()
+        payload={'path':str(source),'binding_server_id':'paper','scope_map':{'old:GroupMessage:1':self.ctx['umo']}}
+        preview=await self.app.web('import_preview',payload,'dashboard:tester')
+        self.assertTrue(preview['binding_plan']['can_apply'])
+        self.assertIsNone(self.app.store.binding('100001'))
+        with self.assertRaises(ValueError):
+            await self.app.web('import_apply',{**payload,'confirmed':True,'digest':preview['digest'],'plan_digest':'wrong'},'dashboard:tester')
+        result=await self.app.web('import_apply',{**payload,'confirmed':True,'digest':preview['digest'],'plan_digest':preview['plan_digest']},'dashboard:tester')
+        self.assertEqual(result['bindings_added'],1)
+        bound=self.app.store.binding('100001')
+        self.assertEqual((bound['player'],bound['server_id'],bound['verified']),('TestPlayer','paper',False))
+        self.assertIsNone(bound['mc_uuid'])
+        repeated=await self.app.web('import_preview',payload,'dashboard:tester')
+        result=await self.app.web('import_apply',{**payload,'confirmed':True,'digest':repeated['digest'],'plan_digest':repeated['plan_digest']},'dashboard:tester')
+        self.assertTrue(result['already_imported'])
+        self.assertEqual(self.app.store.balance(self.ctx['umo'],'100001')['total'],42)
+        with self.assertRaisesRegex(ValueError,'服务器'):
+            await self.app.web('import_preview',{**payload,'binding_server_id':'missing'},'dashboard:tester')
+        with self.assertRaisesRegex(ValueError,'服务器'):
+            await self.app.web('import_preview',{**payload,'server_map':{'old':'missing'}},'dashboard:tester')
 
     async def test_metric_timeout_does_not_fabricate_a_measurement(self):
         self.app.gateway.rcon = AsyncMock(side_effect=module.OutcomeUnknown('no response'))

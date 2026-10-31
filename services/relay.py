@@ -6,12 +6,16 @@ import hashlib
 import json
 import logging
 import re
+import string
 import time
 from collections import deque
 from collections.abc import Mapping
+from copy import deepcopy
+from datetime import datetime
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
-from ..core.text import render_template
+from ..core.text import render_template, template_fields
 from .media import MediaRejected, MediaUnavailable
 
 log = logging.getLogger(__name__)
@@ -20,6 +24,9 @@ FORMAT = re.compile(r"[§&]x(?:[§&][0-9a-f]){6}|[§&]#[0-9a-f]{6}|[§&][0-9a-fk
 COLOR_NAMES = dict(zip("0123456789abcdef", ("black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white")))
 DECORATIONS = {"k": "obfuscated", "l": "bold", "m": "strikethrough", "n": "underlined", "o": "italic"}
 LABELS = {"image": "图片", "record": "语音", "video": "视频", "file": "文件"}
+MESSAGE_COLORS = {"link": "blue", "image": "blue", "record": "blue", "video": "blue", "file": "blue",
+                  "forward": "blue", "reply": "gray", "face": "green", "at": "yellow"}
+REPLY_HOVER = "{sender}\n{message}\nDate: {time}"
 EVENTS = {"player_chat": "PlayerChatEvent", "player_join": "PlayerJoinEvent", "player_quit": "PlayerQuitEvent", "player_death": "PlayerDeathEvent", "player_achievement": "PlayerAchievementEvent", "player_advancement": "PlayerAchievementEvent"}
 
 
@@ -50,8 +57,14 @@ def strip_styles(value: str) -> str:
     return "".join(output)
 
 
-def styled_components(text: str, *, modern: bool = False, color: str = "white", links: bool = True) -> list[dict]:
+def styled_components(text: str, *, modern: bool = False, color: str = "white", links: bool = True,
+                      link_color: str = "blue") -> list[dict]:
     """Translate legacy colour/style codes to actual JSON properties, preserving URLs."""
+    return _styled_parts([text], modern=modern, color=color, links=links, link_color=link_color)
+
+
+def _styled_parts(parts: list[str | dict], *, modern: bool, color: str, links: bool, link_color: str = "blue") -> list[dict]:
+    """Keep text formatting state across inserted components without modifying them."""
     state = {"color": color, **{name: False for name in DECORATIONS.values()}}
     result = []
 
@@ -73,17 +86,77 @@ def styled_components(text: str, *, modern: bool = False, color: str = "white", 
             cursor = match.end()
         emit(value[cursor:])
 
-    cursor = 0
-    for match in URL.finditer(text):
-        plain(text[cursor:match.start()])
-        source = match.group().rstrip("。，！；,;)")
-        if links:
-            result.append(minecraft_component("[链接]", hover=source, url=_safe_url(source), modern=modern, color="blue"))
-        else:
-            emit(source)
-        cursor = match.start() + len(source)
-    plain(text[cursor:])
+    for text in parts:
+        if isinstance(text, dict):
+            result.append(deepcopy(text))
+            continue
+        cursor = 0
+        for match in URL.finditer(text):
+            plain(text[cursor:match.start()])
+            source = match.group().rstrip("。，！；,;)")
+            if links:
+                result.append(minecraft_component("[链接]", hover=source, url=_safe_url(source), modern=modern, color=link_color))
+            else:
+                emit(source)
+            cursor = match.start() + len(source)
+        plain(text[cursor:])
     return result
+
+
+def _prefix_components(template: str, values: dict, replies: list[dict], *, modern: bool) -> list[dict]:
+    # Validate with the same template rules as other text. Only real template
+    # fields insert components: escaped braces and sender names remain literal.
+    render_template(template, values)
+    parts, pending = [], []
+    for literal, field, _, _ in string.Formatter().parse(template):
+        pending.append(literal)
+        if field == "reply" and replies:
+            parts.append("".join(pending))
+            pending.clear()
+            parts.extend(replies)
+        elif field is not None and field != "reply":
+            value = values.get(field, "")
+            pending.append("" if value is None else str(value))
+    parts.append("".join(pending))
+
+    # Preserve the existing prefix size bound, including inserted label text.
+    bounded, remaining = [], 300
+    for part in parts:
+        if remaining <= 0:
+            break
+        text = part if isinstance(part, str) else part.get("text", "")
+        bounded.append(text[:remaining] if isinstance(part, str) else {**part, "text": text[:remaining]})
+        remaining -= len(text)
+    return _styled_parts(bounded, modern=modern, color="aqua", links=False)
+
+
+def _message_colors(route: dict) -> dict[str, str]:
+    colors = dict(MESSAGE_COLORS)
+    configured = route.get("message_colors", {})
+    if isinstance(configured, dict):
+        for kind in colors:
+            value = str(configured.get(kind, "")).lower()
+            if value in COLOR_NAMES.values() or re.fullmatch(r"#[0-9a-f]{6}", value):
+                colors[kind] = value
+    return colors
+
+
+def _quote_time(info: dict, data: dict, route: dict) -> str:
+    for source, keys in ((info, ("time", "timestamp")), (data, ("timestamp", "time"))):
+        for key in keys:
+            raw = source.get(key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                timestamp = float(raw)
+                if timestamp <= 0:
+                    continue
+                if timestamp >= 100_000_000_000:
+                    timestamp /= 1000
+                return datetime.fromtimestamp(timestamp, ZoneInfo(str(route.get("timezone") or "Asia/Shanghai"))).strftime("%H:%M:%S")
+            except (ValueError, TypeError, OverflowError, OSError, KeyError):
+                continue
+    return "未知"
 
 
 def component_text(value, depth: int = 0) -> str:
@@ -310,11 +383,15 @@ class Relay:
         modern = server.get("component_version") == "modern"
         sender = str(event.get_sender_name()) if hasattr(event, "get_sender_name") else user
         group = str(route.get("display_name") or route.get("name") or "QQ群")
-        prefix = render_template(route.get("prefix", "[{group}] {sender}："), {"group": group, "sender": sender, "user_id": user})
+        prefix = route.get("prefix", "[{group}] {sender}{reply}：")
+        move_replies = "reply" in template_fields(prefix)
+        prefix_values = {"group": group, "sender": sender, "user_id": user}
         async with self._semaphore:
             segments = self._segments(event)
-            components = await self._render_segments(event, segments, route, modern, 0, [0])
-            if not components:
+            replies = []
+            components = await self._render_segments(event, segments, route, modern, 0, [0],
+                                                     reply_components=replies if move_replies else None)
+            if not components and not replies:
                 return
             bounded, remaining = [], 12000
             for component in components:
@@ -325,17 +402,21 @@ class Relay:
                 bounded.append(component)
                 remaining -= len(text)
             components = bounded
-            components[:0] = styled_components(prefix[:300], color="aqua", modern=modern, links=False)
+            components[:0] = _prefix_components(prefix, prefix_values, replies, modern=modern)
+            if not components:
+                return
             rendered = "".join(item["text"] for item in components)
             digest = hashlib.sha256(rendered.encode()).hexdigest()
             self._echoes[(route["server_id"], digest)] = time.monotonic() + 30
             self._echoes = {k: expiry for k, expiry in self._echoes.items() if expiry > time.monotonic()}
             await self.gateway.broadcast(route["server_id"], components)
 
-    async def _render_segments(self, event, segments: list, route: dict, modern: bool, depth: int, budget: list[int]) -> list[dict]:
+    async def _render_segments(self, event, segments: list, route: dict, modern: bool, depth: int, budget: list[int],
+                               *, reply_components: list[dict] | None = None) -> list[dict]:
         if depth > 3:
             return [minecraft_component("[嵌套消息已截断]", color="gray")]
         result = []
+        colors = _message_colors(route)
         enabled = set(route.get("types", ["text", "link", "image", "record", "video", "file", "reply", "forward", "at", "face"]))
         for raw in segments[:100]:
             if budget[0] >= 200:
@@ -349,10 +430,10 @@ class Relay:
             data = raw["data"]
             if kind == "text":
                 text = str(data.get("text", ""))[:4000]
-                result.extend(styled_components(text, modern=modern, links="link" in enabled))
+                result.extend(styled_components(text, modern=modern, links="link" in enabled, link_color=colors["link"]))
             elif kind == "at":
                 target = str(data.get("qq", data.get("id", "")))
-                result.append(minecraft_component("@全体成员" if target == "all" else "@" + str(data.get("name") or target), color="yellow"))
+                result.append(minecraft_component("@全体成员" if target == "all" else "@" + str(data.get("name") or target), color=colors["at"]))
             elif kind == "face":
                 face_kind = data.get("_face_kind", "face")
                 label, url = "表情", ""
@@ -369,7 +450,7 @@ class Relay:
                         except (MediaRejected, ValueError):
                             pass
                 hover = str(data.get("name") or data.get("summary") or "QQ 表情 " + str(data.get("id", "")))
-                result.append(minecraft_component("[" + label + "]", hover=hover, url=url, modern=modern, color="green"))
+                result.append(minecraft_component("[" + label + "]", hover=hover, url=url, modern=modern, color=colors["face"]))
             elif kind in LABELS:
                 label = LABELS[kind]
                 name = str(data.get("name") or data.get("file_name") or "")
@@ -379,15 +460,16 @@ class Relay:
                     source = await self._media_source(event, kind, data)
                     direct = getattr(self.media, "public_source_url", None)
                     url = direct(source) if callable(direct) and _safe_url(source) else await self.media.publish(source, kind, name)
-                    result.append(minecraft_component(f"[{label}]", hover=name or "点击访问，有效期内可用", url=url, modern=modern, color="blue"))
+                    result.append(minecraft_component(f"[{label}]", hover=name or "点击访问，有效期内可用", url=url, modern=modern, color=colors[kind]))
                 except Exception as exc:
                     if isinstance(exc, asyncio.CancelledError):
                         raise
-                    result.append(minecraft_component(f"[{label}·暂不可用]", hover="媒体链接未配置、已失效或无法读取", modern=modern, color="gray"))
+                    result.append(minecraft_component(f"[{label}·暂不可用]", hover="媒体链接未配置、已失效或无法读取", modern=modern, color=colors[kind]))
                     log.debug("[YumaMCQQ] media unavailable: %s", type(exc).__name__)
             elif kind == "reply":
-                author, text = await self._quote(event, data)
-                result.append(minecraft_component(f"[回复 {author}] ", hover=text or "引用内容暂不可用", modern=modern, color="gray"))
+                author, text = await self._quote(event, data, route)
+                target = result if reply_components is None else reply_components
+                target.append(minecraft_component(f"[回复 {author}] ", hover=text or "引用内容暂不可用", modern=modern, color=colors["reply"]))
             elif kind == "forward":
                 records = await self._forward(event, data, route, modern, depth, budget)
                 preview = "\n".join(f"{node['author']}：{node['text']}" for node in records[:5])[:1600]
@@ -396,10 +478,10 @@ class Relay:
                 except Exception:
                     url = ""
                 label = f"[合并消息·{len(records)}条]" if records else "[合并消息·暂不可用]"
-                result.append(minecraft_component(label, hover=preview or "合并消息暂不可用", url=url, modern=modern, color="blue"))
+                result.append(minecraft_component(label, hover=preview or "合并消息暂不可用", url=url, modern=modern, color=colors["forward"]))
             elif kind == "link":
                 url, title = self._card(data)
-                result.append(minecraft_component("[链接]" if not title else "[" + title[:80] + "]", hover=url or "链接卡片暂无法展开", url=url, modern=modern, color="blue"))
+                result.append(minecraft_component("[链接]" if not title else "[" + title[:80] + "]", hover=url or "链接卡片暂无法展开", url=url, modern=modern, color=colors["link"]))
         return result
 
     async def _media_source(self, event, kind: str, data: dict) -> str:
@@ -449,7 +531,9 @@ class Relay:
             return "base64://" + str(info["base64"])
         return next((value for value in values if value), fallback)
 
-    async def _quote(self, event, data: dict) -> tuple[str, str]:
+    async def _quote(self, event, data: dict, route: dict | None = None) -> tuple[str, str]:
+        route = route or {}
+        author, text, quoted_time = "某人", "引用内容暂不可用", "未知"
         try:
             info = await self._api(event, "get_msg", message_id=int(data["id"]))
             group = _group_id(event)
@@ -459,11 +543,14 @@ class Relay:
             elif info.get("group_id") or str(info.get("user_id", "")) != str(event.get_sender_id()):
                 raise MediaRejected("引用消息不属于当前私聊")
             sender = _as_dict(info.get("sender", {}))
-            author = str(sender.get("card") or sender.get("nickname") or data.get("sender_nickname") or sender.get("user_id") or "某人")
+            author = strip_styles(str(sender.get("card") or sender.get("nickname") or data.get("sender_nickname") or sender.get("user_id") or "某人"))
             quoted = info.get("message") or info.get("raw_message") or data.get("chain") or data.get("message_str") or ""
-            return strip_styles(author), self._summary(quoted, preserve_styles=True)[:1600]
+            text = self._summary(quoted, preserve_styles=True)[:1600] or "引用内容暂不可用"
+            quoted_time = _quote_time(info, data, route)
         except Exception:
-            return "某人", "引用内容暂不可用"
+            pass
+        template = route.get("templates", {}).get("reply_hover") or REPLY_HOVER
+        return author, render_template(template, {"sender": author, "message": text, "time": quoted_time})
 
     async def _forward(self, event, data: dict, route: dict, modern: bool, depth: int, budget: list[int]) -> list[dict]:
         content = data.get("content") or data.get("nodes")

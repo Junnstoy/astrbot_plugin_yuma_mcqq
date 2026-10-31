@@ -19,8 +19,8 @@ except ImportError:  # Standalone offline tests.
     from core.text import SIGNIN_RULES, clean_text, parse_rules, render_command, render_template, validate_player
 
 
-DEFAULT_SIGNIN = "签到成功✅️\n本次获得 {points_delta}{points_name}，当前{points_name}：{balance}\n{rcon}"
-DEFAULT_ALREADY_SIGNED = "签到失败❌️ 今日已签到，请不要重复签到。"
+DEFAULT_SIGNIN = "玩家: {player}\n{group_result}\n{game_result}"
+DEFAULT_ALREADY_SIGNED = DEFAULT_SIGNIN
 
 
 class Domain:
@@ -242,9 +242,7 @@ class Domain:
                 game_status = str(parsed["status"]).upper()
                 if game_status not in ("SIGNED", "ALREADY_SIGNED"):
                     state = "failed" if game_status in ("FAILED", "FAILURE", "ERROR") else "unknown"
-                    message = "签到失败❌️ 游戏签到失败或结果无法确认，本次群签到未结算。"
-                    if displayed_rcon:
-                        message += "\n" + displayed_rcon
+                    message = self._signin_unconfirmed_text(game_status, displayed_rcon)
                     self.store.set_signin_state(operation_id, state, game_status, displayed_rcon,
                                                 {"rcon": displayed_rcon, "reply": message, "points_name": self._points_name()})
                     return self._result(message, state)
@@ -271,15 +269,73 @@ class Domain:
                     self.store.set_signin_state(operation_id, state, detail=type(exc).__name__)
                 return self._result(f"签到失败❌️ 游戏或群结算状态需要核对；没有重复增加{self._points_name()}。", "unknown")
 
-    def _signin_message(self, result, binding, route):
-        values = dict(result, points_name=result.get("points_name", self._points_name()),
+    @staticmethod
+    def _signin_unconfirmed_text(game_status, rcon):
+        reason = "游戏签到失败" if game_status in ("FAILED", "FAILURE", "ERROR") else "游戏签到结果无法确认"
+        message = f"签到失败❌️ {reason}，本次群签到未结算。"
+        return message + ("\n" + rcon if rcon else "")
+
+    def _signin_values(self, result, binding):
+        """Derive the two result lines from this operation, never from an older daily row."""
+        game_status = str(result.get("game_status", "UNKNOWN")).upper()
+        group_status = str(result.get("group_status", "NOT_SETTLED")).upper()
+        raw_days = result.get("days", result.get("game_continuous_days", ""))
+        days = str(raw_days) if raw_days is not None and re.fullmatch(r"[0-9]+", str(raw_days)) else ""
+        values = dict(result, points_name=result.get("points_name") or self._points_name(),
                       rcon=result.get("rcon", ""), player=binding["player"], player_name=binding["player"],
-                      game_status_text="本次签到成功" if result["game_status"] == "SIGNED" else "今日已签到",
-                      group_status_text="签到成功" if result["group_status"] == "SIGNED" else "今日已签到")
-        already_signed = result["group_status"] == "ALREADY_SIGNED"
+                      days=days, game_continuous_days=days, game_status=game_status, group_status=group_status,
+                      status=game_status)
+        if group_status == "SIGNED":
+            values["group_status_text"] = "签到成功"
+            values["group_result"] = (f"群内签到成功✅️ 本次获得: {values.get('points_delta', 0)} "
+                                      f"{values['points_name']} 当前{values['points_name']}:{values.get('balance', '')}")
+        elif group_status == "ALREADY_SIGNED":
+            values["group_status_text"] = "今日已签到"
+            values["group_result"] = "群内签到失败❌️ 今日已签到 请不要重复签到"
+        else:
+            values["group_status_text"] = "未结算"
+            values["group_result"] = "群内签到未结算：游戏结果尚未确认。"
+        if game_status == "SIGNED":
+            values["game_status_text"] = "本次签到成功"
+            # Older stored results/custom rules may not contain continuous days.
+            # A confirmed success remains a success without inventing a count.
+            values["game_result"] = "游戏签到成功✅️" + (f" 已连续签到 {days} 天。" if days else "")
+        elif game_status == "ALREADY_SIGNED":
+            values["game_status_text"] = "今日已签到"
+            values["game_result"] = "游戏签到失败❌️ 今日已签到 请不要重复签到"
+        else:
+            failed = game_status in ("FAILED", "FAILURE", "ERROR")
+            values["game_status_text"] = "签到失败" if failed else "结果未知"
+            values["game_result"] = "游戏签到失败❌️" if failed else "游戏签到结果未知，请核对服务器回包。"
+        return values
+
+    def _signin_message(self, result, binding, route):
+        values = self._signin_values(result, binding)
+        already_signed = values["group_status"] == "ALREADY_SIGNED"
         key, default = ("signin_already", DEFAULT_ALREADY_SIGNED) if already_signed else ("signin", DEFAULT_SIGNIN)
         template = route.get("templates", {}).get(key, default)
-        return dict(status="success", text=render_template(template, values), data=result)
+        return dict(status="success", text=render_template(template, values), data=values)
+
+    def preview_signin(self, raw, player, route, group_signed=False, points_delta=1, balance=1):
+        """Pure two-stage preview; no account reads, database writes or game calls."""
+        player = validate_player(str(player))
+        if not isinstance(group_signed, bool):
+            raise ValueError("模拟群签到状态必须为布尔值")
+        for value in (points_delta, balance):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+                raise ValueError("模拟奖励和余额必须为非负整数")
+        parsed = parse_rules(raw, route.get("signin_rules") or SIGNIN_RULES,
+                             player, route.get("signin_prefixes", ["[手记人偶]"]))
+        game_status = str(parsed["status"]).upper()
+        confirmed = game_status in ("SIGNED", "ALREADY_SIGNED")
+        result = {"game_status": game_status,
+                  "group_status": ("ALREADY_SIGNED" if group_signed else "SIGNED") if confirmed else "NOT_SETTLED",
+                  "points_delta": points_delta if confirmed and not group_signed else 0,
+                  "balance": balance, "day": "", "points_name": self._points_name(),
+                  "game_continuous_days": parsed["fields"].get("days", ""), "rcon": clean_text(raw)}
+        values = self._signin_values(result, {"player": player})
+        preview = self._signin_message(result, {"player": player}, route)["text"] if confirmed else self._signin_unconfirmed_text(game_status, result["rcon"])
+        return {**parsed, "preview": preview, "data": values}
 
     async def on_game_event(self, server_id, event):
         if event.get("event_name") not in ("PlayerChatEvent", "PlayerCommandEvent"):
@@ -411,12 +467,32 @@ class Domain:
             result = self._admin_binding("unbind", payload["user_id"], actor)
             return dict(result, text=self._unbind_message(result, admin=True))
         if action == "import_preview":
-            return self.store.preview_legacy(str(payload["path"]))
+            return self.store.preview_legacy(str(payload["path"]), payload.get("scope_map", {}),
+                                            **self._migration_binding_options(payload))
         if action == "import_apply":
             if payload.get("confirmed") is not True:
                 raise DomainError("请先预览并明确确认数据导入")
-            return self.store.import_legacy(str(payload["path"]), str(payload["digest"]), actor, payload.get("scope_map", {}))
+            return self.store.import_legacy(str(payload["path"]), str(payload["digest"]), actor, payload.get("scope_map", {}),
+                                            **self._migration_binding_options(payload),
+                                            plan_digest=payload.get("plan_digest", ""))
         raise DomainError("未知管理操作")
+
+    def _migration_binding_options(self, payload):
+        server_id = payload.get("binding_server_id", "")
+        server_map = payload.get("server_map", {})
+        choices = payload.get("binding_choices")
+        if not isinstance(server_id, str) or not isinstance(server_map, dict):
+            raise DomainError("绑定目标服务器和服务器映射格式无效")
+        known = {str(server["id"]) for server in self.settings.data.get("servers", [])}
+        if server_id and server_id not in known:
+            raise DomainError("绑定目标服务器不存在，请先添加服务器")
+        if any(not isinstance(key, str) or not isinstance(value, str) or value not in known
+               for key, value in server_map.items()):
+            raise DomainError("服务器映射必须指向已配置的服务器 ID")
+        if choices is not None and (not isinstance(choices, list) or not all(isinstance(key, str) for key in choices)):
+            raise DomainError("请选择需要迁移的旧绑定记录")
+        return {"binding_server_id": server_id, "server_map": server_map,
+                "binding_choices": choices, "routes": self.settings.data.get("routes", [])}
 
     async def recover(self):
         return self.store.recover()

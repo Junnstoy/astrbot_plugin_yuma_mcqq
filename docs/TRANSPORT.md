@@ -1,6 +1,6 @@
 # 传输、富消息与性能采样
 
-本文对应 1.1.1 版本。模块按新设计独立实现，旧插件仅用于显式数据迁移。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；已经使用模拟协议与真实 AstrBot 消息类测试，**尚未连接真实 QQ/Paper 服务进行联调**。
+本文对应 1.2.0 版本。模块按新设计独立实现，旧插件仅用于显式数据迁移。协议目标为 QueQiao V2、NapCat/OneBot 和 Paper；已经使用模拟协议与真实 AstrBot 消息类测试，**尚未连接真实 QQ/Paper 服务进行联调**。
 
 ## QueQiao 连接与命令结果
 
@@ -57,10 +57,51 @@ API 的 `code: 200, status: SUCCESS` 仅说明收到了接口结果。签到成�
 | 语音 | `[语音]` 点击资源链接；转码缓存可打开浏览器播放器/下载页 |
 | 视频 | `[视频]` 点击 QQ 资源原链接，或缓存播放器/下载页 |
 | 文件 | `[文件：名称]` 点击下载 |
-| 引用 | `[回复 某人]`，悬浮显示文字和附件类型摘要 |
+| 引用 | `[回复 某人]`，悬浮分行显示原作者、消息与原消息时间；附件显示类型摘要 |
 | 合并消息 | 数量标签、前几条悬浮摘要、完整记录限时页面 |
 
 引用按需调用 `get_msg`，从 AstrBot 的 `get_group_id` / `message_obj.group_id` 取得当前会话，校验返回消息属于当前群或私聊；无法确认归属时仅显示占位。适配时优先保留 `model_dump()` / pydantic.v1 `.dict()` 的字段，避免 `Reply.toDict()` 仅保留 ID 而丢失引用链；通过会话校验后可用这条已解析链补全悬浮内容。不会因为存在一段引用文本就跳过归属校验。[AstrBot 官方消息组件实现](https://github.com/AstrBotDevs/AstrBot/blob/master/astrbot/core/message/components.py)
+
+QQ → MC 的 `prefix` 支持引用组件占位符 `{reply}`，可独立决定引用标签的位置。例如将原来的 `&e[{group}]&e{sender}&8:` 改成：
+
+```text
+&e[{group}]&e{sender}{reply}&8:
+```
+
+`{reply}` 插入 `[回复 作者/ID]` 标签及其悬浮事件，不把引用降为纯文本；标签默认灰色，可通过下述消息颜色配置修改，仍保留原有尾随空格。前后 `&` / `§` 颜色与样式连续生效，引用本身不会改变后续文字的颜色状态，支持两种 Minecraft 组件格式。无引用或关闭路由 `reply` 类型时，占位符为空且不查询引用内容。
+
+模板包含 `{reply}` 时，当前消息的顶层引用只在指定槽位展示，正文不再重复追加；其他正文段的顺序不变，合并消息内部的引用位置也不变。重复写多个 `{reply}` 会在每个位置按原顺序渲染同一组引用组件，每条引用只查询一次，仍遵守前缀长度上限。模板没有该占位符则兼容旧行为，引用继续出现在原消息段位置。`{{reply}}` 表示字面文字 `{reply}`，昵称或群名中的同名文字不被当作槽位。
+
+1.2.0 的新默认前缀为 `[{group}] {sender}{reply}：`。配置升级只迁移旧官方默认前缀；已有自定义前缀保持不变，需要按希望的位置手动加入 `{reply}`。组件插槽仍经过同一会话归属校验，不开放跨群引用，也不引入 ChatImage。
+
+引用悬浮模板由 `routes[].templates.reply_hover` 配置，默认是三个独立行：
+
+```text
+{sender}
+{message}
+Date: {time}
+```
+
+`{sender}` 是被引用消息的作者名称或 ID；`{message}` 保留原消息文字、颜色、URL 原文及附件类型摘要；`{time}` 是原消息时间，按当前路由 `timezone` 显示为 `HH:MM:SS`。优先使用同会话 `get_msg` 回包的 `time` / `timestamp`，缺失时使用已校验归属的引用组件 `timestamp` / `time`，支持 Unix 秒和毫秒。缺失或无法解释的时间显示“未知”，不使用当前时间；跨群引用的作者、内容和时间均不会展示。例如：
+
+```text
+占星术士
+www.google.com
+Date: 11:11:11
+```
+
+GUI 中可以分别修改语义标签颜色，保存到每条群路由的 `message_colors`。支持 Minecraft 的 16 个标准颜色名或 `#RRGGBB`：
+
+| 配置键 | 标签与默认颜色 |
+| --- | --- |
+| `link` | 文字中的 HTTP(S) / `www.` 链接和分享卡片，`blue` |
+| `image` / `record` / `video` / `file` | 图片 / 语音 / 视频 / 文件，分别默认 `blue` |
+| `forward` | 合并消息，`blue` |
+| `reply` | 引用，`gray` |
+| `face` | 普通表情、大表情、骰子、猜拳，`green` |
+| `at` | 提及，`yellow` |
+
+例如 `"message_colors": {"link": "gold", "image": "#12ABEF", "reply": "gray"}`；未列出的类型沿用默认值。类型颜色也用于该类型的“暂不可用”标签，通用截断提示仍为灰色。普通文字和前缀继续按自身的 Minecraft 色码渲染，标签不会把自己的颜色传递给后续正文。颜色配置与悬浮模板同时支持 legacy / modern 组件格式，不改变链接地址或引用归属校验。
 
 语音、视频、图片、文件有公开 HTTP(S) 原地址时直接提供点击链接，不要求先启用媒体服务，也不在转发时抓取该地址。没有公开地址才按需查询 NapCat：语音使用 `get_record(out_format="mp3")`，图片使用 `get_image`，视频使用 `get_file`，文件优先 `get_group_file_url` / `get_private_file_url`，再尝试 `get_file`。NapCat 的 `get_record` 可能把 `url` 返回为转码后的本地路径；若同时有 `base64`，插件可通过有大小限制的媒体缓存发布它，不因此开放任意本地路径。[NapCat GetMsg](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/msg/GetMsg.ts)、[GetRecord](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/file/GetRecord.ts)、[GetFile](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/file/GetFile.ts)
 
@@ -115,7 +156,7 @@ URL 的持有人在有效期内可以访问对应内容，链接可能被收件�
 
 普通 `ping` 的实现取决于服务端安装的插件，不能保证存在毫秒数，例如 EssentialsX 无参数时只发送 `pong` 文案。采样识别带 `ms` 的已支持数值格式；`Pong!`、仅玩家可用、未知命令或其他无法解析的回包记为 `null` 和不可用原因，不写成 0，也不使用 SLP RTT 代替玩家延迟。QQ 的 `ping` 文本查询仍返回实际回包经通用清洗后的原文，不受图表能否解析数值影响。[EssentialsX ping 实现](https://github.com/EssentialsX/Essentials/blob/2.x/Essentials/src/main/java/com/earth2me/essentials/commands/Commandping.java)
 
-管理员仍可显式配置 Spark 等查询命令；解析器保留对 `[⚡]` 前缀、多行/连续回包和统计窗口的支持。启动读取旧配置 `schema_version=2` 时，仅把精确的旧默认值 `spark tps` / `spark ping` 一次性迁移为 `tps` / `ping`，其他自定义命令不变。保存为配置 v3 后再次主动选择 Spark，后续启动不会替换。[配置迁移约定](IMPLEMENTATION_CONTRACT.md#配置-v3)、[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)、[Spark 指标输出定义](https://github.com/lucko/spark/blob/master/spark-common/src/main/java/me/lucko/spark/common/command/modules/HealthModule.java)
+管理员仍可显式配置 Spark 等查询命令；解析器保留对 `[⚡]` 前缀、多行/连续回包和统计窗口的支持。启动读取旧配置 `schema_version=2` 时，仅把精确的旧默认值 `spark tps` / `spark ping` 一次性迁移为 `tps` / `ping`，其他自定义命令不变。保存为配置 v3 或更高版本后再次主动选择 Spark，后续启动不会替换。[配置迁移约定](IMPLEMENTATION_CONTRACT.md)、[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)、[Spark 指标输出定义](https://github.com/lucko/spark/blob/master/spark-common/src/main/java/me/lucko/spark/common/command/modules/HealthModule.java)
 
 | 字段 | 含义 |
 | --- | --- |

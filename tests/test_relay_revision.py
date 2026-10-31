@@ -11,6 +11,7 @@ import tempfile
 import types
 import unittest
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -38,6 +39,7 @@ class RichReply:
     chain: list = field(default_factory=list)
     sender_nickname: str = ""
     type: Kind = Kind.Reply
+    timestamp: float = 0
 
     def dict(self):
         return asdict(self)
@@ -90,7 +92,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
         quote = next(c for c in output if "回复 Bob" in c["text"])
-        self.assertEqual(quote["hoverEvent"]["contents"]["text"], "原文[表情][图片]")
+        self.assertEqual(quote["hoverEvent"]["contents"]["text"], "Bob\n原文[表情][图片]\nDate: 未知")
         self.assertIn("幻域群", "".join(c["text"] for c in output))
 
     async def test_object_raw_message_and_cq_escaped_quote(self):
@@ -100,7 +102,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         await self.relay.from_qq(Event(raw, api=api), self.route)
         quote = next(c for c in self.gateway.broadcast.await_args.args[1] if "回复 CardName" in c["text"])
         # &b is a valid style token outside a URL, but CQ entities are decoded first.
-        self.assertEqual(relay_module.component_text(quote["hoverEvent"]["contents"]), "a[图片]")
+        self.assertEqual(relay_module.component_text(quote["hoverEvent"]["contents"]), "CardName\na[图片]\nDate: 未知")
 
     async def test_quote_hover_preserves_color_style_hex_and_url_query(self):
         async def api(action, **params):
@@ -126,6 +128,200 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         event.bot.call_action = AsyncMock(return_value={"group_id": 88, "message": "another group secret"})
         self.assertNotIn("secret", (await self.relay._quote(event, {"id": "23"}))[1])
 
+    async def test_reply_prefix_slot_moves_hover_component_for_both_mc_formats(self):
+        self.route["prefix"] = "&e[{group}]&e{sender}{reply}&8:"
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "Bob"}, "message": "原文"}
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                self.server["component_version"] = "modern" if modern else "legacy"
+                event = Event({"message": [{"type": "text", "data": {"text": "前"}},
+                                            {"type": "reply", "data": {"id": "20"}},
+                                            {"type": "text", "data": {"text": "后"}}]}, api=api)
+                event.message_obj.message_id = str(modern)
+                await self.relay.from_qq(event, self.route)
+                output = self.gateway.broadcast.await_args.args[1]
+                self.assertEqual("".join(c["text"] for c in output), "[幻域群]Alice[回复 Bob] :前后")
+                quote = next(c for c in output if "回复 Bob" in c["text"])
+                hover_key, value_key = ("hover_event", "value") if modern else ("hoverEvent", "contents")
+                self.assertEqual(quote[hover_key][value_key]["text"], "Bob\n原文\nDate: 未知")
+                self.assertEqual(quote["color"], "gray")
+                self.assertEqual(next(c for c in output if c["text"] == ":")["color"], "dark_gray")
+                event.bot.call_action.assert_awaited_once()
+
+    async def test_repeated_reply_slots_keep_formatting_state_and_fetch_once(self):
+        self.route["prefix"] = "&e&l前{reply}后&r复位§8冒号§a{reply}尾"
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"user_id": 456}, "message": "§a绿色原文"}
+        event = Event({"message": [{"type": "reply", "data": {"id": "20"}},
+                                    {"type": "text", "data": {"text": "正文"}}]}, api=api)
+        await self.relay.from_qq(event, self.route)
+        output = self.gateway.broadcast.await_args.args[1]
+        by_text = {c["text"]: c for c in output}
+        self.assertEqual("".join(c["text"] for c in output), "前[回复 456] 后复位冒号[回复 456] 尾正文")
+        for text in ("前", "后"):
+            self.assertEqual(by_text[text]["color"], "yellow")
+            self.assertTrue(by_text[text]["bold"])
+        self.assertEqual(by_text["复位"]["color"], "aqua")
+        self.assertFalse(by_text["复位"]["bold"])
+        self.assertEqual(by_text["冒号"]["color"], "dark_gray")
+        self.assertEqual(by_text["尾"]["color"], "green")
+        self.assertEqual(by_text["正文"]["color"], "white")
+        quotes = [c for c in output if "回复 456" in c["text"]]
+        self.assertEqual(len(quotes), 2)
+        self.assertEqual(quotes[0], quotes[1])
+        self.assertIsNot(quotes[0]["hoverEvent"], quotes[1]["hoverEvent"])
+        self.assertEqual(next(c for c in quotes[0]["hoverEvent"]["contents"]["extra"] if "绿色原文" in c["text"])["color"], "green")
+        self.assertFalse(quotes[0]["bold"])
+        event.bot.call_action.assert_awaited_once()
+
+    async def test_empty_or_disabled_reply_slot_is_empty_without_lookup(self):
+        self.route["prefix"] = "&e{sender}{reply}&8:"
+        for with_reply, types_enabled in ((False, ["text", "reply"]), (True, ["text"])):
+            with self.subTest(with_reply=with_reply):
+                self.route["types"] = types_enabled
+                segments = [{"type": "text", "data": {"text": "正文"}}]
+                if with_reply:
+                    segments.insert(0, {"type": "reply", "data": {"id": "20"}})
+                event = Event({"message": segments})
+                event.message_obj.message_id = str(with_reply)
+                await self.relay.from_qq(event, self.route)
+                output = self.gateway.broadcast.await_args.args[1]
+                self.assertEqual("".join(c["text"] for c in output), "Alice:正文")
+                self.assertFalse(any("hoverEvent" in c for c in output))
+                event.bot.call_action.assert_not_awaited()
+        self.gateway.broadcast.reset_mock()
+        event = Event({"message": [{"type": "reply", "data": {"id": "20"}}]})
+        await self.relay.from_qq(event, self.route)
+        self.gateway.broadcast.assert_not_awaited()
+        event.bot.call_action.assert_not_awaited()
+
+    async def test_legacy_and_escaped_reply_prefix_keep_original_body_position(self):
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "Bob"}, "message": "原文"}
+        for prefix, expected in (("{sender}:", "Alice:"), ("{sender}{{reply}}:", "Alice{reply}:")):
+            with self.subTest(prefix=prefix):
+                self.route["prefix"] = prefix
+                event = Event({"message": [{"type": "text", "data": {"text": "前"}},
+                                            {"type": "reply", "data": {"id": "20"}},
+                                            {"type": "text", "data": {"text": "后"}}]}, api=api)
+                event.message_obj.message_id = prefix
+                await self.relay.from_qq(event, self.route)
+                output = self.gateway.broadcast.await_args.args[1]
+                self.assertEqual("".join(c["text"] for c in output), expected + "前[回复 Bob] 后")
+
+    async def test_placeholder_in_sender_or_group_does_not_insert_extra_replies(self):
+        self.route.update(prefix="[{group}]{sender}{reply}:", display_name="{reply}")
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "Bob"}, "message": "原文"}
+        event = Event({"message": [{"type": "reply", "data": {"id": "20"}}]}, api=api)
+        event.get_sender_name = lambda: "{reply}"
+        await self.relay.from_qq(event, self.route)
+        output = self.gateway.broadcast.await_args.args[1]
+        self.assertEqual("".join(c["text"] for c in output), "[{reply}]{reply}[回复 Bob] :")
+        self.assertEqual(sum("hoverEvent" in c for c in output), 1)
+
+    async def test_reply_slot_keeps_cross_group_privacy_check(self):
+        self.route["prefix"] = "{sender}{reply}:"
+        async def api(action, **params):
+            return {"group_id": 88, "sender": {"nickname": "SecretAuthor"}, "message": "secret"}
+        reply = RichReply(id="20", sender_nickname="SecretAuthor", chain=[{"type": "Plain", "text": "secret"}])
+        event = Event("[CQ:reply,id=20]正文", [reply, {"type": "text", "text": "正文"}], api=api)
+        await self.relay.from_qq(event, self.route)
+        output = self.gateway.broadcast.await_args.args[1]
+        self.assertEqual("".join(c["text"] for c in output), "Alice[回复 某人] :正文")
+        self.assertNotIn("secret", json.dumps(output).lower())
+        self.assertIn("引用内容暂不可用", str(output))
+
+    async def test_multiple_references_preserve_order_in_each_slot_not_in_body(self):
+        self.route["prefix"] = "先{reply}中{reply}后:"
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "Bob" + str(params["message_id"])}, "message": "原文"}
+        event = Event({"message": [{"type": "text", "data": {"text": "A"}},
+                                    {"type": "reply", "data": {"id": "20"}},
+                                    {"type": "text", "data": {"text": "B"}},
+                                    {"type": "reply", "data": {"id": "21"}},
+                                    {"type": "text", "data": {"text": "C"}}]}, api=api)
+        await self.relay.from_qq(event, self.route)
+        output = self.gateway.broadcast.await_args.args[1]
+        self.assertEqual("".join(c["text"] for c in output), "先[回复 Bob20] [回复 Bob21] 中[回复 Bob20] [回复 Bob21] 后:ABC")
+        self.assertEqual(event.bot.call_action.await_count, 2)
+
+    async def test_configured_semantic_colors_and_three_line_quote_hover_in_both_formats(self):
+        self.route.update(prefix="{sender}{reply}:", timezone="Asia/Shanghai", message_colors={
+            "link": "gold", "image": "#12ABEF", "record": "red", "video": "dark_purple", "file": "aqua",
+            "forward": "dark_green", "reply": "light_purple", "face": "white", "at": "dark_red",
+        })
+        timestamp = datetime(2026, 10, 31, 3, 11, 11, tzinfo=timezone.utc).timestamp()
+        segments = [{"type": "reply", "data": {"id": "20"}},
+                    {"type": "text", "data": {"text": "https://example.com www.example.com "}},
+                    {"type": "share", "data": {"title": "卡片", "url": "https://example.com/card"}},
+                    {"type": "at", "data": {"qq": "456"}}, {"type": "face", "data": {"id": 14}},
+                    {"type": "dice", "data": {"result": "6"}}, {"type": "rps", "data": {"result": "2"}},
+                    {"type": "mface", "data": {"url": "https://cdn.example.com/mface.gif"}},
+                    {"type": "forward", "data": {"content": [{"sender": {"nickname": "N"}, "content": [{"type": "text", "data": {"text": "嵌套"}}]}]}}]
+        segments.extend({"type": kind, "data": {"url": "https://cdn.example.com/" + kind}} for kind in ("image", "record", "video", "file"))
+        expected_colors = {"[链接]": "gold", "[卡片]": "gold", "[图片]": "#12abef", "[语音]": "red",
+                           "[视频]": "dark_purple", "[文件]": "aqua", "[合并消息·1条]": "dark_green",
+                           "[回复 占星术士] ": "light_purple", "[表情]": "white", "[骰子：6]": "white",
+                           "[猜拳：2]": "white", "@456": "dark_red"}
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                self.server["component_version"] = "modern" if modern else "legacy"
+                async def api(action, **params):
+                    self.assertEqual(action, "get_msg")
+                    return {"group_id": 77, "sender": {"nickname": "占星术士"}, "message": "www.google.com",
+                            "time": timestamp * (1000 if modern else 1)}
+                event = Event({"message": segments}, api=api)
+                event.message_obj.message_id = str(modern)
+                await self.relay.from_qq(event, self.route)
+                output = self.gateway.broadcast.await_args.args[1]
+                found = set()
+                for component in output:
+                    if component["text"] in expected_colors:
+                        found.add(component["text"])
+                        self.assertEqual(component["color"], expected_colors[component["text"]])
+                self.assertEqual(found, set(expected_colors))
+                quote = next(c for c in output if c["text"] == "[回复 占星术士] ")
+                hover = quote["hover_event"]["value"] if modern else quote["hoverEvent"]["contents"]
+                self.assertEqual(hover["text"], "占星术士\nwww.google.com\nDate: 11:11:11")
+                link = next(c for c in output if c["text"] == "[链接]")
+                self.assertIn("click_event" if modern else "clickEvent", link)
+                event.bot.call_action.assert_awaited_once()
+
+    async def test_reply_hover_template_uses_verified_chain_time_and_keeps_message_styles(self):
+        self.route.update(prefix="{reply}:", timezone="UTC", templates={"reply_hover": "{sender}\n{message}\n原消息时间: {time}"})
+        timestamp = datetime(2026, 10, 31, 3, 11, 11, tzinfo=timezone.utc).timestamp()
+        reply = RichReply(id="20", sender_nickname="Bob", timestamp=timestamp * 1000,
+                          chain=[{"type": "text", "data": {"text": "&a原文 www.google.com?a=1&b=2"}},
+                                 {"type": "image", "data": {"url": "https://cdn.example.com/image"}}])
+        async def api(action, **params):
+            return {"group_id": 77, "message": [], "time": 0}
+        event = Event("[CQ:reply,id=20]正文", [reply, {"type": "text", "text": "正文"}], api=api)
+        await self.relay.from_qq(event, self.route)
+        quote = next(c for c in self.gateway.broadcast.await_args.args[1] if "回复 Bob" in c["text"])
+        contents = quote["hoverEvent"]["contents"]
+        self.assertEqual(relay_module.component_text(contents), "Bob\n原文 www.google.com?a=1&b=2[图片]\n原消息时间: 03:11:11")
+        self.assertEqual(next(c for c in contents["extra"] if "原文" in c["text"])["color"], "green")
+        self.assertFalse(any("clickEvent" in c for c in contents["extra"]))
+        event.bot.call_action.assert_awaited_once()
+
+    async def test_invalid_reply_time_stays_unknown_and_cross_group_time_is_not_used(self):
+        self.route.update(prefix="{reply}", timezone="Asia/Shanghai")
+        for group, timestamp in ((77, "not a timestamp"), (88, 1793416271)):
+            with self.subTest(group=group):
+                async def api(action, **params):
+                    return {"group_id": group, "time": timestamp, "sender": {"nickname": "Bob"}, "message": "内容"}
+                event = Event({"message": [{"type": "reply", "data": {"id": "20"}}]}, api=api)
+                event.message_obj.message_id = str(group)
+                await self.relay.from_qq(event, self.route)
+                quote = next(c for c in self.gateway.broadcast.await_args.args[1] if "回复" in c["text"])
+                text = quote["hoverEvent"]["contents"]["text"]
+                self.assertTrue(text.endswith("Date: 未知"))
+                if group == 88:
+                    self.assertNotIn("Bob", text)
+                    self.assertNotIn("内容\n", text)
+
     async def test_http_media_links_work_without_media_service_or_chatimage(self):
         segments = [{"type": "text", "data": {"text": "www.example.com?a=1&b=2 "}}, {"type": "face", "data": {"id": 14}}]
         for kind in ("image", "video", "record", "file"):
@@ -143,11 +339,13 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         event.bot.call_action.assert_not_awaited()
 
     async def test_private_media_url_is_never_published_or_fetched(self):
+        self.route["message_colors"] = {"image": "gold"}
         self.media.publish = AsyncMock()
         event = Event({"message": [{"type": "image", "data": {"url": "http://127.0.0.1/secret"}}, {"type": "text", "data": {"text": "正文"}}]})
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
         self.assertTrue(any("暂不可用" in c["text"] for c in output))
+        self.assertEqual(next(c for c in output if "图片" in c["text"])["color"], "gold")
         self.assertIn("正文", "".join(c["text"] for c in output))
         self.media.publish.assert_not_awaited()
         self.assertFalse(any("clickEvent" in c for c in output))

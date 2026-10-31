@@ -22,6 +22,9 @@ const gameEvents = [['PlayerChatEvent','玩家聊天'],['PlayerJoinEvent','玩�
 const pointsName = () => state?.settings?.points_name || '点数';
 const currencyLabel = text => String(text).replaceAll('点数', pointsName());
 const serverLabel = server => server.display_name || server.name || server.id;
+const migrationStatus = status => ({ready:'待导入',duplicate:'重复合并',existing:'已存在',blocked:'需要处理',imported:'已处理',ignored:'未选择',excluded:'未选择'}[status]||status);
+const mcColors={black:'#000000',dark_blue:'#0000aa',dark_green:'#00aa00',dark_aqua:'#00aaaa',dark_red:'#aa0000',dark_purple:'#aa00aa',gold:'#ffaa00',gray:'#aaaaaa',dark_gray:'#555555',blue:'#5555ff',green:'#55ff55',aqua:'#55ffff',red:'#ff5555',light_purple:'#ff55ff',yellow:'#ffff55',white:'#ffffff'};
+const tagColors=[['link','链接','#5555ff'],['image','图片','#5555ff'],['record','语音','#5555ff'],['video','视频','#5555ff'],['file','文件','#5555ff'],['forward','合并消息','#5555ff'],['reply','引用','#aaaaaa'],['face','表情','#55ff55'],['at','@提及','#ffff55']];
 
 function element(tag, text, cls) {
   const node = document.createElement(tag);
@@ -224,8 +227,9 @@ function serverEditor(existing) {
 }
 function routeEditor(existing) {
   const base={umo:'',scope:'',display_name:'',server_id:state.settings.servers[0]?.id||'',enabled:true,qq_to_mc:true,mc_to_qq:true,admins:[],timezone:'Asia/Shanghai',points_min:10,points_max:10,
-    signin_command:'signin click {player}',signin_prefixes:['[手记人偶]'],signin_rules:[],templates:{},events:gameEvents.map(x=>x[0]),types:messageTypes.map(x=>x[0]),prefix:'[{group}] {sender}：',max_forward_nodes:30,...existing};
-  const value={...base,signin_success:base.templates.signin??'',signin_already:base.templates.signin_already??'',mc_to_qq_template:base.templates.mc_to_qq??''};
+    signin_command:'signin click {player}',signin_prefixes:['[手记人偶]'],signin_rules:[],templates:{},events:gameEvents.map(x=>x[0]),types:messageTypes.map(x=>x[0]),prefix:'[{group}] {sender}{reply}：',max_forward_nodes:30,...existing};
+  const value={...base,signin_success:base.templates.signin??'',signin_already:base.templates.signin_already??'',mc_to_qq_template:base.templates.mc_to_qq??'',reply_hover_template:base.templates.reply_hover??''};
+  for(const [key,,fallback] of tagColors){const color=base.message_colors?.[key];value['color_'+key]=mcColors[color]||color||fallback;}
   edit(existing?'编辑群服路由':'添加群服路由',[
     field('群聊与服务器','section_route','section'),field('原始 UMO','umo','text',{required:true,wide:true,readonly:!!existing,hint:'在目标群使用 AstrBot /sid 获取完整会话标识。'}),
     field('QQ群显示名称','display_name','text',{hint:'QQ → MC 的 {group} 使用此名称，留空显示 QQ群。'}),
@@ -233,18 +237,21 @@ function routeEditor(existing) {
     field('启用此群路由','enabled','checkbox'),field('QQ → MC 转发','qq_to_mc','checkbox'),field('MC → QQ 转发','mc_to_qq','checkbox'),
     field('QQ → MC 消息类型','types','checks',{options:messageTypes,hint:'勾选的类型会转发；图片、视频等显示可点击标签，引用显示悬浮内容。'}),
     field('MC → QQ 游戏事件','events','checks',{options:gameEvents,hint:'分别开启玩家聊天、加入、离开、死亡和成就。QueQiao 也必须上报对应事件。'}),
-    field('QQ → MC 显示前缀','prefix','text',{wide:true,hint:'变量：{group} 群显示名、{sender} 发言人、{user_id} QQ号。支持 &a、§a、&#RRGGBB 等颜色代码。'}),
+    field('QQ → MC 显示前缀','prefix','text',{wide:true,hint:'变量：{group} 群显示名、{sender} 发言人、{reply} 带悬浮内容的引用标签、{user_id} QQ号。例：&e[{group}]&e{sender}{reply}&8:。无引用时 {reply} 为空；旧模板未填写时仍在正文显示引用。支持 &a、§a、&#RRGGBB 颜色。'}),
+    field('消息标签颜色','section_colors','section',{hint:'点击色块选择链接、图片和引用等标签的颜色；点击链接和悬浮内容仍会保留。'}),
+    ...tagColors.map(([key,label])=>field(label+'标签颜色','color_'+key,'color')),
+    field('引用悬浮内容（留空用默认）','reply_hover_template','textarea',{wide:true,placeholder:'{sender}\n{message}\nDate: {time}',hint:'默认三行：原作者、原消息内容、原消息时间。{sender} 是被引用消息作者，{message} 为原文，{time} 按本路由时区显示 HH:MM:SS；没有原时间则显示未知。'}),
     field('MC → QQ 消息格式','mc_to_qq_template','textarea',{wide:true,placeholder:'[{server}] {message}',hint:'留空使用默认。{server} 是服务器显示名称，{player} 是玩家名，{message} 是已含玩家名的聊天或事件内容。'}),
     field('签到与账户','section_signin','section'),field('点数作用域','scope','text',{hint:'留空使用 UMO。填写相同值可共享余额；共享时区和签到奖励必须一致。'}),
     field('签到时区','timezone'),field('签到奖励下限','points_min','number',{min:0}),field('签到奖励上限','points_max','number',{min:0}),
     field('游戏签到命令','signin_command','text',{wide:true,hint:'先执行此命令，确认游戏已签到，再结算本群奖励。{player} 会替换成绑定的玩家名。'}),
     field('群管理员 QQ（每行一个）','admins','lines',{wide:true}),
-    field('签到成功回复（留空用默认）','signin_success','textarea',{wide:true,placeholder:'签到成功✅️\n本次获得 {points_delta}{points_name}，当前{points_name}：{balance}\n{rcon}',hint:'变量：{points_delta} 本次奖励、{points_name} 货币名称、{balance} 当前余额、{rcon} 清洗后完整回包、{player} 玩家。'}),
-    field('今日已签到回复（留空用默认）','signin_already','textarea',{wide:true,placeholder:'签到失败❌️ 今日已签到，请不要重复签到。'}),
+    field('群签到成功时的完整回复（留空用默认）','signin_success','textarea',{wide:true,placeholder:'玩家: {player}\n{group_result}\n{game_result}',hint:'{group_result} 是群签到结果行，{game_result} 是本次游戏结果行，分别判断。还可用 {days} 连续天数、{points_delta} 奖励、{points_name} 货币名称、{balance} 余额、{rcon} 完整回包。'}),
+    field('群内今日已签到时的完整回复（留空用默认）','signin_already','textarea',{wide:true,placeholder:'玩家: {player}\n{group_result}\n{game_result}',hint:'群内重复不等于游戏也重复；保留 {game_result} 才能显示本次游戏是否成功。'}),
     field('识别时忽略的回包前缀（每行一个）','signin_prefixes','lines',{wide:true,advanced:true,hint:'只影响规则识别。例如 [手记人偶] 会从匹配文本开头移除；QQ群中 {rcon} 仍保留它。颜色代码自动清除，无需填入。'}),
     field('自定义签到结果规则','signin_rules','json',{advanced:true,hint:'默认 [] 直接识别已提供的 LiteSignIn 回包。仅当服务端返回文字变化时修改。每项包含 status 和 pattern；SIGNED / ALREADY_SIGNED 必须用 (?P<player>...) 捕获玩家名。'}),
     field('合并消息展开上限','max_forward_nodes','number',{advanced:true,min:1,max:100})
-  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;const list=state.settings.routes.filter(x=>x.umo!==v.umo);list.push(v);await saveSettings({routes:list});});
+  ],value,async v=>{v.scope||=v.umo;const templates={...v.templates};for(const [field,key] of [['signin_success','signin'],['signin_already','signin_already'],['mc_to_qq_template','mc_to_qq'],['reply_hover_template','reply_hover']]){if(v[field].trim())templates[key]=v[field];else delete templates[key];delete v[field];}v.templates=templates;v.message_colors={...v.message_colors};for(const [key] of tagColors){v.message_colors[key]=v['color_'+key];delete v['color_'+key];}const list=state.settings.routes.filter(x=>x.umo!==v.umo);list.push(v);await saveSettings({routes:list});});
 }
 function routes() {
   const p=panel('服务器连接','鉴权名称与对外显示名称分开设置。支持正向连接及反向监听。',[button('全局设置',globalSettings),button('添加服务器',()=>serverEditor(),'')]);
@@ -263,7 +270,19 @@ function commands() {
   const q=panel('管理行为生效值','在 AstrBot → 插件 → 管理行为中修改名称、别名和入口启停。');
   const effective=state.effective_commands || []; table(q,[['动作',x=>x.action_id||x.handler_name||x.id],['实际触发名',x=>x.effective_command||x.name||x.command],['别名',x=>x.effective_aliases||x.aliases||[]],['入口启用',x=>x.enabled===false?'否':'是']],Array.isArray(effective)?effective:Object.values(effective));
 }
-function preview(command={name:'LiteSignIn 游戏签到',rcon:'signin click {player}',parser:'litesignin',rules:[],templates:{SIGNED:'签到成功✅️\n本次获得 {points_delta}{points_name}，当前{points_name}：{balance}\n{rcon}',ALREADY_SIGNED:'游戏已签到；实际群回复仍会继续检查本群今日签到记录。'}}) {
+function signinPreview() {
+  edit('群签到与游戏签到 · 模拟回复',[
+    field('使用哪份路由模板','route_umo','select',{options:[['','内置默认模板'],...state.settings.routes.map(r=>[r.umo,r.display_name||r.umo])],wide:true}),
+    field('期望玩家名','player','text',{required:true}),field('模拟：群内今日已经签到','group_signed','checkbox',{hint:'只影响本次预览，不查询真实签到记录。游戏结果由下面的回包识别。'}),
+    field('示例本次奖励','points_delta','number',{min:0}),field('示例当前余额','balance','number',{min:0}),
+    field('粘贴游戏签到原始回包','raw','textarea',{wide:true,required:true,hint:'成功和重复游戏签到回包，分别搭配群已签到勾选状态，即可验证四种结果；不执行 RCON、不增加点数。'})
+  ],{route_umo:state.settings.routes[0]?.umo||'',player:'rincho',group_signed:false,points_delta:1,balance:1,
+    raw:'Rcon:§f[§3手记人偶§f] §a成功给玩家 §6rincho §a签到， 当前该玩家已连续签到 §e1 §a天。'},async v=>{
+      const r=await action('preview_signin',v);
+      output('签到模拟结果 · 未执行命令',`游戏识别：${r.status}\n群结果：${r.data?.group_status||'未结算'}\n\n提取字段\n${JSON.stringify(r.fields||{},null,2)}\n\n回复预览\n${r.preview||'（空）'}`);
+  },'只模拟回复');
+}
+function preview(command) {
   const isSignin=command.parser==='litesignin';
   const raw=isSignin?'Rcon:§f[§3手记人偶§f] §a成功给玩家 §6rincho §a签到， 当前该玩家已连续签到 §e1 §a天。':'';
   edit(`模拟回复：${command.name||command.id||'当前指令'}`,[
@@ -313,10 +332,67 @@ function monitor(){
   const grid=element('div',null,'grid-two');$('#content').append(grid);drawChart(grid,metrics,'tps','TPS','');drawChart(grid,metrics,'mspt','MSPT','ms');drawChart(grid,metrics,'player_ping_ms','玩家延迟','ms');drawChart(grid,metrics,'slp_rtt_ms','机器人 → 服务端 RTT','ms');
   const note=element('div','采样按配置间隔在后台进行。QQ群的 tps / mspt / ping 返回实际 RCON 文本；“服务器状态”仅返回在线或离线；“性能图”获取历史图片。玩家 ping 与机器人探测链路分别记录，未知值不填 0。','note');$('#content').append(note);
 }
+function rememberMigration(parameters,result) {
+  migrationPreview={parameters:structuredClone(parameters),digest:result.digest,plan_digest:result.plan_digest,result};
+  $('#banner').hidden=true;
+  render();
+  const plan=result.binding_plan||{};
+  output('迁移预览 · 只读核对',{digest:result.digest,already_imported:result.already_imported,counts:result.counts,
+    balance_totals:result.balance_totals,warnings:result.warnings,binding_counts:plan.counts,
+    can_apply:plan.can_apply,conflicts:plan.conflicts});
+}
+function migrationStart() {
+  const previous=migrationPreview?.parameters;
+  edit('预览旧点数数据库',[
+    field('旧 SQLite 文件绝对路径','path','text',{required:true,wide:true,hint:'选择一致性备份；路径必须位于运行 AstrBot 的机器上。预览不会修改原数据库。'}),
+    field('旧绑定的目标服务器','binding_server_id','select',{wide:true,options:[['','按映射与群路由推导'],...state.settings.servers.map(s=>[s.id,serverLabel(s)])],hint:'旧绑定通常只有QQ和玩家名，没有服务器。只有一台服时可直接选择；导入后显示为未验证的名称绑定。'}),
+    field('旧 session → 新 scope 映射','scope_map','json',{object:true,advanced:true,hint:'影响余额、签到和商店；未填写的旧作用域保留原值。已经迁过的账本不会再次导入。'}),
+    field('旧账号或平台 → 服务器 ID 映射','server_map','json',{object:true,advanced:true,hint:'多服务器时可按完整旧账号键、账号前缀或平台实例指定服务器，优先于上面的统一目标服。'})
+  ],{path:previous?.path||'',binding_server_id:previous?.binding_server_id||(state.settings.servers.length===1?state.settings.servers[0].id:''),
+    scope_map:previous?.scope_map||{},server_map:previous?.server_map||{}},async v=>{
+      const parameters={...v,binding_choices:null};
+      rememberMigration(parameters,await action('import_preview',parameters));
+  },'只读预览');
+}
+function migrationChooseBindings() {
+  if(!migrationPreview)throw Error('请先预览旧数据库');
+  const previous=migrationPreview;
+  const rows=previous.result.binding_plan?.rows||[];
+  const chosen=previous.parameters.binding_choices??rows.map(r=>r.account_key);
+  edit('选择要迁移的绑定',[
+    field('绑定记录','binding_choices','checks',{options:rows.map(r=>[r.account_key,`${r.qq_id} → ${r.player} · ${r.server_id||'未指定服'} · ${r.account_key}${r.reason?' · '+r.reason:''}`]),hint:'冲突记录取消不需要的那一项，再核对。相同QQ、玩家和服务器的重复记录会自动合并。全部取消表示仅归档旧绑定，不建立可用绑定。'})
+  ],{binding_choices:chosen},async v=>{
+    if(migrationPreview!==previous)throw Error('迁移预览已更新，请重新选择');
+    const parameters={...previous.parameters,binding_choices:v.binding_choices};
+    rememberMigration(parameters,await action('import_preview',parameters));
+  },'重新核对选择');
+}
+function migrationApply() {
+  const previous=migrationPreview;
+  if(!previous?.digest)throw Error('请先预览备份文件');
+  if(!previous.result.binding_plan?.can_apply)throw Error('绑定计划存在冲突或缺少服务器，请先选择绑定并重新核对');
+  const counts=previous.result.binding_plan.counts||{};
+  edit('确认已核对的迁移计划',[
+    field('已预览的 SQLite 备份路径','path','text',{readonly:true,wide:true}),
+    field(`绑定：待导入 ${counts.ready||0}，已存在 ${counts.existing||0}，重复 ${counts.duplicates||0}`,'summary','section',{hint:previous.result.already_imported?'此批次账本已经迁过，本次仅处理尚未迁移的绑定。':'余额、历史和本次选定绑定将在一个事务中导入。'}),
+    field('我已核对选择并备份当前数据','confirmed','checkbox')
+  ],{path:previous.parameters.path,confirmed:false},async v=>{
+    if(!v.confirmed)throw Error('请先核对计划并备份当前数据');
+    if(migrationPreview!==previous)throw Error('迁移计划已更新，请重新确认');
+    const result=await action('import_apply',{...previous.parameters,digest:previous.digest,plan_digest:previous.plan_digest,confirmed:true});
+    migrationPreview=null;await refresh();output('迁移结果',result);
+  },'确认导入');
+}
 function diagnostics(){
-  const p=panel('回包与连接诊断','解析预览不会执行游戏命令。',[button('签到回包解析示例',()=>preview()),button('执行 RCON',()=>edit('实际执行 RCON',[field('目标服务器','server_id','select',{options:state.settings.servers.map(x=>[x.id,serverLabel(x)])}),field('控制台命令','command','text',{required:true,wide:true,hint:'这会实际执行服务器命令，请核对内容。'})],{server_id:state.settings.servers[0]?.id||'',command:''},async v=>output('RCON 返回',await action('rcon',v)),'执行命令'))]);
+  const p=panel('回包与连接诊断','解析预览不会执行游戏命令。',[button('签到回包解析示例',signinPreview),button('执行 RCON',()=>edit('实际执行 RCON',[field('目标服务器','server_id','select',{options:state.settings.servers.map(x=>[x.id,serverLabel(x)])}),field('控制台命令','command','text',{required:true,wide:true,hint:'这会实际执行服务器命令，请核对内容。'})],{server_id:state.settings.servers[0]?.id||'',command:''},async v=>output('RCON 返回',await action('rcon',v)),'执行命令'))]);
   table(p,[['动作','action'],['服务器','server_id'],['状态','status'],['时间',x=>nowText(x.created_at)]],state.runs||[]);
-  const m=panel('旧数据迁移','仅在明确选择文件后读取；先预览，再确认导入。不会自动寻找生产数据库。',[button('预览迁移',()=>edit('预览旧点数数据库',[field('旧 SQLite 文件绝对路径','path','text',{required:true,wide:true,hint:'先停用旧插件并制作一致性备份，再选择备份文件。旧名称绑定需重新绑定；是否到游戏验证由全局开关决定。'})],{path:''},async v=>{const result=await action('import_preview',v);migrationPreview={path:v.path,digest:result.digest};output('迁移预览',result);},'只读预览')),button('导入备份',()=>edit('导入旧点数数据',[field('已预览的 SQLite 备份路径','path','text',{required:true,wide:true}),field('旧 session → 新 scope 映射','scope_map','json',{object:true,hint:'未填写的旧作用域保留原值；请按迁移说明填写。'}),field('我已预览并备份当前数据','confirmed','checkbox')],{path:migrationPreview?.path||'',confirmed:false,scope_map:{}},async v=>{if(!v.confirmed)throw Error('请先预览并备份后勾选确认');if(!migrationPreview?.digest||migrationPreview.path!==v.path)throw Error('请先预览同一个备份文件');output('迁移结果',await action('import_apply',{...v,digest:migrationPreview.digest}));migrationPreview=null;await refresh();},'确认导入'),'danger small')]);m.append(element('div','迁移保留余额、历史与已用码；不自动沿用旧命令、旧插件联动或旧玩法。重复批次应被拒绝或安全跳过。','note'));
+  const m=panel('旧数据迁移','先预览绑定计划，处理冲突，再确认导入。已经迁过账本的批次可补迁绑定。',[button('预览迁移',migrationStart),button('选择绑定 / 重新核对',migrationChooseBindings),button('导入备份',migrationApply,'danger small')]);
+  m.append(element('div','旧名称绑定可迁为未验证的名称身份，不伪造 UUID。不会重复迁入余额，也不会自动发送奖励或执行旧命令。','note'));
+  if(migrationPreview?.result.binding_plan){
+    const plan=migrationPreview.result.binding_plan;
+    m.append(element('div',`当前计划：${plan.can_apply?'可导入':'需要处理冲突或服务器映射'}；待导入 ${plan.counts?.ready||0} 条。`,'note'));
+    table(m,[['旧账号键','account_key'],['QQ','qq_id'],['MC名','player'],['服务器','server_id'],['状态',r=>migrationStatus(r.status)],['说明','reason']],plan.rows||[]);
+  }
   const mediaPanel=panel('媒体服务状态','可点击资源链接由独立媒体服务提供。');table(mediaPanel,[['项目','name'],['状态','value']],Object.entries(state.media||{}).map(([name,value])=>({name,value})));
   const a=panel('管理操作记录','不记录 Token、兑换码或奖励正文。');table(a,[['操作者','actor'],['操作','action'],['说明','detail'],['时间',x=>nowText(x.created_at)]],state.audit||[]);
 }

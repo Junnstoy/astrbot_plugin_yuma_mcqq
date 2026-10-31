@@ -112,7 +112,7 @@ class ConfigTests(unittest.TestCase):
         ]}
         self.settings.path.write_text(json.dumps(old),encoding='utf-8')
         upgraded = Settings(self.settings.path)
-        self.assertEqual(upgraded.data['schema_version'],3)
+        self.assertEqual(upgraded.data['schema_version'],4)
         self.assertEqual(upgraded.server('old')['tps_command'],'tps')
         self.assertEqual(upgraded.server('old')['ping_command'],'ping')
         self.assertEqual(upgraded.server('custom')['tps_command'],'paper:tps')
@@ -123,6 +123,34 @@ class ConfigTests(unittest.TestCase):
         reloaded = Settings(self.settings.path)
         self.assertEqual(reloaded.server('old')['tps_command'],'spark tps')
         self.assertEqual(reloaded.server('old')['ping_command'],'spark ping')
+
+    def test_v4_migrates_only_shipped_reply_prefix_and_signin_templates(self):
+        old = {'schema_version':3,'servers':[{'id':'s'}],'routes':[
+            {'umo':'b:GroupMessage:1','server_id':'s','prefix':'[{group}] {sender}：',
+             'templates':{'signin':'签到成功✅️\n本次获得 {points_delta}{points_name}，当前{points_name}：{balance}\n{rcon}',
+                          'signin_already':'签到失败❌️ 今日已签到，请不要重复签到。'}},
+            {'umo':'b:GroupMessage:2','server_id':'s','prefix':'&e[{group}]&e{sender}&8:',
+             'templates':{'signin':'自定义 {player} {rcon}','signin_already':'自定义重复 {balance}'}}]}
+        self.settings.path.write_text(json.dumps(old),encoding='utf-8')
+        upgraded=Settings(self.settings.path)
+        one,two=upgraded.data['routes']
+        self.assertEqual(one['prefix'],'[{group}] {sender}{reply}：')
+        self.assertEqual(one['templates'],{})
+        self.assertEqual(two['prefix'],'&e[{group}]&e{sender}&8:')
+        self.assertEqual(two['templates'],old['routes'][1]['templates'])
+        upgraded.save({})
+        self.assertEqual(Settings(self.settings.path).data,upgraded.data)
+
+    def test_message_colors_and_reply_hover_template_validation(self):
+        self.settings.save({'servers':[{'id':'s'}]})
+        route={'umo':'b:GroupMessage:1','server_id':'s','message_colors':{'link':'#12AbEf','reply':'gold'},
+               'templates':{'reply_hover':'{sender}\n{message}\nDate: {time}'}}
+        self.settings.save({'routes':[route]})
+        self.assertEqual(self.settings.data['routes'][0]['message_colors']['link'],'#12AbEf')
+        self.assertEqual(self.settings.data['routes'][0]['message_colors']['image'],'blue')
+        for colors in ({'link':'red;hack'},{'link':'#abc'},{'unknown':'blue'}):
+            with self.assertRaises(ValueError):self.settings.save({'routes':[{**route,'message_colors':colors}]})
+        with self.assertRaises(ValueError):self.settings.save({'routes':[{**route,'templates':{'reply_hover':'{missing}'}}]})
 
 
 if __name__ == '__main__': unittest.main()

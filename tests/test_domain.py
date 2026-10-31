@@ -180,7 +180,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(preview["balance_totals"], {"g": 60})
         with self.assertRaises(DomainError):
             self.store.import_legacy(path, "wrong", "admin")
-        self.store.import_legacy(path, preview["digest"], "admin")
+        self.store.import_legacy(path, preview["digest"], "admin", binding_choices=[])
         self.assertEqual(self.store.balance("g", "1")["total"], 60)
         self.assertIsNone(self.store.binding("1"))
         self.assertEqual(self.store.get_product("g", "code")["stock"], 1)
@@ -192,7 +192,7 @@ class StorageTests(unittest.TestCase):
         self.store.claim_delivery(order["id"], reclaim=True)
         self.store.finish_order(order["id"], "fulfilled")
         self.assertEqual(self.store.balance("g", "1")["total"], 60)
-        self.assertTrue(self.store.import_legacy(path, preview["digest"], "admin")["already_imported"])
+        self.assertTrue(self.store.import_legacy(path, preview["digest"], "admin", binding_choices=[])["already_imported"])
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
         public = json.dumps(self.store.snapshot())
         self.assertNotIn("USED_SECRET", public)

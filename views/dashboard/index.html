@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Yuma MCQQ</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="shell">
+  <aside><div class="brand"><span class="logo">Y</span><div>Yuma <strong>MCQQ</strong><small>群服互通 · 点数与签到</small></div></div>
+    <nav id="nav" aria-label="管理导航"></nav><div class="aside-foot"><span class="dot"></span> AstrBot 插件管理页<br><small>配置保存在插件数据目录</small></div>
+  </aside>
+  <main><header><div><p class="eyebrow">YUMA / CONTROL PANEL</p><h1 id="title">总览</h1><p id="subtitle">连接游戏与群聊，让每个动作都有记录。</p></div><div class="header-actions"><span id="connection" class="badge">正在连接</span><button id="refresh" class="secondary">刷新数据</button></div></header>
+    <div id="banner" role="status" hidden></div><section id="content" aria-live="polite"><div class="empty">正在读取插件状态…</div></section>
+    <footer>Yuma MCQQ · 原始 UMO 路由 · 游戏签到后结算群点数</footer>
+  </main>
+</div>
+<dialog id="editor"><form id="edit-form"><div class="dialog-head"><div><p class="eyebrow">CONFIGURATION</p><h2 id="dialog-title"></h2></div><button type="button" id="dialog-close" class="icon" aria-label="关闭">×</button></div><div id="fields"></div><div id="dialog-error" role="alert"></div><div class="dialog-foot"><button type="button" id="cancel" class="secondary">取消</button><button id="save" type="submit">保存</button></div></form></dialog>
+<dialog id="output"><div class="dialog-head"><h2 id="output-title">操作结果</h2><button id="output-close" class="icon" aria-label="关闭">×</button></div><pre id="output-text"></pre></dialog>
+<script type="module" src="app.js"></script>
+</body></html>

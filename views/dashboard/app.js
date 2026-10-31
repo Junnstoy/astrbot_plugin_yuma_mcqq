@@ -232,7 +232,7 @@ function overview() {
   [['服务器', state.settings.servers.length, 'QueQiao 连接'], ['群服路由', state.settings.routes.length, '按原始 UMO 定位'], ['已绑定账号', state.domain?.bindings?.length || 0, 'QQ ↔ MC 双向唯一'], ['待核对订单', (state.domain?.orders || []).filter(x => x.status === 'unknown').length, '结果未知不自动重发']].forEach(([label, value, hint]) => { const c = element('div', null, 'card'); c.append(element('div', label, 'label'), element('div', value, 'number'), element('div', hint, 'hint')); cards.append(c); }); $('#content').append(cards);
   const p = panel('连接状态', '所有后台请求都有独立的服务器与响应关联。', [button('全局设置', globalSettings)]);
   table(p, [['服务器', x => x.name || x.server_id || x.id], ['状态', x => x.connected ? '已连接' : x.status || '未连接'], ['最近错误', x => x.last_error || '—']], state.connections);
-  const f = panel('消息处理顺序', '先判断指令与 AI 接管；普通消息在图片理解前转发，主动回复群等待 AI 判断。'); const flow = element('div', null, 'flow');
+  const f = panel('消息处理顺序', '命令与已唤醒的 AI 请求不转发；普通消息先进入游戏，再继续图片理解和主动回复。'); const flow = element('div', null, 'flow');
   ['指令与权限', 'AI 唤醒 / 接管', '普通消息转发'].forEach((s, i) => { if (i) flow.append(element('i', '→')); flow.append(element('span', s)); }); f.append(flow);
   f.append(element('div', '首次使用：添加服务器 → 添加 UMO 路由 → 绑定玩家名 → 使用“签到”。仅开启验证码时需要游戏验证。商店兑换记录与点数流水独立保存。', 'note'));
 }

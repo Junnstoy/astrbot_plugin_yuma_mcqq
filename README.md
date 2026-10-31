@@ -13,7 +13,7 @@
 - 每条自定义 RCON 指令独立参数、清洗前缀、解析规则及回复模板；共用颜色/控制码清洗器。
 - 23 个内置指令和自定义指令均注册到 AstrBot **管理行为**，可改触发名、别名和启停；可使用 AstrBot 唤醒方式或设置本插件独立前缀。
 - `mc帮助` 默认发送一张深色图片，按全局帮助顺序从上到下排布，每列最多 15 条命令，超出自动增加列，不分页；连续同类内容用矩形框住。也可切换文字，编辑说明、独立显隐与排序，采用当前管理行为名称及权限。
-- 按原始 **UMO** 回复和路由；明确指令、AI 唤醒或已接管消息不转发。普通消息优先在群聊图片转述前发送到游戏；当前群可能触发主动回复时，保留末位判断。
+- 按原始 **UMO** 回复和路由；明确指令、实际 AI 聊天唤醒或已接管消息不转发。其余普通图片先发送到游戏，再继续群聊图片转述，不因开启主动回复而延后。
 - 文本、@、QQ 表情、图片、链接、合并消息、语音、视频、文件、引用；9 类标签颜色可在 GUI 修改，`{reply}` 放置引用，悬浮默认三行原作者/原内容/原时间，无需 ChatImage。
 - QueQiao 正向/反向连接、独立服务器显示名称；游戏聊天、加入、退出、死亡、成就事件分别开关。
 - `tps` / `mspt` / `ping` 返回实际 RCON 文字；`服务器状态` 只回复在线/离线；`性能图` 提供定时采样的历史 PNG，GUI 查看曲线。
@@ -23,9 +23,9 @@
 
 要求 Python 3.11+、AstrBot **4.29+ / <5**、NapCat/OneBot、Paper 和官方 [QueQiao](https://github.com/17TheWord/QueQiao)。1.3.0 已在真实 AstrBot 4.29.1 框架中进行隔离集成测试。动态命令桥接使用 AstrBot 内部注册接口，升级框架应重新跑集成测试。
 
-在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.4.2。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。本次补丁、签到策略与帮助样式见 [1.4 系列升级说明](docs/UPGRADE_1_4.md)，管理功能见 [1.3 升级说明](docs/UPGRADE_1_3.md)，绑定迁移见 [1.2 升级说明](docs/UPGRADE_1_2.md)，已有 1.0 数据的用户也请阅读 [1.1 身份升级说明](docs/UPGRADE_1_1.md)。
+在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.4.3。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。本次补丁、签到策略与帮助样式见 [1.4 系列升级说明](docs/UPGRADE_1_4.md)，管理功能见 [1.3 升级说明](docs/UPGRADE_1_3.md)，绑定迁移见 [1.2 升级说明](docs/UPGRADE_1_2.md)，已有 1.0 数据的用户也请阅读 [1.1 身份升级说明](docs/UPGRADE_1_1.md)。
 
-当前 1.4.2 通过 [feat/session-checkin 分支](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq/tree/feat/session-checkin)交付，对应 [PR #2](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq/pull/2)，尚未合并到 `main`。安装或更新时请选择该分支，并核对 `metadata.yaml` 的版本；只更新默认分支暂时不会取得本次补丁。
+当前 1.4.3 通过 [feat/session-checkin 分支](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq/tree/feat/session-checkin)交付，对应 [PR #2](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq/pull/2)，尚未合并到 `main`。安装或更新时请选择该分支，并核对 `metadata.yaml` 的版本；只更新默认分支暂时不会取得本次补丁。
 
 1. 在 Paper 安装 QueQiao 与 LiteSignIn，启用 QueQiao WebSocket 和其 RCON 支持；先在服务器确认 `signin click 玩家名` 可用。
 2. 打开 AstrBot → 插件详情 → 插件视图 → `dashboard`。添加服务器，填写与 QueQiao 一致的鉴权名称 `name`；可另设 `display_name` 用于 QQ 展示。正向模式填写 QueQiao 的 WebSocket 地址；反向模式由 QueQiao 连接机器人监听地址，必须设置非空 token。
@@ -35,7 +35,9 @@
 6. 在商店 GUI 添加商品并上架。游戏交付商品必须填写可确认成功的回包规则。通过转发类型与游戏事件复选框选择消息范围。
 7. QQ 已提供的可公开访问图片、视频、语音和文件链接可直接点击，不要求开启缓存服务。本地媒体、需转存资源和完整合并消息页面才需要配置 `media.public_base` 等缓存服务选项。详见 [传输与部署](docs/TRANSPORT.md)。
 
-1.4.2 调整普通群消息的转发时机，减少群聊自动图片理解带来的等待，详见 [图片转发顺序](docs/UPGRADE_1_4.md#图片转发顺序)。已有公网链接仍直接转发，缺少链接时保留有限并发查询；AstrBot 预处理中的图片下载仍可能在插件前发生。本版已移除临时慢阶段日志，不再需要搜索相关提示或调整日志过滤器。
+1.4.3 按当前消息是否实际唤醒 AI 聊天分流；普通群图片先转发，再继续群聊理解，详见 [图片转发顺序](docs/UPGRADE_1_4.md#图片转发顺序)。已有公网链接仍直接转发，缺少链接时保留有限并发查询；AstrBot 预处理中的图片下载仍可能在插件前发生。临时慢阶段日志已移除，不再需要搜索相关提示或调整日志过滤器。
+
+例如当前群的全局唤醒为 `#`、聊天前缀为 `星乃` 时，`#星乃` 加图片交给 AI，不发往游戏；普通图片或未命中命令的 `#其他` 加图片先转发，再继续理解。前缀从当前会话配置读取，`星乃` 只是示例。
 
 `command_prefix` 留空时沿用当前会话的 AstrBot 唤醒方式，例如 `/签到` 或 @机器人 后发送；填写 `mc` 后，本插件命令使用 `mc签到` 或 `mc 签到` 这样的独立前缀。这里展示的是默认命令名，实际名称仍以管理行为为准。首次创建后配置由插件 GUI 管理并保存到插件数据目录，基础配置面板中的 `enabled` 仅用于首次初始化。
 

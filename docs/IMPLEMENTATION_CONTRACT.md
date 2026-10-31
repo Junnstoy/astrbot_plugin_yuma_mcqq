@@ -70,6 +70,12 @@ GUI 使用 AstrBot Plugin Views SDK 调用 GET state、POST settings、POST acti
 
 同步纯函数 `Domain.preview_signin(raw, player, route, group_signed=False, points_delta=1, balance=1)` 返回 `{status, fields, cleaned, preview, data}`；`status` 为识别的游戏状态，`preview` 为两阶段回复，`data` 为模拟结果和模板变量。群重复把模拟奖励置零，识别失败时群状态为 `NOT_SETTLED`。两个预览均不读取真实账户、不写数据库、不执行 RCON；`rcon` 动作才会调用真实服务器。前端应明确显示此区别。状态快照不包含兑换码、私聊奖励或明文 token。
 
+分页动作 `dashboard_page` 接受 `{table, page, page_size, scope?}`，只允许 bindings/balances/ledger/signins/runs/audit 六类。每页 10/20/50/100；返回 `{rows,total,page,page_size,pages}`，空表保持第 1/1 页，越界钳位。余额、流水、签到先按 scope 过滤；全局绑定、运行及审计不伪造作用域归属。
+
+服务器 ID 动作 `server_rename` 接受 `{server_id,new_server_id,revision}`，与主入口配置保存锁串行，关联数据同步迁移。维护门禁阻止新的业务，`state.maintenance` 供 GUI 提示。数据目录内 `server-rename.json` 记录 ID、配置摘要和操作 ID，不保存 token；逐库完成标记支持失败重试/启动恢复。禁止用普通配置增删绕过有关联数据的 ID 修改。
+
+`state.help_commands` 为 GUI 提供完整可编辑帮助元数据，包含稳定 action_id、当前名称/别名、默认及实际说明、显隐/排序和权限提示。配置 `help` 与命令执行启停独立；引用标签配置为 `route.templates.reply_label`，仅支持 `{sender}`。
+
 ## 显式旧数据迁移
 
 `Store.preview_legacy(path, scope_map=None, *, binding_server_id="", server_map=None, routes=None, binding_choices=None)` 返回源文件 `digest`、绑定计划 `plan_digest`、`binding_plan` 与统计；`Store.import_legacy` 另接收 `expected_digest`、`actor` 和 `plan_digest`。后台 `import_preview/import_apply` 接受路径、`scope_map` 及这三项绑定选项；`routes` 由 Domain 取当前已校验配置，不能用客户端载荷替换。

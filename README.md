@@ -11,17 +11,18 @@
 - 一种群积分货币，显示名称可自定义；点数商店、私聊文本/唯一码/游戏命令商品、确认兑换、补领和未知交付核对。
 - 每条自定义 RCON 指令独立参数、清洗前缀、解析规则及回复模板；共用颜色/控制码清洗器。
 - 23 个内置指令和自定义指令均注册到 AstrBot **管理行为**，可改触发名、别名和启停；可使用 AstrBot 唤醒方式或设置本插件独立前缀。
+- `mc帮助` 可选分页图片或文字；默认和自定义指令都可编辑帮助说明、独立显隐与排序，采用当前管理行为名称及权限。
 - 按原始 **UMO** 回复和路由；明确指令先处理，AI 唤醒消息交回 AstrBot，普通消息最后转发。
 - 文本、@、QQ 表情、图片、链接、合并消息、语音、视频、文件、引用；9 类标签颜色可在 GUI 修改，`{reply}` 放置引用，悬浮默认三行原作者/原内容/原时间，无需 ChatImage。
 - QueQiao 正向/反向连接、独立服务器显示名称；游戏聊天、加入、退出、死亡、成就事件分别开关。
 - `tps` / `mspt` / `ping` 返回实际 RCON 文字；`服务器状态` 只回复在线/离线；`性能图` 提供定时采样的历史 PNG，GUI 查看曲线。
-- AstrBot 内嵌管理 GUI：连接/路由、命令、绑定/点数、商店/订单、监控、解析预览与迁移。
+- AstrBot 内嵌管理 GUI：连接/路由、指令与帮助、绑定/点数、商店/订单、监控、解析预览与迁移。数据列表分页，服务器 ID 可连同关联数据修改；引用标签、颜色和悬浮分别配置。
 
 ## 安装与首次配置
 
-要求 Python 3.11+、AstrBot **4.29+ / <5**、NapCat/OneBot、Paper 和官方 [QueQiao](https://github.com/17TheWord/QueQiao)。已在真实 AstrBot 4.29.0 框架中进行隔离集成测试。动态命令桥接使用 AstrBot 内部注册接口，升级框架应重新跑集成测试。
+要求 Python 3.11+、AstrBot **4.29+ / <5**、NapCat/OneBot、Paper 和官方 [QueQiao](https://github.com/17TheWord/QueQiao)。1.3.0 已在真实 AstrBot 4.29.1 框架中进行隔离集成测试。动态命令桥接使用 AstrBot 内部注册接口，升级框架应重新跑集成测试。
 
-在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.2.0。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。本次变更和迁移操作见 [1.2 升级说明](docs/UPGRADE_1_2.md)，已有 1.0 数据的用户也请阅读 [1.1 身份升级说明](docs/UPGRADE_1_1.md)。
+在 AstrBot 插件管理中使用[本仓库](https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq)安装或更新，确认所安装代码的版本为 1.3.0。手动安装时将插件目录命名为 `astrbot_plugin_yuma_mcqq`，在 AstrBot 使用的 Python 环境安装 `requirements.txt`，然后加载插件。本次变更见 [1.3 升级说明](docs/UPGRADE_1_3.md)，绑定迁移见 [1.2 升级说明](docs/UPGRADE_1_2.md)，已有 1.0 数据的用户也请阅读 [1.1 身份升级说明](docs/UPGRADE_1_1.md)。
 
 1. 在 Paper 安装 QueQiao 与 LiteSignIn，启用 QueQiao WebSocket 和其 RCON 支持；先在服务器确认 `signin click 玩家名` 可用。
 2. 打开 AstrBot → 插件详情 → 插件视图 → `dashboard`。添加服务器，填写与 QueQiao 一致的鉴权名称 `name`；可另设 `display_name` 用于 QQ 展示。正向模式填写 QueQiao 的 WebSocket 地址；反向模式由 QueQiao 连接机器人监听地址，必须设置非空 token。
@@ -35,7 +36,7 @@
 
 | 默认指令 | 用途 |
 | --- | --- |
-| `mc帮助` | 显示当前管理行为生效后的名称 |
+| `mc帮助` | 按配置返回图片或文字，采用当前名称、说明、显示开关与排序 |
 | `绑定 玩家名` / `我的绑定` / `修改绑定 玩家名` / `解绑` | 直接绑定，或按开关验证后绑定；查询及变更 |
 | `签到` / `点数` / `点数排行` | 两阶段签到和账户查询 |
 | `点数商店` / `兑换 商品ID` / `确认兑换 订单ID` | 浏览及购买一件商品 |
@@ -58,6 +59,7 @@
 - [1.1 升级与八项反馈修复](docs/UPGRADE_1_1.md)
 - [1.1.1 管理员绑定与查询命令修订](docs/UPGRADE_1_1_1.md)
 - [1.2 绑定迁移、引用颜色与签到回复](docs/UPGRADE_1_2.md)
+- [1.3 帮助设置、分页、解绑与服务器 ID 修改](docs/UPGRADE_1_3.md)
 - [测试记录与实服验收步骤](docs/VALIDATION.md)
 - [设计决策和开发记录](docs/DEVELOPMENT.md)、[变更记录](CHANGELOG.md)
 

@@ -181,6 +181,8 @@ flowchart TB
 
 ## 代码布局
 
+1.3 增加的管理路径：帮助从框架生效命令生成完整编辑表，叠加稳定动作 ID 的说明、显隐与排序后，按当前用户权限构建同一份文字/图片文档。数据列表经过鉴权 API 进入白名单分页查询，返回当前页和总数。服务器 ID 修改则先取得配置锁、暂停新业务并排空在途动作，写入恢复日志后更新各库和配置，恢复连接；失败期间保持维护态并在重载时恢复。具体请求与恢复约定见 [接口契约](IMPLEMENTATION_CONTRACT.md) 和 [1.3 更新说明](UPGRADE_1_3.md)。
+
 ```text
 main.py                       AstrBot 生命周期、消息和鉴权 API
 adapters/astrbot_commands.py   4.29 指令注册兼容层
@@ -188,6 +190,8 @@ core/config.py                配置模型和原子持久化
 core/text.py                  清洗、解析和模板
 core/store.py                 事务账本、身份、订单和迁移
 services/application.py       组合入口、自定义动作和管理员cmd
+services/dashboard.py         账户与诊断的受限分页查询
+services/help_renderer.py     帮助元数据、文字与分页图片
 services/domain.py            绑定、签到和商店
 services/gateway.py           QueQiao V2
 services/media.py             只读限时媒体服务

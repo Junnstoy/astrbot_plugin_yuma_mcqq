@@ -27,6 +27,7 @@ LABELS = {"image": "图片", "record": "语音", "video": "视频", "file": "文
 MESSAGE_COLORS = {"link": "blue", "image": "blue", "record": "blue", "video": "blue", "file": "blue",
                   "forward": "blue", "reply": "gray", "face": "green", "at": "yellow"}
 REPLY_HOVER = "{sender}\n{message}\nDate: {time}"
+REPLY_LABEL = "[回复 {sender}]"
 EVENTS = {"player_chat": "PlayerChatEvent", "player_join": "PlayerJoinEvent", "player_quit": "PlayerQuitEvent", "player_death": "PlayerDeathEvent", "player_achievement": "PlayerAchievementEvent", "player_advancement": "PlayerAchievementEvent"}
 
 
@@ -468,8 +469,15 @@ class Relay:
                     log.debug("[YumaMCQQ] media unavailable: %s", type(exc).__name__)
             elif kind == "reply":
                 author, text = await self._quote(event, data, route)
+                template = route.get("templates", {}).get("reply_label") or REPLY_LABEL
+                if not template.strip():
+                    template = REPLY_LABEL
+                # Labels are plain text with their configured semantic colour.
+                # Interpolate once, then remove legacy formatting even if it was
+                # formed across the template/author boundary.
+                label = FORMAT.sub("", render_template(template, {"sender": author}))
                 target = result if reply_components is None else reply_components
-                target.append(minecraft_component(f"[回复 {author}] ", hover=text or "引用内容暂不可用", modern=modern, color=colors["reply"]))
+                target.append(minecraft_component(label, hover=text or "引用内容暂不可用", modern=modern, color=colors["reply"]))
             elif kind == "forward":
                 records = await self._forward(event, data, route, modern, depth, budget)
                 preview = "\n".join(f"{node['author']}：{node['text']}" for node in records[:5])[:1600]
@@ -543,7 +551,8 @@ class Relay:
             elif info.get("group_id") or str(info.get("user_id", "")) != str(event.get_sender_id()):
                 raise MediaRejected("引用消息不属于当前私聊")
             sender = _as_dict(info.get("sender", {}))
-            author = strip_styles(str(sender.get("card") or sender.get("nickname") or data.get("sender_nickname") or sender.get("user_id") or "某人"))
+            author = str(sender.get("card") or sender.get("nickname") or data.get("sender_nickname") or sender.get("user_id") or "某人")
+            author = " ".join(FORMAT.sub("", author).split()) or "某人"
             quoted = info.get("message") or info.get("raw_message") or data.get("chain") or data.get("message_str") or ""
             text = self._summary(quoted, preserve_styles=True)[:1600] or "引用内容暂不可用"
             quoted_time = _quote_time(info, data, route)

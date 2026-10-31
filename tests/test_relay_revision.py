@@ -141,7 +141,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
                 event.message_obj.message_id = str(modern)
                 await self.relay.from_qq(event, self.route)
                 output = self.gateway.broadcast.await_args.args[1]
-                self.assertEqual("".join(c["text"] for c in output), "[幻域群]Alice[回复 Bob] :前后")
+                self.assertEqual("".join(c["text"] for c in output), "[幻域群]Alice[回复 Bob]:前后")
                 quote = next(c for c in output if "回复 Bob" in c["text"])
                 hover_key, value_key = ("hover_event", "value") if modern else ("hoverEvent", "contents")
                 self.assertEqual(quote[hover_key][value_key]["text"], "Bob\n原文\nDate: 未知")
@@ -158,7 +158,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
         by_text = {c["text"]: c for c in output}
-        self.assertEqual("".join(c["text"] for c in output), "前[回复 456] 后复位冒号[回复 456] 尾正文")
+        self.assertEqual("".join(c["text"] for c in output), "前[回复 456]后复位冒号[回复 456]尾正文")
         for text in ("前", "后"):
             self.assertEqual(by_text[text]["color"], "yellow")
             self.assertTrue(by_text[text]["bold"])
@@ -208,7 +208,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
                 event.message_obj.message_id = prefix
                 await self.relay.from_qq(event, self.route)
                 output = self.gateway.broadcast.await_args.args[1]
-                self.assertEqual("".join(c["text"] for c in output), expected + "前[回复 Bob] 后")
+                self.assertEqual("".join(c["text"] for c in output), expected + "前[回复 Bob]后")
 
     async def test_placeholder_in_sender_or_group_does_not_insert_extra_replies(self):
         self.route.update(prefix="[{group}]{sender}{reply}:", display_name="{reply}")
@@ -218,7 +218,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         event.get_sender_name = lambda: "{reply}"
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
-        self.assertEqual("".join(c["text"] for c in output), "[{reply}]{reply}[回复 Bob] :")
+        self.assertEqual("".join(c["text"] for c in output), "[{reply}]{reply}[回复 Bob]:")
         self.assertEqual(sum("hoverEvent" in c for c in output), 1)
 
     async def test_reply_slot_keeps_cross_group_privacy_check(self):
@@ -229,7 +229,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         event = Event("[CQ:reply,id=20]正文", [reply, {"type": "text", "text": "正文"}], api=api)
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
-        self.assertEqual("".join(c["text"] for c in output), "Alice[回复 某人] :正文")
+        self.assertEqual("".join(c["text"] for c in output), "Alice[回复 某人]:正文")
         self.assertNotIn("secret", json.dumps(output).lower())
         self.assertIn("引用内容暂不可用", str(output))
 
@@ -244,7 +244,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
                                     {"type": "text", "data": {"text": "C"}}]}, api=api)
         await self.relay.from_qq(event, self.route)
         output = self.gateway.broadcast.await_args.args[1]
-        self.assertEqual("".join(c["text"] for c in output), "先[回复 Bob20] [回复 Bob21] 中[回复 Bob20] [回复 Bob21] 后:ABC")
+        self.assertEqual("".join(c["text"] for c in output), "先[回复 Bob20][回复 Bob21]中[回复 Bob20][回复 Bob21]后:ABC")
         self.assertEqual(event.bot.call_action.await_count, 2)
 
     async def test_configured_semantic_colors_and_three_line_quote_hover_in_both_formats(self):
@@ -263,7 +263,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
         segments.extend({"type": kind, "data": {"url": "https://cdn.example.com/" + kind}} for kind in ("image", "record", "video", "file"))
         expected_colors = {"[链接]": "gold", "[卡片]": "gold", "[图片]": "#12abef", "[语音]": "red",
                            "[视频]": "dark_purple", "[文件]": "aqua", "[合并消息·1条]": "dark_green",
-                           "[回复 占星术士] ": "light_purple", "[表情]": "white", "[骰子：6]": "white",
+                           "[回复 占星术士]": "light_purple", "[表情]": "white", "[骰子：6]": "white",
                            "[猜拳：2]": "white", "@456": "dark_red"}
         for modern in (False, True):
             with self.subTest(modern=modern):
@@ -282,7 +282,7 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
                         found.add(component["text"])
                         self.assertEqual(component["color"], expected_colors[component["text"]])
                 self.assertEqual(found, set(expected_colors))
-                quote = next(c for c in output if c["text"] == "[回复 占星术士] ")
+                quote = next(c for c in output if c["text"] == "[回复 占星术士]")
                 hover = quote["hover_event"]["value"] if modern else quote["hoverEvent"]["contents"]
                 self.assertEqual(hover["text"], "占星术士\nwww.google.com\nDate: 11:11:11")
                 link = next(c for c in output if c["text"] == "[链接]")
@@ -321,6 +321,56 @@ class RelayRevisionTests(unittest.IsolatedAsyncioTestCase):
                 if group == 88:
                     self.assertNotIn("Bob", text)
                     self.assertNotIn("内容\n", text)
+
+    async def test_custom_reply_label_keeps_hover_color_and_original_or_slot_position(self):
+        self.route.update(templates={"reply_label": "(回复 @{sender})"}, message_colors={"reply": "gold"})
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "Bob"}, "message": "原文"}
+        for modern, prefix, expected in (
+            (False, "{sender}:", "Alice:前(回复 @Bob)后"),
+            (True, "{sender}{reply}:", "Alice(回复 @Bob):前后"),
+        ):
+            with self.subTest(modern=modern):
+                self.server["component_version"] = "modern" if modern else "legacy"
+                self.route["prefix"] = prefix
+                event = Event({"message": [{"type": "text", "data": {"text": "前"}},
+                                            {"type": "reply", "data": {"id": "20"}},
+                                            {"type": "text", "data": {"text": "后"}}]}, api=api)
+                event.message_obj.message_id = str(modern)
+                await self.relay.from_qq(event, self.route)
+                output = self.gateway.broadcast.await_args.args[1]
+                self.assertEqual("".join(c["text"] for c in output), expected)
+                quote = next(c for c in output if c["text"] == "(回复 @Bob)")
+                self.assertEqual(quote["color"], "gold")
+                hover = quote["hover_event"]["value"] if modern else quote["hoverEvent"]["contents"]
+                self.assertEqual(hover["text"], "Bob\n原文\nDate: 未知")
+                event.bot.call_action.assert_awaited_once()
+
+    async def test_reply_label_does_not_interpret_author_as_template_or_color(self):
+        self.route.update(prefix="{reply}", templates={"reply_label": "{{literal}} (回复 @{sender})"},
+                          message_colors={"reply": "#123abc"})
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"nickname": "§c&l作者{message}\n&#12abef"}, "message": "真正原文"}
+        event = Event({"message": [{"type": "reply", "data": {"id": "20"}}]}, api=api)
+        await self.relay.from_qq(event, self.route)
+        quote = self.gateway.broadcast.await_args.args[1][0]
+        self.assertEqual(quote["text"], "{literal} (回复 @作者{message})")
+        self.assertEqual(quote["color"], "#123abc")
+        self.assertFalse(quote["bold"])
+        self.assertEqual(quote["hoverEvent"]["contents"]["text"], "作者{message}\n真正原文\nDate: 未知")
+
+    async def test_blank_reply_label_uses_default_and_explicit_spacing_is_preserved(self):
+        self.route["prefix"] = "{reply}:"
+        async def api(action, **params):
+            return {"group_id": 77, "sender": {"user_id": 456}, "message": "原文"}
+        for template, expected in (("", "[回复 456]:"), ("  ", "[回复 456]:"),
+                                   ("(回复 @{sender}) ", "(回复 @456) :")):
+            with self.subTest(template=template):
+                self.route["templates"] = {"reply_label": template}
+                event = Event({"message": [{"type": "reply", "data": {"id": "20"}}]}, api=api)
+                event.message_obj.message_id = repr(template)
+                await self.relay.from_qq(event, self.route)
+                self.assertEqual("".join(c["text"] for c in self.gateway.broadcast.await_args.args[1]), expected)
 
     async def test_http_media_links_work_without_media_service_or_chatimage(self):
         segments = [{"type": "text", "data": {"text": "www.example.com?a=1&b=2 "}}, {"type": "face", "data": {"id": 14}}]

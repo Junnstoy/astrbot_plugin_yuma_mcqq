@@ -176,6 +176,32 @@ class Monitor:
         await self.close()
         await self.start()
 
+    def server_references(self, server_id):
+        self._open()
+        return self._db.execute("SELECT COUNT(*) FROM samples WHERE server_id=?", (server_id,)).fetchone()[0]
+
+    def rename_server(self, old_id, new_id, operation_id):
+        """Called only after sampling and foreground rendering have drained."""
+        self._open()
+        with self._db:
+            self._db.execute("CREATE TABLE IF NOT EXISTS server_renames(id TEXT PRIMARY KEY,old_id TEXT,new_id TEXT,count INTEGER)")
+            previous = self._db.execute("SELECT old_id,new_id,count FROM server_renames WHERE id=?", (operation_id,)).fetchone()
+            if previous:
+                if tuple(previous[:2]) != (old_id, new_id):
+                    raise ValueError("性能历史重命名操作不匹配")
+                count = previous[2]
+            else:
+                rows = self._db.execute("SELECT id,payload FROM samples WHERE server_id=?", (old_id,)).fetchall()
+                for row in rows:
+                    payload = json.loads(row[1])
+                    payload["server_id"] = new_id
+                    self._db.execute("UPDATE samples SET server_id=?,payload=? WHERE id=?", (new_id, json.dumps(payload, ensure_ascii=False), row[0]))
+                count = len(rows)
+                self._db.execute("INSERT INTO server_renames VALUES(?,?,?,?)", (operation_id, old_id, new_id, count))
+        self._last.clear()
+        self._locks.pop(old_id, None)
+        return count
+
     async def _loop(self):
         # Let WebSocket connections establish before the first automatic sample.
         await asyncio.sleep(2)
@@ -273,7 +299,7 @@ class Monitor:
         zone = ZoneInfo(self.settings.data.get("timezone", "Asia/Shanghai"))
         times = [datetime.fromtimestamp(row["timestamp"], zone) for row in rows]
         panels = [("tps", "TPS (reported rolling window)", "ticks/s", "#4264d8"),
-                  ("mspt", "MSPT (reported mean / median)", "ms/tick", "#a04bb4"),
+                  ("mspt", "Tick duration (MSPT / 50)", "ticks (1 tick = 50 ms)", "#a04bb4"),
                   ("player_ping_ms", "Player ping (server-reported)", "ms", "#d37a20"),
                   ("slp_rtt_ms", "Bot to server SLP RTT", "ms", "#168b7e")]
         for index, (key, title, unit, color) in enumerate(panels, 1):
@@ -282,7 +308,8 @@ class Monitor:
             ax.set_ylabel(unit, fontsize=9)
             ax.set_facecolor("white")
             ax.grid(alpha=0.15)
-            values = [row.get(key) if row.get(key) is not None else float("nan") for row in rows]
+            scale = 50 if key == "mspt" else 1
+            values = [row[key] / scale if row.get(key) is not None else float("nan") for row in rows]
             if rows:
                 ax.plot(times, values, color=color, linewidth=1.6, marker="." if len(rows) < 20 else None)
                 ax.xaxis.set_major_formatter(DateFormatter("%m-%d\n%H:%M", tz=zone))
@@ -291,6 +318,6 @@ class Monitor:
             ax.tick_params(labelsize=8)
             ax.set_ylim(bottom=0)
         figure.suptitle(f"Yuma MCQQ | {server_id} | {self.settings.data.get('timezone', 'Asia/Shanghai')}", fontsize=13, x=0.06, ha="left")
-        figure.text(0.06, 0.025, "Gaps indicate missing data. Player ping and bot RTT measure different network paths.", fontsize=8, color="#627086")
+        figure.text(0.06, 0.025, "MSPT chart: 1 tick = 50 ms. Gaps indicate missing data. Player ping and bot RTT use different paths.", fontsize=8, color="#627086")
         figure.subplots_adjust(top=0.90, bottom=0.12, left=0.08, right=0.97, hspace=0.42, wspace=0.28)
         figure.savefig(filename, facecolor=figure.get_facecolor())

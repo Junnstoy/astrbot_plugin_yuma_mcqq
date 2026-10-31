@@ -150,6 +150,8 @@ URL 的持有人在有效期内可以访问对应内容，链接可能被收件�
 
 ## 性能数据与图表
 
+从 1.3 起，GUI 提供数值纵轴；GUI 与 PNG 的 MSPT 均按 `原始毫秒数 / 50` 显示为 ticks，并注明 `1 tick = 50 ms`。例如 50 ms 对应 1 tick，12 ms 对应 0.24 ticks。采样数据库仍保存毫秒，RCON 原文回复不变。该显示值是按固定标准换算的耗时，不是 TPS。[Paper MSPT 定义](https://docs.papermc.io/paper/reference/commands/#mspt)
+
 `服务器状态` 仅返回当前路由的“在线”或“离线”，依据 QueQiao 连接状态，不等同于完整游戏健康检查。`tps`、`mspt`、`ping` 指令直接执行对应 RCON 查询，并清洗后返回完整文字，不再返回曲线图。`性能图` 是独立动作，读取历史并生成 PNG，可传小时数，默认 24 小时。实际触发名都以 AstrBot 管理行为为准。
 
 定时器启动后自动采样；同一服务器不重叠探测。每服可配置 `tps_command`、`mspt_command`、`ping_command`，默认分别为 `tps`、`mspt`、`ping`。Paper 的 `tps` 返回最近 1、5、15 分钟三个窗口，采样选取第一个窗口并保存其余窗口；颜色码不会影响识别。[Paper TPS 命令实现](https://github.com/PaperMC/Paper/blob/main/paper-server/src/main/java/org/spigotmc/TicksPerSecondCommand.java)

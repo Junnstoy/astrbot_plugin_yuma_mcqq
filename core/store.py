@@ -28,6 +28,21 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def remap_server_references(value, old_id, new_id):
+    """Change structured references only; never rewrite rewards or raw commands."""
+    if isinstance(value, list):
+        return [remap_server_references(item, old_id, new_id) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: (new_id if key in {"server_id", "binding_server_id"} and item == old_id else
+                  {name: new_id if target == old_id else target for name, target in item.items()}
+                  if key == "server_map" and isinstance(item, dict) else
+                  remap_server_references(item, old_id, new_id))
+            for key, item in value.items()
+        }
+    return value
+
+
 def integer(value, minimum=0, maximum=MAX_POINTS):
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise DomainError("数量必须是有效范围内的整数")
@@ -35,6 +50,13 @@ def integer(value, minimum=0, maximum=MAX_POINTS):
 
 
 class Store:
+    SERVER_JSON_FIELDS = (
+        ("binding_history", "old_binding"), ("binding_history", "new_binding"),
+        ("signin_operations", "binding_json"), ("signin_operations", "result_json"),
+        ("orders", "binding_json"), ("orders", "snapshot"), ("products", "definition"),
+        ("audit_log", "detail"), ("migration_batches", "summary"),
+    )
+
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +169,46 @@ class Store:
     def close(self):
         # Connections are scoped to individual operations.
         pass
+
+    def server_references(self, server_id):
+        """Include historical/pending references so a retired ID cannot be merged."""
+        count = 0
+        with self.connection() as db:
+            for table in ("bindings", "binding_challenges"):
+                count += db.execute(f"SELECT COUNT(*) FROM {table} WHERE server_id=?", (server_id,)).fetchone()[0]
+            for table, column in self.SERVER_JSON_FIELDS:
+                for row in db.execute(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL"):
+                    value = json.loads(row[0])
+                    count += remap_server_references(value, server_id, None) != value
+        return count
+
+    def rename_server(self, old_id, new_id, actor, operation_id):
+        """One local transaction; the application journal coordinates other files."""
+        marker = "server_rename:" + operation_id
+        with self.connection(True) as db:
+            previous = db.execute("SELECT value FROM schema_meta WHERE key=?", (marker,)).fetchone()
+            if previous:
+                saved = json.loads(previous[0])
+                if (saved["old_id"], saved["new_id"]) != (old_id, new_id):
+                    raise DomainError("服务器重命名操作标识不匹配")
+                return saved["counts"]
+            counts = {}
+            for table in ("bindings", "binding_challenges"):
+                counts[table] = db.execute(f"UPDATE {table} SET server_id=? WHERE server_id=?", (new_id, old_id)).rowcount
+            for table, column in self.SERVER_JSON_FIELDS:
+                changed = 0
+                rows = db.execute(f"SELECT rowid,{column} FROM {table} WHERE {column} IS NOT NULL").fetchall()
+                for row in rows:
+                    value = json.loads(row[1])
+                    renamed = remap_server_references(value, old_id, new_id)
+                    if renamed != value:
+                        db.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (encode(renamed), row[0]))
+                        changed += 1
+                counts[table + "." + column] = changed
+            # Identity, binding version, cooldown, points and order state stay intact.
+            self._audit(db, "server_rename", actor, {"old_id": old_id, "new_id": new_id, "operation_id": operation_id})
+            db.execute("INSERT INTO schema_meta VALUES(?,?)", (marker, encode(dict(old_id=old_id, new_id=new_id, counts=counts))))
+            return counts
 
     @staticmethod
     def _audit(db, action, actor, detail):

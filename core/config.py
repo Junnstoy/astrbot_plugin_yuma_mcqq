@@ -21,6 +21,7 @@ COLOR_NAMES = {"black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dar
 DEFAULTS = {
     "schema_version": 4, "binding_verification_enabled": False,
     "points_name": "点数", "command_prefix": "",
+    "help": {"image_enabled": True, "entries": {}},
     "enabled": True, "timezone": "Asia/Shanghai", "binding_cooldown_seconds": 604800,
     "servers": [], "routes": [], "commands": [],
     "media": {"enabled": False, "host": "127.0.0.1", "port": 8766,
@@ -79,6 +80,25 @@ def validate(data: dict) -> dict:
     data["points_name"] = data["points_name"].strip()
     if not isinstance(data["command_prefix"], str) or len(data["command_prefix"]) > 20 or any(c.isspace() or ord(c) < 32 for c in data["command_prefix"]):
         raise ValueError("插件唤醒前缀应不超过 20 字符，不能含空格或控制字符；留空沿用 AstrBot")
+    help_settings = data.setdefault("help", copy.deepcopy(DEFAULTS["help"]))
+    if not isinstance(help_settings, dict) or set(help_settings) - {"image_enabled", "entries"}:
+        raise ValueError("帮助配置必须是对象，且只能包含 image_enabled 和 entries")
+    help_settings.setdefault("image_enabled", True)
+    help_settings.setdefault("entries", {})
+    _booleans(help_settings, "image_enabled")
+    if not isinstance(help_settings["entries"], dict):
+        raise ValueError("帮助指令配置 entries 必须是对象")
+    for action_id, entry in help_settings["entries"].items():
+        if not isinstance(action_id, str) or not re.fullmatch(r"(?:custom:)?[A-Za-z0-9_-]{1,64}", action_id):
+            raise ValueError("帮助 action_id 无效；自定义指令使用 custom:配置ID")
+        if not isinstance(entry, dict) or set(entry) - {"description", "visible", "order"}:
+            raise ValueError("每项帮助配置只能包含 description、visible 和 order")
+        if "description" in entry and (not isinstance(entry["description"], str) or len(entry["description"]) > 16384):
+            raise ValueError("帮助说明必须是不超过 16 KiB 的文本")
+        if "visible" in entry:
+            _booleans(entry, "visible")
+        if "order" in entry:
+            _number(entry["order"], -1000000, 1000000, "帮助顺序", integer=True)
     _timezone(data["timezone"])
     for key in ("servers", "routes", "commands"):
         if not isinstance(data.get(key), list) or not all(isinstance(x, dict) for x in data[key]):
@@ -169,6 +189,8 @@ def validate(data: dict) -> dict:
             template_fields(template)
         if "reply_hover" in route["templates"] and not template_fields(route["templates"]["reply_hover"]) <= {"sender", "message", "time"}:
             raise ValueError("引用悬浮模板仅支持 {sender}、{message} 和 {time}")
+        if "reply_label" in route["templates"] and not template_fields(route["templates"]["reply_label"]) <= {"sender"}:
+            raise ValueError("引用标签模板仅支持 {sender}")
         if not isinstance(route["signin_rules"], list) or not isinstance(route["signin_prefixes"], list):
             raise ValueError("签到规则与前缀必须为数组")
         for rule in route["signin_rules"]:

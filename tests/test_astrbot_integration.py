@@ -255,7 +255,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.app = types.SimpleNamespace(
             settings=types.SimpleNamespace(data={"enabled": True}, route=lambda umo: self.route),
             execute=AsyncMock(return_value={"text": "完成"}),
-            relay=types.SimpleNamespace(from_qq=AsyncMock()),
+            relay_from_qq=AsyncMock(),
             web=AsyncMock(return_value={"saved": True}),
             snapshot=lambda: {"settings": {"servers": []}},
         )
@@ -286,12 +286,12 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_runs_only_after_commands_and_ai_signals_are_excluded(self):
         ordinary = FakeEvent("普通聊天")
         await self.plugin.ordinary_message(ordinary)
-        self.plugin.app.relay.from_qq.assert_awaited_once()
+        self.plugin.app.relay_from_qq.assert_awaited_once()
         for event in [FakeEvent("AI聊天", ai=True), FakeEvent("已处理")]:
             if event.message_str == "已处理":
                 event.set_extra(self.main.CONSUMED_KEY, True)
             await self.plugin.ordinary_message(event)
-        self.assertEqual(self.plugin.app.relay.from_qq.await_count, 1)
+        self.assertEqual(self.plugin.app.relay_from_qq.await_count, 1)
 
     async def test_async_reply_uses_original_umo_and_command_is_consumed(self):
         event = FakeEvent("签到", ai=True)
@@ -333,10 +333,48 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ]
         await self.plugin._execute_action("help", FakeEvent(user="20002"), "")
         self.plugin.app.execute.assert_not_awaited()
-        message = self.plugin.context.send_message.await_args.args[1].chain[0].text
+        from PIL import Image as PillowImage
+        component = self.plugin.context.send_message.await_args.args[1].chain[0]
+        self.assertIsInstance(component, self.main.Image)
+        with PillowImage.open(next((self.plugin.data_dir / "help").glob("*.png"))) as image:
+            message = image.info["help_text"]
         self.assertIn("/领取确认", message)
         self.assertNotIn("加点", message)
         self.assertNotIn("服务器性能", message)
+
+    async def test_help_image_switch_and_render_failure_keep_complete_text(self):
+        self.plugin.commands.effective_commands.return_value = [
+            {"handler_name": "cmd_confirm", "effective_command": "领取确认", "aliases": ["领奖"], "description": "完整命令说明"},
+        ]
+        for image_enabled in (False, True):
+            with self.subTest(image_enabled=image_enabled):
+                self.plugin.app.settings.data["help"] = {"image_enabled": image_enabled}
+                with patch.object(self.main, "render_help_pages", side_effect=RuntimeError("没有中文字体")) as render:
+                    await self.plugin._execute_action("help", FakeEvent(user="20002"), "")
+                    self.assertEqual(render.call_count, int(image_enabled))
+                message = self.plugin.context.send_message.await_args.args[1].chain[0].text
+                self.assertIn("/领取确认", message)
+                self.assertIn("/领奖", message)
+                self.assertIn("完整命令说明", message)
+
+    async def test_help_sends_every_page_to_captured_umo(self):
+        from PIL import Image as PillowImage
+        paths = []
+        for index in range(3):
+            path = self.plugin.data_dir / f"page-{index}.png"
+            with PillowImage.new("RGB", (8, 8), "white") as image:
+                image.save(path)
+            paths.append(str(path))
+        event = FakeEvent(user="20002")
+        def render(*args):
+            event.unified_msg_origin = "different:GroupMessage:999"
+            return paths
+        with patch.object(self.main, "render_help_pages", side_effect=render):
+            await self.plugin._execute_action("help", event, "")
+        self.assertEqual(self.plugin.context.send_message.await_count, 3)
+        for call in self.plugin.context.send_message.await_args_list:
+            self.assertEqual(call.args[0], "bot:GroupMessage:12345")
+            self.assertIsInstance(call.args[1].chain[0], self.main.Image)
 
     async def test_admin_actions_are_rechecked_in_business_entry(self):
         event = FakeEvent(user="20002")

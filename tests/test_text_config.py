@@ -152,5 +152,31 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.settings.save({'routes':[{**route,'message_colors':colors}]})
         with self.assertRaises(ValueError):self.settings.save({'routes':[{**route,'templates':{'reply_hover':'{missing}'}}]})
 
+    def test_reply_label_accepts_sender_and_literal_braces_only(self):
+        self.settings.save({'servers':[{'id':'s'}]})
+        route={'umo':'b:GroupMessage:1','server_id':'s','templates':{'reply_label':'{{literal}} (回复 @{sender})'}}
+        self.settings.save({'routes':[route]})
+        self.assertEqual(Settings(self.settings.path).data['routes'][0]['templates']['reply_label'],route['templates']['reply_label'])
+        before=self.settings.path.read_bytes()
+        for template in ('{message}','{time}','{sender.name}','{sender!r}'):
+            with self.subTest(template=template),self.assertRaises(ValueError):
+                self.settings.save({'routes':[{**route,'templates':{'reply_label':template}}]})
+        self.assertEqual(self.settings.path.read_bytes(),before)
+
+    def test_help_defaults_and_validated_per_action_overrides(self):
+        self.assertEqual(self.settings.data['help'], {'image_enabled':True,'entries':{}})
+        help_settings={'image_enabled':False,'entries':{'signin':{'description':'新版说明','visible':False,'order':5},
+                                                       'custom:lookup':{'visible':True,'order':-1}}}
+        self.settings.save({'help':help_settings})
+        self.assertEqual(Settings(self.settings.path).data['help'],help_settings)
+        before=self.settings.path.read_bytes()
+        for invalid in ({'image_enabled':'false'}, {'entries':[]}, {'unknown':True},
+                        {'entries':{'custom:':{}}}, {'entries':{'signin':{'visible':1}}},
+                        {'entries':{'signin':{'order':1.5}}}, {'entries':{'signin':{'order':1000001}}},
+                        {'entries':{'signin':{'description':None}}}, {'entries':{'signin':{'enabled':False}}}):
+            with self.subTest(invalid=invalid),self.assertRaises(ValueError):
+                self.settings.save({'help':invalid})
+        self.assertEqual(self.settings.path.read_bytes(),before)
+
 
 if __name__ == '__main__': unittest.main()

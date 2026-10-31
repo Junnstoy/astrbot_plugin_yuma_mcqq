@@ -48,6 +48,15 @@ def _safe_url(value: str) -> str:
     return ""
 
 
+def _segment_url(data: dict) -> str:
+    """Find an already-provided URL without resolving or downloading anything."""
+    for key in ("url", "file", "file_path", "path"):
+        source = _safe_url(data.get(key, ""))
+        if source:
+            return source
+    return ""
+
+
 def strip_styles(value: str) -> str:
     # Ampersands in URL query strings are data, not Minecraft style markers.
     output, start = [], 0
@@ -296,11 +305,20 @@ class Relay:
         self._rates: dict[str, deque] = {}
         self._echoes: dict[tuple[str, str], float] = {}
         self._semaphore = asyncio.Semaphore(8)
+        self._slow_stages: dict[str, float] = {}
 
     async def close(self):
         self._seen.clear()
         self._rates.clear()
         self._echoes.clear()
+        self._slow_stages.clear()
+
+    def _slow_stage(self, stage: str, started: float) -> None:
+        elapsed, now = time.perf_counter() - started, time.monotonic()
+        if elapsed >= 1 and now >= self._slow_stages.get(stage, 0):
+            self._slow_stages[stage] = now + 30
+            # Do not log origins, file IDs, message content or signed media URLs.
+            log.warning("[YumaMCQQ] QQ-to-MC slow stage=%s elapsed=%.3fs", stage, elapsed)
 
     def _once(self, key: str, ttl: int = 120) -> bool:
         now = time.monotonic()
@@ -344,13 +362,20 @@ class Relay:
                     continue
                 if kind == "reply" and str(data.get("id", "")) != str(extra["data"].get("id", "")):
                     continue
-                segment["data"] = {**extra["data"], **data}
+                merged = {**extra["data"], **data}
+                if kind in LABELS and not _segment_url(merged):
+                    # Raw image.file is often an opaque ID while the framework's
+                    # corresponding Image.file/url already contains a usable URL.
+                    # Keep that URL when raw empty fields/IDs overwrite adaptation.
+                    source = _segment_url(data) or _segment_url(extra["data"])
+                    if source:
+                        merged["url"] = source
+                segment["data"] = merged
                 remaining.pop(index)
                 break
         return original
 
-    @staticmethod
-    async def _api(event, action: str, **params) -> dict:
+    async def _api(self, event, action: str, **params) -> dict:
         bot = getattr(event, "bot", None)
         callback = getattr(bot, "call_action", None)
         if not callback:
@@ -360,7 +385,12 @@ class Relay:
         self_id = _raw_event(event).get("self_id") or (event.get_self_id() if hasattr(event, "get_self_id") else None)
         if self_id:
             params.setdefault("self_id", self_id)
-        result = await asyncio.wait_for(callback(action=action, **params), timeout=8)
+        started = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(callback(action=action, **params), timeout=8)
+        finally:
+            known = {"get_msg", "get_image", "get_record", "get_group_file_url", "get_private_file_url", "get_file", "get_forward_msg"}
+            self._slow_stage("onebot." + (action if action in known else "other"), started)
         if not isinstance(result, dict):
             raise MediaRejected("OneBot 返回格式异常")
         if "retcode" in result and result["retcode"] != 0:
@@ -380,6 +410,15 @@ class Relay:
             return
         if not self._rate(umo):
             return
+        created = getattr(event, "created_at", None)
+        now = time.time()
+        if isinstance(created, (int, float)) and not isinstance(created, bool) and 0 < created <= now:
+            age = now - created
+            if age <= 86400:
+                # AstrBot sets created_at after adapter conversion. This is only
+                # an estimate of queue/preprocessing/earlier-handler wait, not
+                # proof of which upstream stage caused it or QQ network latency.
+                self._slow_stage("framework_wait", time.perf_counter() - age)
         server = self.settings.server(route["server_id"])
         modern = server.get("component_version") == "modern"
         sender = str(event.get_sender_name()) if hasattr(event, "get_sender_name") else user
@@ -387,11 +426,17 @@ class Relay:
         prefix = route.get("prefix", "[{group}] {sender}{reply}：")
         move_replies = "reply" in template_fields(prefix)
         prefix_values = {"group": group, "sender": sender, "user_id": user}
+        queued = time.perf_counter()
         async with self._semaphore:
+            self._slow_stage("relay_queue", queued)
             segments = self._segments(event)
             replies = []
-            components = await self._render_segments(event, segments, route, modern, 0, [0],
-                                                     reply_components=replies if move_replies else None)
+            started = time.perf_counter()
+            try:
+                components = await self._render_segments(event, segments, route, modern, 0, [0],
+                                                         reply_components=replies if move_replies else None)
+            finally:
+                self._slow_stage("render", started)
             if not components and not replies:
                 return
             bounded, remaining = [], 12000
@@ -410,16 +455,54 @@ class Relay:
             digest = hashlib.sha256(rendered.encode()).hexdigest()
             self._echoes[(route["server_id"], digest)] = time.monotonic() + 30
             self._echoes = {k: expiry for k, expiry in self._echoes.items() if expiry > time.monotonic()}
-            await self.gateway.broadcast(route["server_id"], components)
+            started = time.perf_counter()
+            try:
+                await self.gateway.broadcast(route["server_id"], components)
+            finally:
+                self._slow_stage("queqiao_broadcast", started)
 
     async def _render_segments(self, event, segments: list, route: dict, modern: bool, depth: int, budget: list[int],
                                *, reply_components: list[dict] | None = None) -> list[dict]:
         if depth > 3:
             return [minecraft_component("[嵌套消息已截断]", color="gray")]
+        enabled = set(route.get("types", ["text", "link", "image", "record", "video", "file", "reply", "forward", "at", "face"]))
+        prepared, limit = {}, asyncio.Semaphore(4)
+
+        async def resolve(kind, data):
+            async with limit:
+                if kind == "reply":
+                    return await self._quote(event, data, route)
+                return await self._media_source(event, kind, data)
+
+        # Only independent metadata is concurrent. Rendering, nested budgets,
+        # cache publication and the final message remain in the original order.
+        for index, raw in enumerate(segments[:min(100, max(0, 200 - budget[0]))]):
+            segment = _segment(raw)
+            kind = segment["type"]
+            if kind not in enabled:
+                continue
+            if kind == "forward":
+                break
+            if kind in LABELS or kind == "reply":
+                prepared[index] = asyncio.create_task(resolve(kind, segment["data"]))
+        try:
+            return await self._render_segments_ordered(event, segments, route, modern, depth, budget,
+                                                       reply_components=reply_components, prepared=prepared)
+        finally:
+            for task in prepared.values():
+                if not task.done():
+                    task.cancel()
+            if prepared:
+                await asyncio.gather(*prepared.values(), return_exceptions=True)
+
+    async def _render_segments_ordered(self, event, segments: list, route: dict, modern: bool, depth: int, budget: list[int],
+                                       *, reply_components: list[dict] | None = None, prepared: dict | None = None) -> list[dict]:
+        if depth > 3:
+            return [minecraft_component("[嵌套消息已截断]", color="gray")]
         result = []
         colors = _message_colors(route)
         enabled = set(route.get("types", ["text", "link", "image", "record", "video", "file", "reply", "forward", "at", "face"]))
-        for raw in segments[:100]:
+        for index, raw in enumerate(segments[:100]):
             if budget[0] >= 200:
                 result.append(minecraft_component("[消息过长，已截断]", color="gray"))
                 break
@@ -458,9 +541,16 @@ class Relay:
                 if kind == "file" and name:
                     label += "：" + name[:100]
                 try:
-                    source = await self._media_source(event, kind, data)
+                    source = await prepared[index] if prepared and index in prepared else await self._media_source(event, kind, data)
                     direct = getattr(self.media, "public_source_url", None)
-                    url = direct(source) if callable(direct) and _safe_url(source) else await self.media.publish(source, kind, name)
+                    if callable(direct) and _safe_url(source):
+                        url = direct(source)
+                    else:
+                        started = time.perf_counter()
+                        try:
+                            url = await self.media.publish(source, kind, name)
+                        finally:
+                            self._slow_stage("media_cache", started)
                     result.append(minecraft_component(f"[{label}]", hover=name or "点击访问，有效期内可用", url=url, modern=modern, color=colors[kind]))
                 except Exception as exc:
                     if isinstance(exc, asyncio.CancelledError):
@@ -468,7 +558,7 @@ class Relay:
                     result.append(minecraft_component(f"[{label}·暂不可用]", hover="媒体链接未配置、已失效或无法读取", modern=modern, color=colors[kind]))
                     log.debug("[YumaMCQQ] media unavailable: %s", type(exc).__name__)
             elif kind == "reply":
-                author, text = await self._quote(event, data, route)
+                author, text = await prepared[index] if prepared and index in prepared else await self._quote(event, data, route)
                 template = route.get("templates", {}).get("reply_label") or REPLY_LABEL
                 if not template.strip():
                     template = REPLY_LABEL
@@ -493,11 +583,11 @@ class Relay:
         return result
 
     async def _media_source(self, event, kind: str, data: dict) -> str:
+        provided = _segment_url(data)
+        if provided:
+            return provided
         source = str(data.get("url") or data.get("path") or "")
         file_id = str(data.get("file") or data.get("file_id") or "")
-        for candidate in (source, file_id):
-            if _safe_url(candidate):
-                return _safe_url(candidate)
         if not source and file_id.startswith("base64://"):
             return file_id
         if kind == "record" and file_id:

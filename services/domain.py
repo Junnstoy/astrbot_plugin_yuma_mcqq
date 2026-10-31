@@ -157,7 +157,7 @@ class Domain:
                 return self._result(f"{points_name}：{balance['total']}\n可用：{balance['available']}\n冻结：{balance['frozen']}")
             if action == "rank":
                 rows = self.store.rank(ctx["scope"])
-                return self._result(points_name + "排行榜\n" + ("\n".join(f"{i}. {r['qq_id']}：{r['total']}" for i, r in enumerate(rows, 1)) or "暂无记录"))
+                return self._result(points_name + "排行榜\n" + ("\n".join(f"{i}. {r['player']}：{r['total']}" for i, r in enumerate(rows, 1)) or "暂无记录"))
             if action in {"points_add", "points_sub", "points_set"}:
                 self._admin_only(ctx)
                 tokens = args.split(maxsplit=2)

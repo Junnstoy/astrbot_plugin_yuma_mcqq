@@ -305,20 +305,11 @@ class Relay:
         self._rates: dict[str, deque] = {}
         self._echoes: dict[tuple[str, str], float] = {}
         self._semaphore = asyncio.Semaphore(8)
-        self._slow_stages: dict[str, float] = {}
 
     async def close(self):
         self._seen.clear()
         self._rates.clear()
         self._echoes.clear()
-        self._slow_stages.clear()
-
-    def _slow_stage(self, stage: str, started: float) -> None:
-        elapsed, now = time.perf_counter() - started, time.monotonic()
-        if elapsed >= 1 and now >= self._slow_stages.get(stage, 0):
-            self._slow_stages[stage] = now + 30
-            # Do not log origins, file IDs, message content or signed media URLs.
-            log.warning("[YumaMCQQ] QQ-to-MC slow stage=%s elapsed=%.3fs", stage, elapsed)
 
     def _once(self, key: str, ttl: int = 120) -> bool:
         now = time.monotonic()
@@ -375,7 +366,8 @@ class Relay:
                 break
         return original
 
-    async def _api(self, event, action: str, **params) -> dict:
+    @staticmethod
+    async def _api(event, action: str, **params) -> dict:
         bot = getattr(event, "bot", None)
         callback = getattr(bot, "call_action", None)
         if not callback:
@@ -385,12 +377,7 @@ class Relay:
         self_id = _raw_event(event).get("self_id") or (event.get_self_id() if hasattr(event, "get_self_id") else None)
         if self_id:
             params.setdefault("self_id", self_id)
-        started = time.perf_counter()
-        try:
-            result = await asyncio.wait_for(callback(action=action, **params), timeout=8)
-        finally:
-            known = {"get_msg", "get_image", "get_record", "get_group_file_url", "get_private_file_url", "get_file", "get_forward_msg"}
-            self._slow_stage("onebot." + (action if action in known else "other"), started)
+        result = await asyncio.wait_for(callback(action=action, **params), timeout=8)
         if not isinstance(result, dict):
             raise MediaRejected("OneBot 返回格式异常")
         if "retcode" in result and result["retcode"] != 0:
@@ -410,15 +397,6 @@ class Relay:
             return
         if not self._rate(umo):
             return
-        created = getattr(event, "created_at", None)
-        now = time.time()
-        if isinstance(created, (int, float)) and not isinstance(created, bool) and 0 < created <= now:
-            age = now - created
-            if age <= 86400:
-                # AstrBot sets created_at after adapter conversion. This is only
-                # an estimate of queue/preprocessing/earlier-handler wait, not
-                # proof of which upstream stage caused it or QQ network latency.
-                self._slow_stage("framework_wait", time.perf_counter() - age)
         server = self.settings.server(route["server_id"])
         modern = server.get("component_version") == "modern"
         sender = str(event.get_sender_name()) if hasattr(event, "get_sender_name") else user
@@ -426,17 +404,11 @@ class Relay:
         prefix = route.get("prefix", "[{group}] {sender}{reply}：")
         move_replies = "reply" in template_fields(prefix)
         prefix_values = {"group": group, "sender": sender, "user_id": user}
-        queued = time.perf_counter()
         async with self._semaphore:
-            self._slow_stage("relay_queue", queued)
             segments = self._segments(event)
             replies = []
-            started = time.perf_counter()
-            try:
-                components = await self._render_segments(event, segments, route, modern, 0, [0],
-                                                         reply_components=replies if move_replies else None)
-            finally:
-                self._slow_stage("render", started)
+            components = await self._render_segments(event, segments, route, modern, 0, [0],
+                                                     reply_components=replies if move_replies else None)
             if not components and not replies:
                 return
             bounded, remaining = [], 12000
@@ -455,11 +427,7 @@ class Relay:
             digest = hashlib.sha256(rendered.encode()).hexdigest()
             self._echoes[(route["server_id"], digest)] = time.monotonic() + 30
             self._echoes = {k: expiry for k, expiry in self._echoes.items() if expiry > time.monotonic()}
-            started = time.perf_counter()
-            try:
-                await self.gateway.broadcast(route["server_id"], components)
-            finally:
-                self._slow_stage("queqiao_broadcast", started)
+            await self.gateway.broadcast(route["server_id"], components)
 
     async def _render_segments(self, event, segments: list, route: dict, modern: bool, depth: int, budget: list[int],
                                *, reply_components: list[dict] | None = None) -> list[dict]:
@@ -546,11 +514,7 @@ class Relay:
                     if callable(direct) and _safe_url(source):
                         url = direct(source)
                     else:
-                        started = time.perf_counter()
-                        try:
-                            url = await self.media.publish(source, kind, name)
-                        finally:
-                            self._slow_stage("media_cache", started)
+                        url = await self.media.publish(source, kind, name)
                     result.append(minecraft_component(f"[{label}]", hover=name or "点击访问，有效期内可用", url=url, modern=modern, color=colors[kind]))
                 except Exception as exc:
                     if isinstance(exc, asyncio.CancelledError):

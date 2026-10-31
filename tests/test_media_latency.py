@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import types
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
 from tests import test_relay_revision as fixtures
 
@@ -180,46 +180,6 @@ class MediaLatencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.media.status()["assets"], 1)
         finally:
             self.media._runner = None
-
-    async def test_slow_logs_are_visible_rate_limited_and_contain_no_media_identity(self):
-        event = Event({}, api=lambda **_: {"url": "https://cdn.example.com/p?token=secret"})
-        with patch.object(relay_module.time, "perf_counter", side_effect=[0, 2]), \
-                patch.object(relay_module.time, "monotonic", return_value=100), \
-                patch.object(relay_module.log, "warning") as warning:
-            await self.relay._api(event, "get_image", file="secret-file-id")
-            warning.assert_called_once_with("[YumaMCQQ] QQ-to-MC slow stage=%s elapsed=%.3fs", "onebot.get_image", 2)
-            self.assertNotIn("secret", str(warning.call_args))
-        with patch.object(relay_module.time, "perf_counter", return_value=2), \
-                patch.object(relay_module.time, "monotonic", return_value=101), \
-                patch.object(relay_module.log, "warning") as warning:
-            self.relay._slow_stage("onebot.get_image", 0)
-            warning.assert_not_called()
-
-    async def test_framework_wait_reports_only_adapter_to_handler_age(self):
-        event = Event({"message": [{"type": "text", "data": {"text": "private-message-body"}}]})
-        event.created_at = 99996.0
-        with patch.object(relay_module.time, "time", return_value=100000), \
-                patch.object(relay_module.time, "perf_counter", return_value=100), \
-                patch.object(relay_module.log, "warning") as warning:
-            await self.relay.from_qq(event, self.route)
-            warning.assert_called_once_with("[YumaMCQQ] QQ-to-MC slow stage=%s elapsed=%.3fs", "framework_wait", 4)
-            self.assertNotIn("private", str(warning.call_args))
-            self.assertNotIn(event.get_sender_id(), str(warning.call_args))
-            self.assertNotIn(event.unified_msg_origin, str(warning.call_args))
-
-    async def test_framework_wait_ignores_future_invalid_and_unreasonable_created_at(self):
-        for index, created in enumerate((None, True, False, "99996", 0, -1, 100001, 13599,
-                                         float("nan"), float("inf"), 10 ** 1000)):
-            with self.subTest(created=repr(created)):
-                event = Event({"message": [{"type": "text", "data": {"text": "body"}}]})
-                event.created_at = created
-                event.message_obj.message_id = str(index)
-                with patch.object(relay_module.time, "time", return_value=100000), \
-                        patch.object(relay_module.time, "perf_counter", return_value=100), \
-                        patch.object(relay_module.log, "warning") as warning:
-                    await self.relay.from_qq(event, self.route)
-                    warning.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,7 +34,7 @@ AI_TAKEOVER_KEYS = ("yuma_mcqq.ai_claimed", "ai_claimed", "provider_request")
     PLUGIN_NAME,
     "Junnstoy",
     "Paper / QueQiao 群服互通、绑定、签到点数商店与性能监控",
-    "1.4.2",
+    "1.4.3",
     "https://github.com/Junnstoy/astrbot_plugin_yuma_mcqq",
 )
 class YumaMCQQPlugin(Star):
@@ -230,7 +230,7 @@ class YumaMCQQPlugin(Star):
         if not event.get_group_id() or str(event.get_sender_id()) == str(event.get_self_id()):
             return None
         # is_wake is also set by generic listeners and is not an AI signal.
-        if event.is_at_or_wake_command or event.call_llm or getattr(event, "_has_send_oper", False):
+        if event.call_llm or getattr(event, "_has_send_oper", False):
             return None
         if any(event.get_extra(key, False) for key in AI_TAKEOVER_KEYS):
             return None
@@ -238,29 +238,39 @@ class YumaMCQQPlugin(Star):
         # also excludes another plugin's command whose priority is below ours.
         if event.get_extra("handlers_parsed_params", {}):
             return None
+        if self._is_ai_wake(event):
+            return None
         route = self.app.settings.route(str(event.unified_msg_origin))
         if not route or not route.get("enabled", True) or not route.get("qq_to_mc", True):
             return None
         return route
 
-    def _may_auto_reply(self, event: AstrMessageEvent) -> bool:
-        # Do not call need_active_reply: it draws randomly and the built-in
-        # handler must remain the sole owner of that decision.
+    def _is_ai_wake(self, event: AstrMessageEvent) -> bool:
+        # Generic bot wake (e.g. '#') is not necessarily an AI request: the
+        # additional chat prefix must match too. AstrBot has already stripped
+        # the generic prefix from event.message_str before invoking handlers.
+        if not event.is_at_or_wake_command:
+            return False
         try:
             config = self.context.get_config(str(event.unified_msg_origin))
-            ltm = config.get("provider_ltm_settings", {})
-            active = ltm.get("active_reply", {})
-            if not isinstance(active, Mapping):
+            provider = config.get("provider_settings", {})
+            if not isinstance(provider, Mapping):
                 return True
-            if not active.get("enable", False):
-                return False
-            whitelist = active.get("whitelist", [])
-            if not isinstance(whitelist, list):
+            prefix = provider.get("wake_prefix", "")
+            bot_prefixes = config.get("wake_prefix", [])
+            if (not isinstance(prefix, str) or not isinstance(bot_prefixes, list)
+                    or any(not isinstance(value, str) for value in bot_prefixes)):
                 return True
-            return (not whitelist or str(event.unified_msg_origin) in whitelist
-                    or str(event.get_group_id()) in whitelist)
+            # Mirror AgentRequestSubStage's duplicate-prefix normalization.
+            for bot_prefix in bot_prefixes:
+                if prefix.startswith(bot_prefix):
+                    prefix = prefix[len(bot_prefix):]
+            text = event.message_str or ""
+            if event.get_platform_name() == "lark":
+                text = text.lstrip()
+            return not prefix or event.get_platform_name() == "webchat" or text.startswith(prefix)
         except Exception:
-            # Unknown session configuration retains the previous late path.
+            # An ambiguous explicit wake must not expose an AI request to MC.
             return True
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
@@ -268,7 +278,7 @@ class YumaMCQQPlugin(Star):
         # Commands run at 20, group-context captioning at 0. Keep the event
         # intact so recording/captioning still runs after ordinary forwarding.
         route = self._ordinary_route(event)
-        if route is not None and not self._may_auto_reply(event):
+        if route is not None:
             await self._relay_ordinary(event, route)
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=-1000)

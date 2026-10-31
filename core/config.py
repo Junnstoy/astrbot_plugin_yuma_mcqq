@@ -14,8 +14,12 @@ from .text import template_fields
 
 MASK = "********"
 IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
+MESSAGE_COLORS = {"link": "blue", "image": "blue", "record": "blue", "video": "blue",
+                  "file": "blue", "forward": "blue", "reply": "gray", "face": "green", "at": "yellow"}
+COLOR_NAMES = {"black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple",
+               "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white"}
 DEFAULTS = {
-    "schema_version": 3, "binding_verification_enabled": False,
+    "schema_version": 4, "binding_verification_enabled": False,
     "points_name": "点数", "command_prefix": "",
     "enabled": True, "timezone": "Asia/Shanghai", "binding_cooldown_seconds": 604800,
     "servers": [], "routes": [], "commands": [],
@@ -32,12 +36,13 @@ SERVER_DEFAULTS = {"name": "", "url": "ws://127.0.0.1:8080", "token": "", "enabl
                    "component_version": "legacy"}
 ROUTE_DEFAULTS = {"enabled": True, "qq_to_mc": True, "mc_to_qq": True, "admins": [],
                   "display_name": "",
+                  "message_colors": MESSAGE_COLORS,
                   "points_min": 10, "points_max": 10, "timezone": "Asia/Shanghai",
                   "signin_command": "signin click {player}", "templates": {},
                   "signin_prefixes": ["[手记人偶]"], "signin_rules": [],
                   "events": ["PlayerChatEvent", "PlayerJoinEvent", "PlayerQuitEvent", "PlayerDeathEvent", "PlayerAchievementEvent"],
                   "types": ["text", "face", "image", "link", "record", "video", "file", "forward", "reply", "at"],
-                  "prefix": "[{group}] {sender}：", "max_forward_nodes": 30}
+                  "prefix": "[{group}] {sender}{reply}：", "max_forward_nodes": 30}
 COMMAND_DEFAULTS = {"aliases": [], "description": "自定义服务器命令", "enabled": True,
                     "require_binding": True, "admin_only": True, "cooldown_seconds": 3,
                     "server_id": "", "parser": "rules", "cleanup_prefixes": [], "rules": [],
@@ -67,7 +72,7 @@ def validate(data: dict) -> dict:
         raise ValueError("配置必须是对象")
     data = copy.deepcopy(data)
     _booleans(data, "enabled", "binding_verification_enabled")
-    if data.get("schema_version") != 3:
+    if data.get("schema_version") != 4:
         raise ValueError("不支持的配置版本")
     if not isinstance(data["points_name"], str) or not data["points_name"].strip() or len(data["points_name"]) > 20 or any(ord(c) < 32 or c in "{}" for c in data["points_name"]):
         raise ValueError("点数名称须为 1–20 个字符，不能包含控制字符或花括号")
@@ -122,6 +127,13 @@ def validate(data: dict) -> dict:
         for key, value in ROUTE_DEFAULTS.items():
             route.setdefault(key, copy.deepcopy(value))
         _booleans(route, "enabled", "qq_to_mc", "mc_to_qq")
+        colors = route["message_colors"]
+        if not isinstance(colors, dict) or set(colors) - set(MESSAGE_COLORS):
+            raise ValueError("消息颜色配置包含未知类型")
+        for kind, default in MESSAGE_COLORS.items():
+            value = colors.setdefault(kind, default)
+            if not isinstance(value, str) or not (value in COLOR_NAMES or re.fullmatch(r"#[0-9a-fA-F]{6}", value)):
+                raise ValueError("消息颜色须为 Minecraft 标准颜色名或 #RRGGBB")
         if not isinstance(route["display_name"], str) or len(route["display_name"]) > 100:
             raise ValueError("群显示名称不超过100字符")
         for key in ("events", "types"):
@@ -155,6 +167,8 @@ def validate(data: dict) -> dict:
             raise ValueError("签到命令包含未知占位符")
         for template in route["templates"].values():
             template_fields(template)
+        if "reply_hover" in route["templates"] and not template_fields(route["templates"]["reply_hover"]) <= {"sender", "message", "time"}:
+            raise ValueError("引用悬浮模板仅支持 {sender}、{message} 和 {time}")
         if not isinstance(route["signin_rules"], list) or not isinstance(route["signin_prefixes"], list):
             raise ValueError("签到规则与前缀必须为数组")
         for rule in route["signin_rules"]:
@@ -260,6 +274,19 @@ class Settings:
                         if server.get(field) == old:
                             server[field] = new
                 saved["schema_version"] = 3
+            if saved.get("schema_version") == 3:
+                old_templates = {
+                    "signin": "签到成功✅️\n本次获得 {points_delta}{points_name}，当前{points_name}：{balance}\n{rcon}",
+                    "signin_already": "签到失败❌️ 今日已签到，请不要重复签到。",
+                }
+                for route in saved.get("routes", []):
+                    if route.get("prefix") == "[{group}] {sender}：":
+                        route["prefix"] = ROUTE_DEFAULTS["prefix"]
+                    templates = route.get("templates", {})
+                    for key, old in old_templates.items():
+                        if templates.get(key) == old:
+                            del templates[key]
+                saved["schema_version"] = 4
             self.data.update(saved)
         elif bootstrap:
             self.data.update({k: v for k, v in bootstrap.items() if k in DEFAULTS})

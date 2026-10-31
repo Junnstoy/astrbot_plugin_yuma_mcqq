@@ -347,6 +347,20 @@ class Application:
                       "rcon": clean_text(payload.get("raw", "")), "cleaned": result["cleaned"], "status": result["status"]}
             result["preview"] = render_template(command.get("templates", {}).get(result["status"], "{cleaned}"), values)
             return result
+        if action == "preview_signin":
+            route_umo = str(payload.get("route_umo", ""))
+            route = self.settings.route(route_umo) if route_umo else {}
+            if route is None:
+                raise ValueError("请选择现有群服路由，或使用内置默认模板")
+            if not isinstance(payload.get("group_signed", False), bool):
+                raise ValueError("群已签到模拟值必须为布尔值")
+            for key in ("points_delta", "balance"):
+                value = payload.get(key, 1)
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10**12:
+                    raise ValueError("模拟奖励和余额必须是非负整数")
+            return self.domain.preview_signin(payload.get("raw", ""), str(payload.get("player", "")), route,
+                group_signed=payload.get("group_signed", False), points_delta=payload.get("points_delta", 1),
+                balance=payload.get("balance", 1))
         if action == "metrics":
             sid = payload.get("server_id", "")
             self.settings.server(sid)

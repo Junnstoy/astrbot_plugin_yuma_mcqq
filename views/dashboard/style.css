@@ -15,3 +15,6 @@
 .toggle-item{display:flex;align-items:center;gap:9px;font-size:12px;cursor:pointer}
 .toggle-item input{flex:0 0 auto}
 @media(max-width:700px){.form-grid{grid-template-columns:1fr}.checkbox-grid{grid-template-columns:1fr 1fr}}
+[type="color"] { min-height: 42px; padding: 5px !important; cursor: pointer; }
+[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+[type="color"]::-webkit-color-swatch { border: 0; border-radius: 4px; }

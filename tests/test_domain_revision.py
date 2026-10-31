@@ -166,7 +166,7 @@ class DomainRevisionTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_reply_preserves_complete_clean_rcon_and_replays(self):
         await self.bind()
         result = await self.domain.execute("signin", self.ctx)
-        expected = "签到成功✅️\n本次获得 10樱花币，当前樱花币：10\n" + CLEAN_SIGNED
+        expected = "玩家: rincho\n群内签到成功✅️ 本次获得: 10 樱花币 当前樱花币:10\n游戏签到成功✅️ 已连续签到 1 天。"
         self.assertEqual(result["text"], expected)
         self.assertEqual(result["data"]["rcon"], CLEAN_SIGNED)
         stored = self.store.signin_operation(self.domain._key("signin", self.ctx))
@@ -180,9 +180,9 @@ class DomainRevisionTests(unittest.IsolatedAsyncioTestCase):
         await self.bind()
         self.gateway.replies = [ALREADY, ALREADY]
         first = await self.domain.execute("signin", self.ctx)
-        self.assertEqual(first["text"], "签到成功✅️\n本次获得 10樱花币，当前樱花币：10\n" + CLEAN_ALREADY)
+        self.assertEqual(first["text"], "玩家: rincho\n群内签到成功✅️ 本次获得: 10 樱花币 当前樱花币:10\n游戏签到失败❌️ 今日已签到 请不要重复签到")
         second = await self.domain.execute("signin", dict(self.ctx, message_id="2"))
-        self.assertEqual(second["text"], "签到失败❌️ 今日已签到，请不要重复签到。")
+        self.assertEqual(second["text"], "玩家: rincho\n群内签到失败❌️ 今日已签到 请不要重复签到\n游戏签到失败❌️ 今日已签到 请不要重复签到")
         self.assertEqual(len(self.gateway.calls), 2)
         self.assertEqual(self.store.balance("group1", "1")["total"], 10)
 
@@ -206,7 +206,7 @@ class DomainRevisionTests(unittest.IsolatedAsyncioTestCase):
         self.settings.data["points_name"] = "新名称"
         await self.domain.recover()
         result = await self.domain.execute("signin", self.ctx)
-        self.assertEqual(result["text"], "签到成功✅️\n本次获得 10樱花币，当前樱花币：10\n" + CLEAN_SIGNED)
+        self.assertEqual(result["text"], "玩家: rincho\n群内签到成功✅️ 本次获得: 10 樱花币 当前樱花币:10\n游戏签到成功✅️ 已连续签到 1 天。")
         self.assertEqual(len(self.gateway.calls), 1)
 
     async def test_currency_name_reaches_balance_shop_order_admin_and_errors(self):

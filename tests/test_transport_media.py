@@ -225,7 +225,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         url = next(c["click_event"]["url"] for c in components if c["text"] == "[链接]")
         self.assertIn("&b=2", url)
         quote = next(c for c in components if "回复 Bob" in c["text"])
-        self.assertEqual(quote["hover_event"]["value"]["text"], "quoted text")
+        self.assertEqual(quote["hover_event"]["value"]["text"], "Bob\nquoted text\nDate: 未知")
         await self.relay.from_qq(self.event(segments), self.route)
         self.assertEqual(self.gateway.broadcast.await_count, 1)
 

@@ -668,8 +668,19 @@ class Store:
             raise DomainError("请选择旧插件数据库副本，不能导入当前数据库")
         if source.stat().st_size > 256 * 1024 * 1024:
             raise DomainError("数据库超过 256 MiB，请先离线分批迁移")
+        def signature():
+            stat = source.stat()
+            for suffix in ("-wal", "-journal"):
+                sidecar = Path(str(source) + suffix)
+                if sidecar.exists() and sidecar.stat().st_size:
+                    raise DomainError("旧数据库仍有 WAL 或事务日志，请先停止写入并用 SQLite backup 制作一致性副本")
+            return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+        before = signature()
         permitted = ("session_settings", "balances", "checkins", "checkin_resets", "bindings", "balance_audit", "purchases", "used_codes")
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as legacy:
+        # immutable prevents SQLite from creating WAL/SHM in a read-only backup
+        # directory. Never ignore a nonempty source journal to obtain that mode.
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro&immutable=1", uri=True)) as legacy:
+            legacy.execute("PRAGMA query_only=ON")
             legacy.row_factory = sqlite3.Row
             tables = {r[0] for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not {"balances", "checkins"}.issubset(tables):
@@ -682,6 +693,8 @@ class Store:
                 if len(rows) > 100000:
                     raise DomainError("单张旧表超过 100000 行，请使用离线分批迁移")
                 data[table] = rows
+        if signature() != before:
+            raise DomainError("读取期间源数据库发生变化，请停止写入并重新制作一致性副本")
         digest = hashlib.sha256(encode(data).encode()).hexdigest()
         return data, digest
 
@@ -692,15 +705,197 @@ class Store:
             scope = str(row["session"])
             totals[scope] = totals.get(scope, 0) + integer(row["total"])
         return dict(digest=digest, counts={key: len(value) for key, value in data.items()}, balance_totals=totals,
-                    warnings=["仅迁移数据，不启用旧插件配置或旧指令。", "只有玩家名的旧绑定仅归档，请重新绑定；是否验证 UUID 由当前配置决定。",
+                    warnings=["仅迁移数据，不启用旧插件配置或旧指令。", "旧绑定按玩家名身份迁移，不伪造 UUID；需明确目标服务器并解决一对一冲突。",
                               "旧流水与完整记录归档保留，余额以迁移期初值入账。", "旧未付款订单取消；已付款未交付奖励保留，可补领同一份奖励且不再次扣款。"])
 
-    def preview_legacy(self, path):
+    @staticmethod
+    def _legacy_mapping(value, label):
+        if value is None:
+            return {}
+        if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not k.strip() or not v.strip()
+                                              for k, v in value.items()):
+            raise DomainError(label + "必须为非空字符串到非空字符串的对象")
+        return {k: v.strip() for k, v in value.items()}
+
+    @staticmethod
+    def _legacy_account(account_key):
+        key = str(account_key)
+        match = re.fullmatch(r"(.+):User:([0-9]+)", key)
+        if match:
+            return match.group(2), match.group(1), key.rsplit(":", 1)[0]
+        match = re.fullmatch(r"qq:([0-9]+)", key)
+        if match:
+            return match.group(1), "", "qq"
+        return "", "", ""
+
+    def _legacy_binding_plan(self, db, data, digest, previous, scope_map, binding_server_id, server_map, routes, binding_choices):
+        """Plan only; account keys and names are exposed solely to authenticated admins."""
+        scope_map = self._legacy_mapping(scope_map, "作用域映射")
+        server_map = self._legacy_mapping(server_map, "绑定服务器映射")
+        if not isinstance(binding_server_id, str):
+            raise DomainError("绑定目标服务器必须为字符串")
+        binding_server_id = binding_server_id.strip()
+        if binding_choices is not None and (not isinstance(binding_choices, list) or any(not isinstance(k, str) for k in binding_choices)):
+            raise DomainError("绑定选择必须为旧 account_key 字符串列表")
+        routes = [] if routes is None else routes
+        if not isinstance(routes, list) or any(not isinstance(r, dict) for r in routes):
+            raise DomainError("迁移路由必须为对象列表")
+        completed = set(previous.get("binding_imported_keys", []))
+        source = data.get("bindings", [])
+        source_keys = {str(row.get("account_key", "")) for row in source}
+        choices = None if binding_choices is None else set(binding_choices)
+        if choices is not None and choices - source_keys:
+            raise DomainError("绑定选择包含源数据库中不存在的 account_key，请重新预览")
+        sessions = {str(row["session"]) for row in data.get("session_settings", [])}
+        user_sessions = {}
+        for table in ("balances", "checkins", "purchases"):
+            for row in data.get(table, []):
+                session = str(row["session"])
+                sessions.add(session)
+                user_sessions.setdefault(str(row["user_id"]), set()).add(session)
+
+        def resolve_server(key, qq, platform, prefix):
+            for candidate in (key, prefix, platform):
+                if candidate and candidate in server_map:
+                    return server_map[candidate], ""
+            if binding_server_id:
+                return binding_server_id, ""
+            candidates = user_sessions.get(qq, set())
+            if platform:
+                candidates = {s for s in candidates if s.startswith(platform + ":")}
+            if not candidates:
+                candidates = {s for s in sessions if not platform or s.startswith(platform + ":")}
+            servers = set()
+            unresolved = not candidates
+            for session in candidates:
+                group = session.rsplit(":", 1)[-1] if ":GroupMessage:" in session else ""
+                explicit = server_map.get(session) or (server_map.get(group) if group else None)
+                if explicit:
+                    servers.add(explicit)
+                    continue
+                scope = scope_map.get(session, session)
+                matches = {str(route.get("server_id", "")) for route in routes
+                           if route.get("umo") == session or str(route.get("scope") or route.get("umo", "")) == scope}
+                matches.discard("")
+                servers.update(matches)
+                unresolved |= not matches
+            if unresolved:
+                return "", "无法从旧会话唯一推导目标服，请明确选择绑定目标服或填写服务器映射"
+            if len(servers) != 1:
+                return "", "旧绑定关联多个目标服务器，请使用明确的账号前缀或账号映射"
+            return next(iter(servers)), ""
+
+        targets = [dict(row) for row in db.execute("SELECT * FROM bindings ORDER BY qq_id")]
+        by_qq = {row["qq_id"]: row for row in targets}
+        by_player = {row["player"].casefold(): row for row in targets}
+        rows, conflicts = [], []
+
+        def block(indices, code, message):
+            keys = []
+            for index in indices:
+                row = rows[index]
+                row["status"] = "blocked"
+                row["reason"] = (row["reason"] + "；" if row["reason"] else "") + message
+                keys.append(row["account_key"])
+            conflicts.append({"code": code, "account_keys": keys, "message": message})
+
+        for source_row in source:
+            key, player = str(source_row.get("account_key", "")), str(source_row.get("player", ""))
+            qq, platform, prefix = self._legacy_account(key)
+            selected = choices is None or key in choices
+            row = dict(account_key=key, qq_id=qq, player=player, server_id="", selected=selected, status="ignored", reason="管理员未选择；原始记录仍归档")
+            rows.append(row)
+            if not selected:
+                continue
+            row.update(status="ready", reason="")
+            if key in completed:
+                row.update(status="imported", reason="该旧记录已处理，本次不恢复或改写用户后来的绑定变更")
+                continue
+            if not qq or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", player):
+                block([len(rows) - 1], "invalid_source", "旧账号标识或玩家名格式不受支持，需要人工核对")
+                continue
+            server, reason = resolve_server(key, qq, platform, prefix)
+            row["server_id"] = server
+            if reason:
+                block([len(rows) - 1], "server_unresolved", reason)
+
+        candidates = [i for i, row in enumerate(rows) if row["status"] == "ready"]
+        qq_groups, player_groups = {}, {}
+        for i in candidates:
+            row = rows[i]
+            qq_groups.setdefault(row["qq_id"], []).append(i)
+            player_groups.setdefault(row["player"].casefold(), []).append(i)
+        for indices in qq_groups.values():
+            if len({(rows[i]["player"].casefold(), rows[i]["server_id"]) for i in indices}) > 1:
+                block(indices, "source_qq_conflict", "同一 QQ 对应多个玩家名或目标服，请只选择已核对的一份绑定")
+        for indices in player_groups.values():
+            if len({rows[i]["qq_id"] for i in indices}) > 1:
+                block(indices, "source_player_conflict", "同一玩家名对应多个 QQ，请核对归属后选择，不能自动覆盖")
+        seen = {}
+        for i in candidates:
+            row = rows[i]
+            if row["status"] != "ready":
+                continue
+            key = (row["qq_id"], row["player"].casefold(), row["server_id"])
+            existing = by_qq.get(row["qq_id"])
+            owner = by_player.get(row["player"].casefold())
+            if existing and (existing["player"].casefold() != key[1] or existing["server_id"] != key[2]):
+                block([i], "target_qq_conflict", "目标库该 QQ 已绑定其他玩家或服务器，不会覆盖")
+            elif owner and owner["qq_id"] != row["qq_id"]:
+                block([i], "target_player_conflict", "目标库该玩家名已被其他 QQ 绑定，不会覆盖")
+            elif key in seen:
+                row.update(status="duplicate", reason="与同批选中的 QQ/玩家名/目标服相同，合并为一条绑定", duplicate_of=seen[key])
+            else:
+                seen[key] = row["account_key"]
+                if existing:
+                    row.update(status="existing", reason="目标已有相同绑定，保留现有 UUID、验证状态、版本和冷却")
+        counts = {name: sum(row["status"] == status for row in rows)
+                  for name, status in (("duplicates", "duplicate"), ("ready", "ready"), ("existing", "existing"),
+                                       ("blocked", "blocked"), ("imported", "imported"), ("ignored", "ignored"))}
+        counts.update(source=len(rows), selected=sum(row["selected"] for row in rows))
+        plan = dict(rows=rows, counts=counts, conflicts=conflicts, can_apply=not counts["blocked"])
+        selected_qq = {row["qq_id"] for row in rows if row["selected"]}
+        selected_players = {row["player"].casefold() for row in rows if row["selected"]}
+        fingerprint = dict(digest=digest, scope_map=scope_map, server_map=server_map, binding_server_id=binding_server_id,
+                           choices=None if choices is None else sorted(choices), completed=sorted(completed), plan=plan,
+                           targets=[row for row in targets if row["qq_id"] in selected_qq or row["player"].casefold() in selected_players])
+        plan_digest = hashlib.sha256(json.dumps(fingerprint, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return plan, plan_digest
+
+    def preview_legacy(self, path, scope_map=None, *, binding_server_id="", server_map=None, routes=None, binding_choices=None):
         data, digest = self._read_legacy(path)
         summary = self._legacy_summary(data, digest)
         with self.connection() as db:
-            summary["already_imported"] = bool(db.execute("SELECT 1 FROM migration_batches WHERE digest=?", (digest,)).fetchone())
+            previous = db.execute("SELECT summary FROM migration_batches WHERE digest=?", (digest,)).fetchone()
+            summary["already_imported"] = bool(previous)
+            previous = json.loads(previous[0]) if previous else {}
+            summary["binding_plan"], summary["plan_digest"] = self._legacy_binding_plan(
+                db, data, digest, previous, scope_map, binding_server_id, server_map, routes, binding_choices)
         return summary
+
+    def _apply_legacy_bindings(self, db, data, plan, summary, actor, now):
+        completed = set(summary.get("binding_imported_keys", []))
+        processed_pairs = set()
+        added = 0
+        for row in plan["rows"]:
+            if row["status"] not in {"ready", "existing"}:
+                continue
+            if row["status"] == "ready":
+                self._save_binding(db, row["qq_id"], row["player"], row["server_id"], None, 0, now,
+                                   actor="migration:" + str(actor), force=True)
+                added += 1
+            processed_pairs.add((row["qq_id"], row["player"].casefold()))
+        # Mark redundant source copies too: selecting one platform copy must not
+        # later resurrect an unbound user through another copy of the same pair.
+        for row in data.get("bindings", []):
+            key = str(row.get("account_key", ""))
+            if (self._legacy_account(key)[0], str(row.get("player", "")).casefold()) in processed_pairs:
+                completed.add(key)
+        newly_processed = len(completed - set(summary.get("binding_imported_keys", [])))
+        summary["binding_imported_keys"] = sorted(completed)
+        if newly_processed:
+            self._audit(db, "legacy_binding_import", actor, {"digest": summary["digest"], "added": added, "source_records_completed": newly_processed})
+        return added
 
     @staticmethod
     def _legacy_product(raw):
@@ -709,13 +904,12 @@ class Store:
                     reward=str(raw.get("reward_text", "")), command="", rules=[], enabled=False,
                     limit_per_user=integer(raw.get("purchase_limit", 0)), stock=-1, version=1)
 
-    def import_legacy(self, path, expected_digest, actor, scope_map=None):
+    def import_legacy(self, path, expected_digest, actor, scope_map=None, *, binding_server_id="", server_map=None,
+                      routes=None, binding_choices=None, plan_digest=""):
         data, digest = self._read_legacy(path)
         if digest != expected_digest:
             raise DomainError("源数据库已变化，请重新预览后导入")
-        scope_map = scope_map or {}
-        if not isinstance(scope_map, dict):
-            raise DomainError("作用域映射必须为对象")
+        scope_map = self._legacy_mapping(scope_map, "作用域映射")
         def scope_for(value):
             return str(scope_map.get(str(value), str(value)))
         summary = self._legacy_summary(data, digest)
@@ -723,8 +917,17 @@ class Store:
         prefix = "legacy:" + digest[:16] + ":"
         with self.connection(True) as db:
             existing = db.execute("SELECT summary FROM migration_batches WHERE digest=?", (digest,)).fetchone()
+            previous = json.loads(existing[0]) if existing else {}
+            plan, current_plan_digest = self._legacy_binding_plan(db, data, digest, previous, scope_map, binding_server_id,
+                                                                  server_map, routes, binding_choices)
+            if (plan["counts"]["selected"] or plan_digest) and plan_digest != current_plan_digest:
+                raise DomainError("绑定迁移计划已变化或未经确认，请重新预览并提交 plan_digest")
+            if not plan["can_apply"]:
+                raise DomainError("绑定迁移仍有冲突或缺少目标服务器，请解决预览中的问题后重新确认")
             if existing:
-                return dict(json.loads(existing[0]), already_imported=True)
+                added = self._apply_legacy_bindings(db, data, plan, previous, actor, now)
+                db.execute("UPDATE migration_batches SET summary=? WHERE digest=?", (encode(previous), digest))
+                return dict(previous, already_imported=True, binding_plan=plan, plan_digest=current_plan_digest, bindings_added=added)
             # Never silently merge balances into a destination with existing activity.
             for row in data.get("balances", []):
                 scope, user = scope_for(row["session"]), str(row["user_id"])
@@ -774,6 +977,8 @@ class Store:
                 db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (order_id, order_id, scope_for(row["session"]), str(row["user_id"]), str(row["product_id"]), encode(product), "{}", str(row["session"]), state,
                             str(row.get("reward", "")), "从旧插件导入；旧未付款订单已取消，旧已付款订单不会再次扣款", 0, now, now))
+            summary["scope_map"] = scope_map
+            added = self._apply_legacy_bindings(db, data, plan, summary, actor, now)
             db.execute("INSERT INTO migration_batches VALUES(?,?,?,?)", (digest, encode(summary), str(actor), now))
             self._audit(db, "legacy_import", actor, {"digest": digest, "counts": summary["counts"]})
-        return dict(summary, already_imported=False)
+        return dict(summary, already_imported=False, binding_plan=plan, plan_digest=current_plan_digest, bindings_added=added)
